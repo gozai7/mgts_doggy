@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := help
-.PHONY: help build robot teleop stop map localize eval test
+.PHONY: help build build-solver robot teleop stop maps map localize eval test
 
 # Use the prepared engine when available, respecting explicit Docker settings.
 ifeq ($(strip $(DOCKER_CONTEXT)$(DOCKER_HOST)),)
@@ -11,15 +11,18 @@ endif
 A ?= A
 B ?= B
 MAP ?= map-$(A)
-ROUTE ?= route-$(B)
+ROUTE ?= routes/$(MAP)/$(B)
 MODE ?= mapping
 export A B MAP ROUTE MODE ARGS
 
 help: ## показать команды
-	@awk 'BEGIN {FS = ": ## "} /^[a-z]+: ## / {printf "  make %-10s %s\n", $$1, $$2}' Makefile
+	@awk 'BEGIN {FS = ": ## "} /^[a-z-]+: ## / {printf "  make %-10s %s\n", $$1, $$2}' Makefile
 
 build: ## собрать образы Gazebo и решателя
 	docker compose build sim solve
+
+build-solver: ## собрать только SLAM, AMCL и чекер
+	docker compose build solve
 
 robot: ## записать обход A; MODE=inspection записывает маршрут B
 	@set -f; session="$$A"; if [ "$$MODE" = inspection ]; then session="$$B"; fi; \
@@ -31,16 +34,24 @@ teleop: ## управлять Go2 из второго терминала
 stop: ## завершить запись с сохранением bag
 	docker stop --signal=SIGINT --timeout=60 mgts-capture
 
-map: ## построить карту по A и сохранить в runs/MAP
+maps: ## показать имена доступных карт
+	@for yaml in runs/*/map.yaml; do [ -f "$$yaml" ] || continue; dir=$${yaml%/map.yaml}; printf '%s\n' "$${dir#runs/}"; done
+
+map: ## построить карту MAP по записи A, например make map A=survey MAP=office
 	@set -f; exec docker compose run --rm solve map "/data/$$A" "/runs/$$MAP" $$ARGS
 
-localize: ## локализовать B на карте MAP и сохранить в runs/ROUTE
+localize: ## построить маршрут B на выбранной карте, например make localize B=inspection MAP=office
 	@set -f; exec docker compose run --rm solve localize "/data/$$B" "/runs/$$ROUTE" --map "/runs/$$MAP/map.yaml" $$ARGS
 
-eval: ## проверить маршрут; эталон подключается при наличии обеих записей истины
-	@set -f; set -- $$ARGS; if [ -d "truth/$$A" ] && [ -d "truth/$$B" ]; then \
-	    set -- --truth-a "/truth/$$A" --truth-b "/truth/$$B" "$$@"; fi; \
-	exec docker compose run --rm eval "/runs/$$MAP" "/runs/$$ROUTE" "$$@"
+eval: ## оценить сохранённый маршрут B на карте MAP
+	@set -f; route="$$ROUTE"; \
+	if [ "$(origin ROUTE)" = file ] && [ ! -d "runs/$$route" ] && [ -f "runs/route-$$B/run.json" ]; then route="route-$$B"; fi; \
+	exec docker compose run --rm eval "/runs/$$MAP" "/runs/$$route" --truth-root /truth $$ARGS
 
-test: ## запустить сквозной тест на двух тестовых bag
+test: ## без MAP — smoke-тест; с MAP и B — локализация и оценка на выбранной карте
+ifneq ($(origin MAP),file)
+	$(MAKE) localize
+	$(MAKE) eval ARGS=
+else
 	docker run --rm --network none -v "$(CURDIR)/tests:/tests:ro" mgts-solver bash /tests/smoke.sh
+endif

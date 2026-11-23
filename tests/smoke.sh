@@ -11,6 +11,11 @@ python3 solver/solve.py localize /data/fixture-B /runs/B --map /runs/A/map.yaml 
 python3 solver/evaluate.py /runs/A /runs/B
 python3 -c "import json; assert json.load(open('/runs/B/report.json'))['absolute_errors'] is None"
 python3 solver/evaluate.py /runs/A /runs/B --truth-a /truth/fixture-A --truth-b /truth/fixture-B
+mkdir /runs/imported
+cp /runs/A/map.yaml /runs/A/map.pgm /runs/imported/
+python3 solver/solve.py localize /data/fixture-B /runs/imported-B --map /runs/imported/map.yaml --profile /data/fixture-B/profile.yaml --initial 1 0 0 --rate 2
+python3 solver/evaluate.py /runs/imported /runs/imported-B --truth-root /truth
+if python3 solver/evaluate.py /runs/A /runs/imported-B; then exit 1; fi
 PYTHONPATH=solver python3 - <<'PY'
 import json
 import numpy as np
@@ -18,6 +23,9 @@ from evaluate import score
 from geometry import compose, inverse
 
 report = json.load(open('/runs/B/report.json'))
+imported = json.load(open('/runs/imported-B/report.json'))
+assert imported['mapping'] is None and imported['absolute_errors'] is None
+assert imported['inspection']['forwarded'] == 80
 assert report['mapping']['forwarded'] == 80
 assert report['absolute_errors']['inspection']['coverage'] > 0.8
 assert report['absolute_errors']['mapping']['rmse_m'] < 0.25

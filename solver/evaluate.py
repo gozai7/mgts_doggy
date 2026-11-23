@@ -72,28 +72,42 @@ def main():
     parser.add_argument("inspection", type=Path)
     parser.add_argument("--truth-a", type=Path)
     parser.add_argument("--truth-b", type=Path)
+    parser.add_argument("--truth-root", type=Path, help="discover simulation truth by the recorded bag paths")
     parser.add_argument("--max-gap", type=float, default=1.0)
     args = parser.parse_args()
     if bool(args.truth_a) != bool(args.truth_b):
         parser.error("supply both truth sessions or neither")
     a, b = args.mapping, args.inspection
-    meta_a, meta_b = [json.loads((f / "run.json").read_text()) for f in (a, b)]
+    meta_a = json.loads((a / "run.json").read_text()) if (a / "run.json").is_file() else None
+    meta_b = json.loads((b / "run.json").read_text())
     if args.max_gap <= 0:
         parser.error("--max-gap must be positive")
-    if meta_a["mode"] != "map" or meta_b["mode"] != "localize":
+    if (meta_a is not None and meta_a["mode"] != "map") or meta_b["mode"] != "localize":
         parser.error("expected completed mapping and localization runs")
     if Path(meta_b["map"]).resolve() != (a / "map.yaml").resolve():
         parser.error("inspection used another map")
-    am, loc, od = trajectory(a), trajectory(b), trajectory(b, "odometry.csv")
+    if args.truth_root and not args.truth_a and meta_a is not None:
+        sessions = []
+        for meta in (meta_a, meta_b):
+            bag = Path(meta["bag"])
+            session = bag.parent if bag.name == "sensors" else bag
+            sessions.append(args.truth_root / session.name)
+        if all((session / "trajectory.csv").is_file() for session in sessions):
+            args.truth_a, args.truth_b = sessions
+    if args.truth_a and meta_a is None:
+        parser.error("absolute evaluation needs the mapping run and its trajectory for world-to-map alignment")
+    loc, od = trajectory(b), trajectory(b, "odometry.csv")
     config = yaml.safe_load((a / "map.yaml").read_text())
     image = Image.open(a / config["image"]).convert("L")
     grid = np.asarray(image)
     overlay = image.convert("RGB")
     draw = ImageDraw.Draw(overlay)
-    res, (ox, oy, _) = config["resolution"], config["origin"]
+    res, (ox, oy, origin_yaw) = config["resolution"], config["origin"]
 
     def pixels(x, y):
-        return (x - ox) / res, image.height - 1 - (y - oy) / res
+        dx, dy = x - ox, y - oy
+        c, s = math.cos(origin_yaw), math.sin(origin_yaw)
+        return (c * dx + s * dy) / res, image.height - 1 - (-s * dx + c * dy) / res
 
     def path(rows, color):
         x, y = pixels(rows[:, 1], rows[:, 2])
@@ -106,14 +120,16 @@ def main():
     x, y = hits[:, 1:].T
     u, v = pixels(px + np.cos(yaw) * x - np.sin(yaw) * y, py + np.sin(yaw) * x + np.cos(yaw) * y)
     draw.point(list(zip(u, v)), fill="#00a4be")
-    path(am, "#986bb1")
+    if meta_a is not None:
+        am = trajectory(a)
+        path(am, "#986bb1")
     if meta_b["initial"] is not None:
         baseline = transform(od, compose(meta_b["initial"], inverse(od[0, 1:])))
         path(baseline, "#d87f00")
     else:
         baseline = None
     path(loc, "#2762bb")
-    report = dict(mapping=meta_a["counts"], inspection=meta_b["counts"], absolute_errors=None)
+    report = dict(mapping=meta_a["counts"] if meta_a is not None else None, inspection=meta_b["counts"], absolute_errors=None)
     report["inspection"]["max_pose_gap_s"] = float(np.diff(loc[:, 0]).max(initial=0))
     report["inspection"]["max_pose_step_m"] = float(
         np.linalg.norm(np.diff(loc[:, 1:3], axis=0), axis=1).max(initial=0)
@@ -150,7 +166,9 @@ def main():
             )
         layout = json.loads((args.truth_a / "layout.json").read_text())
         iy, ix = np.indices(grid.shape)
-        mx, my = ox + (ix + 0.5) * res, oy + (image.height - iy - 0.5) * res
+        gx, gy = (ix + 0.5) * res, (image.height - iy - 0.5) * res
+        mx = ox + math.cos(origin_yaw) * gx - math.sin(origin_yaw) * gy
+        my = oy + math.sin(origin_yaw) * gx + math.cos(origin_yaw) * gy
         dx, dy, angle = inverse(world_to_map)
         wx = dx + math.cos(angle) * mx - math.sin(angle) * my
         wy = dy + math.sin(angle) * mx + math.cos(angle) * my
