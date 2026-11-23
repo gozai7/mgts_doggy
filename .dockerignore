@@ -1,0 +1,10 @@
+**
+!Dockerfile
+!entrypoint
+!sim/
+!sim/**
+!solver/
+!solver/**
+!configs/
+!configs/**
+**/__pycache__/

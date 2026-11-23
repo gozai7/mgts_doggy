@@ -1,0 +1,5 @@
+#!/bin/bash
+set -e
+source /opt/ros/jazzy/setup.bash
+if [[ -f /go2/install/setup.bash ]]; then source /go2/install/setup.bash; fi
+exec "$@"

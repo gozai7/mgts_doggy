@@ -1,0 +1,14 @@
+lidar: /scan
+imu: /imu/data
+odometry: /odom
+odom_frame: odom
+base_frame: base_footprint
+tf_edges:
+  - [base_footprint, base_link]
+  - [base_link, trunk]
+  - [trunk, scan_link]
+  - [base_link, velodyne_base_link]
+  - [velodyne_base_link, velodyne]
+cloud_height: [0.18, 1.6]
+range: [0.12, 16.0]
+bins: 360
