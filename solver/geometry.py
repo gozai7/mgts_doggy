@@ -1,6 +1,14 @@
 import math
 
 import numpy as np
+import yaml
+
+
+def load_amcl_map(path):
+    config = yaml.safe_load(path.read_text())
+    if not math.isclose(float(config["origin"][2]), 0.0, abs_tol=1e-9):
+        raise ValueError(f"{path}: AMCL requires zero origin yaw; reproject the raster and its origin")
+    return config
 
 
 def compose(a, b):

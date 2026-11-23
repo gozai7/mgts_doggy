@@ -16,11 +16,12 @@ import rclpy
 import yaml
 from ament_index_python.packages import get_package_prefix
 from dataset import Dataset, rotation, stamp
-from geometry import compose, csv_save, inverse
+from geometry import compose, csv_save, inverse, load_amcl_map
 from geometry_msgs.msg import PoseWithCovarianceStamped, TransformStamped
 from lifecycle_msgs.srv import ChangeState
 from nav_msgs.msg import OccupancyGrid
 from PIL import Image
+from rcl_interfaces.msg import Log
 from rclpy.qos import DurabilityPolicy, QoSProfile
 from rosgraph_msgs.msg import Clock
 from sensor_msgs.msg import LaserScan
@@ -77,6 +78,13 @@ def run(args, out, dataset, first, remaining):
     durable = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
     maps, updates, odom_rows = [], {}, []
     mapping = args.mode == "map"
+    amcl_received_map = False
+
+    def on_amcl_log(msg):
+        nonlocal amcl_received_map
+        # Nav2 Jazzy logs map acceptance under the same mutex as global initialization.
+        if msg.name == "amcl" and msg.msg.startswith("Received a ") and " map @ " in msg.msg:
+            amcl_received_map = True
 
     def on_map(msg):
         maps[:] = [msg]
@@ -87,6 +95,9 @@ def run(args, out, dataset, first, remaining):
         updates[stamp(msg.header)] = [p.position.x, p.position.y, math.atan2(f[1], f[0])]
 
     node.create_subscription(OccupancyGrid, "/map", on_map, durable)
+    if not mapping:
+        rosout_qos = QoSProfile(depth=100, durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        node.create_subscription(Log, "/rosout", on_amcl_log, rosout_qos)
     node.create_subscription(
         PoseWithCovarianceStamped, "/pose" if mapping else "/amcl_pose", on_pose, 20 if mapping else durable
     )
@@ -152,11 +163,15 @@ def run(args, out, dataset, first, remaining):
                 for key, val in zip(["x", "y", "yaw"], args.initial):
                     params += ["-p", f"initial_pose.{key}:={val}"]
             start("nav2_amcl", "amcl", "amcl", params)
+            if not spin_until(lambda: amcl_received_map):
+                raise RuntimeError("AMCL did not acknowledge the reference map; see ros.log")
         if not spin_until(lambda: laser.get_subscription_count() and (mapping or maps)):
             raise RuntimeError("missing /scan subscriber or reference map")
         when = first[0].header.stamp
         static.sendTransform(transform(when, "base_footprint", "laser", [*dataset.offset, 0.0]))
         if not mapping and args.initial is None:
+            if 0 not in maps[-1].data:
+                raise ValueError("global localization requires a map with free cells")
             service("/reinitialize_global_localization", Empty, Empty.Request())
 
         previous = stamp(first[0].header)
@@ -226,8 +241,10 @@ def main():
     args = parser.parse_args()
     if args.rate <= 0 or not math.isfinite(args.rate):
         parser.error("--rate must be positive")
-    if args.mode == "localize" and not (args.map and args.map.is_file()):
-        parser.error("localize requires --map with an existing map YAML")
+    if args.mode == "localize":
+        if not (args.map and args.map.is_file()):
+            parser.error("localize requires --map with an existing map YAML")
+        load_amcl_map(args.map)
     profile = yaml.safe_load((args.profile or Path("/mgts/configs/go2.yaml")).read_text())
     manifest = args.bag / "manifest.json"
     if manifest.is_file() and (args.bag / "sensors").is_dir():

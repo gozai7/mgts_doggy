@@ -6,8 +6,7 @@ import math
 from pathlib import Path
 
 import numpy as np
-import yaml
-from geometry import compose, inverse
+from geometry import compose, inverse, load_amcl_map
 from PIL import Image, ImageDraw
 
 
@@ -97,7 +96,7 @@ def main():
     if args.truth_a and meta_a is None:
         parser.error("absolute evaluation needs the mapping run and its trajectory for world-to-map alignment")
     loc, od = trajectory(b), trajectory(b, "odometry.csv")
-    config = yaml.safe_load((a / "map.yaml").read_text())
+    config = load_amcl_map(a / "map.yaml")
     image = Image.open(a / config["image"]).convert("L")
     grid = np.asarray(image)
     overlay = image.convert("RGB")
