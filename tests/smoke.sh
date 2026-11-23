@@ -3,7 +3,10 @@
 set -eu
 mkdir /data /truth /runs
 python3 /tests/replay_fixture.py
-python3 solver/solve.py map /data/fixture-A /runs/A --rate 2
+mkdir /data/capture-A
+mv /data/fixture-A /data/capture-A/sensors
+printf '%s\n' '{"complete":true,"lidar":"/scan"}' > /data/capture-A/manifest.json
+python3 solver/solve.py map /data/capture-A /runs/A --rate 2
 python3 solver/solve.py localize /data/fixture-B /runs/B --map /runs/A/map.yaml --profile /data/fixture-B/profile.yaml --initial 1 0 0 --rate 2
 python3 solver/evaluate.py /runs/A /runs/B
 python3 -c "import json; assert json.load(open('/runs/B/report.json'))['absolute_errors'] is None"

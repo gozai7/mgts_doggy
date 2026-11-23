@@ -218,7 +218,7 @@ def main():
     parser.add_argument("mode", choices=["map", "localize"])
     parser.add_argument("bag", type=Path)
     parser.add_argument("out", type=Path)
-    parser.add_argument("--profile", type=Path, default=Path("/mgts/configs/go2.yaml"))
+    parser.add_argument("--profile", type=Path)
     parser.add_argument("--lidar", help="override lidar topic from profile")
     parser.add_argument("--map", type=Path)
     parser.add_argument("--initial", type=float, nargs=3, metavar=("X", "Y", "YAW"))
@@ -228,7 +228,15 @@ def main():
         parser.error("--rate must be positive")
     if args.mode == "localize" and not (args.map and args.map.is_file()):
         parser.error("localize requires --map with an existing map YAML")
-    profile = yaml.safe_load(args.profile.read_text())
+    profile = yaml.safe_load((args.profile or Path("/mgts/configs/go2.yaml")).read_text())
+    manifest = args.bag / "manifest.json"
+    if manifest.is_file() and (args.bag / "sensors").is_dir():
+        capture = json.loads(manifest.read_text())
+        if not capture["complete"]:
+            parser.error(f"incomplete capture: {args.bag}")
+        if args.profile is None:
+            profile["lidar"] = capture["lidar"]
+        args.bag = args.bag / "sensors"
     if args.lidar:
         profile["lidar"] = args.lidar
     rclpy.init()
