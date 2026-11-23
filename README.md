@@ -1,4 +1,4 @@
-# Инспекция офиса МГТС
+# mgts_doggy · Инспекция офиса МГТС
 
 Стенд для двух независимых записей робота-собаки. По обходу A строится карта офиса, по инспекции B восстанавливается маршрут в системе карты A. Те же команды обрабатывают внешние ROS 2 bag. [Условия кейса](vyzhimka-dvukh-vebinarov.pdf)
 
@@ -9,6 +9,15 @@ teleop → Go2 / CHAMP в Gazebo → LiDAR, IMU, одометрия, TF → data
 bag A → калибровки и проекция → slam_toolbox → карта, граф, траектория A
 bag B → калибровки и проекция → AMCL + карта A → траектория B
 результаты A/B + необязательная истина → чекер → report.json и overlay.png
+```
+
+## Готовые записи и результаты
+
+[Релиз с данными стенда](https://github.com/gozai7/mgts_doggy/releases/tag/simulation-data-v1) содержит архив всех тестовых rosbag, ground truth и прогонов. Чтобы восстановить каталоги `data/`, `truth/` и `runs/` в свежем клоне, выполните из корня проекта:
+
+```bash
+gh release download simulation-data-v1 --pattern 'mgts-doggy-recordings.tar.gz' --pattern SHA256SUMS
+sha256sum -c SHA256SUMS && tar -xzf mgts-doggy-recordings.tar.gz
 ```
 
 ## Запуск
