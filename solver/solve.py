@@ -3,6 +3,7 @@
 import argparse
 import json
 import math
+import os
 import signal
 import subprocess
 import time
@@ -29,6 +30,8 @@ from sensor_msgs.msg import LaserScan
 from slam_toolbox.srv import SerializePoseGraph
 from std_srvs.srv import Empty
 from tf2_ros import StaticTransformBroadcaster, TransformBroadcaster
+
+DIRECTIONAL_LIB = Path("/usr/local/lib/mgts-directional")
 
 
 def transform(stamp_msg, parent, child, pose):
@@ -69,6 +72,15 @@ def save_map(grid, folder):
             )
         )
     )
+
+
+def keyframe_stamps(path):
+    # Karto exports double seconds. Match at microsecond precision and reject collisions.
+    times = np.loadtxt(path, delimiter=",", skiprows=1, usecols=0, ndmin=1)
+    stamps = {round(t * 1e6) for t in times}
+    if not len(times) or len(stamps) != len(times):
+        raise ValueError(f"empty or duplicate keyframe timestamps: {path}")
+    return stamps
 
 
 def run(args, out, dataset, first, remaining):
@@ -126,14 +138,19 @@ def run(args, out, dataset, first, remaining):
         return response
 
     modes = []
+    # For paired mapping experiments read timestamps only, never poses from the reference run.
+    keyframes = keyframe_stamps(args.keyframes) if args.keyframes else None
     with ExitStack() as stack:
         log = stack.enter_context((out / "ros.log").open("w"))
 
         def start(package, binary, name, params):
             exe = Path(get_package_prefix(package), "lib", package, binary)
+            env = os.environ.copy()
+            if mapping and args.directional_odom:
+                env["LD_LIBRARY_PATH"] = str(DIRECTIONAL_LIB) + ":" + env.get("LD_LIBRARY_PATH", "")
             process = subprocess.Popen(
                 [str(exe), "--ros-args", "-r", f"__node:={name}", *params],
-                stdout=log,
+                env=env, stdout=log,
                 stderr=subprocess.STDOUT,
             )
             processes.append(process)
@@ -178,14 +195,26 @@ def run(args, out, dataset, first, remaining):
 
         previous = stamp(first[0].header)
         preview, refinement_scans = [], []
-        for scan, odom in chain([first], remaining):
+        for index, (scan, odom) in enumerate(chain([first], remaining)):
             t = stamp(scan.header)
+            expected = keyframes is not None and round(t * 1e6) in keyframes
+            # slam_toolbox uses the first four incoming scans for its startup gate.
+            if keyframes is not None and index >= 4 and not expected:
+                continue
             due = time.monotonic() + min(t - previous, 1.0) / args.rate
             spin_until(lambda: time.monotonic() >= due, max(2.0, 2.0 / args.rate))
             clock.publish(Clock(clock=scan.header.stamp))
             tf.sendTransform(transform(scan.header.stamp, "odom", "base_footprint", odom))
             laser.publish(scan)
-            if not odom_rows:
+            if expected:
+                if not spin_until(lambda: t in updates, 2):
+                    # A best-effort scan can arrive before the matching TF. Retry the
+                    # same stamp; the exported graph is checked for duplicates below.
+                    tf.sendTransform(transform(scan.header.stamp, "odom", "base_footprint", odom))
+                    laser.publish(scan)
+                    if not spin_until(lambda: t in updates):
+                        raise RuntimeError(f"mapper did not accept reference keyframe at {t}")
+            elif not odom_rows:
                 spin_until(lambda: bool(updates), 2.0)
             odom_rows.append([t, *odom])
             if args.refine:
@@ -212,6 +241,8 @@ def run(args, out, dataset, first, remaining):
             subprocess.run(
                 ["export_graph", out / "map.posegraph", out / "trajectory.csv"], check=True, stdout=log
             )
+            if keyframes is not None and keyframe_stamps(out / "trajectory.csv") != keyframes:
+                raise RuntimeError("serialized mapping graph differs from reference keyframe timestamps")
         else:
             end = time.monotonic() + 0.5
             spin_until(lambda: time.monotonic() >= end)
@@ -252,8 +283,14 @@ def main():
     parser.add_argument("--map", type=Path)
     parser.add_argument("--initial", type=float, nargs=3, metavar=("X", "Y", "YAW"))
     parser.add_argument("--refine", action="store_true", help="offline bidirectional scan matching and SE(2) smoothing")
+    parser.add_argument("--directional-odom", action="store_true", help="use odometry along weak lidar directions during mapping")
+    parser.add_argument("--keyframes", type=Path, help="replay the exact timestamps of a reference mapping trajectory CSV")
     parser.add_argument("--rate", type=float, default=1.0)
     args = parser.parse_args()
+    if (args.directional_odom or args.keyframes) and args.mode != "map":
+        parser.error("--directional-odom and --keyframes require map")
+    if args.directional_odom and not (DIRECTIONAL_LIB / "libkartoSlamToolbox.so").is_file():
+        parser.error("directional Karto library missing; rebuild mgts-solver")
     if args.refine and args.mode != "localize":
         parser.error("--refine requires localize")
     if args.rate <= 0 or not math.isfinite(args.rate):
@@ -294,6 +331,12 @@ def main():
             scan_window=dataset.scan_window,
             counts=dict(dataset.stats),
         )
+        if args.mode == "map":
+            report["directional_odom"] = args.directional_odom
+            if args.keyframes:
+                report["keyframes"] = str(args.keyframes)
+            if args.directional_odom:
+                report["directional_updates"] = (args.out / "ros.log").read_text().count("mgts: directional odometry")
         if args.refine:
             report["refinement_segments"] = modes
         if dataset.imu_offsets:

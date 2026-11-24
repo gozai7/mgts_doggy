@@ -32,8 +32,14 @@ CMD ["python3", "sim/capture.py"]
 
 FROM solver-deps AS solver
 COPY solver/CMakeLists.txt solver/export_graph.cpp solver/
-RUN source /opt/ros/jazzy/setup.bash && cmake -DCMAKE_PREFIX_PATH=/opt/ros/jazzy -S solver -B /tmp/graph \
-    && cmake --build /tmp/graph && mv /tmp/graph/export_graph /usr/local/bin/ && rm -rf /tmp/graph
+# Build an opt-in Karto library against the headers shipped with slam_toolbox 2.8.5.
+ADD --checksum=sha256:ae7dbffdd5850e7f9d86bab65be2d16d0e0e6034090f93c27f095dac07db6816 https://raw.githubusercontent.com/SteveMacenski/slam_toolbox/ec8f7635dea317b531c419f798f87d90a336f32e/lib/karto_sdk/src/Mapper.cpp /tmp/karto/Mapper.cpp
+ADD --checksum=sha256:de8c7ec5d468f957e7a1e394636f82c6e1c484933e312993d35c915079a346b0 https://raw.githubusercontent.com/SteveMacenski/slam_toolbox/ec8f7635dea317b531c419f798f87d90a336f32e/lib/karto_sdk/src/Karto.cpp /tmp/karto/Karto.cpp
+COPY solver/karto/ solver/karto/
+RUN source /opt/ros/jazzy/setup.bash && grep -q '<version>2.8.5</version>' /opt/ros/jazzy/share/slam_toolbox/package.xml \
+    && patch -d /tmp/karto -p0 <solver/karto/directional.patch \
+    && cmake -DCMAKE_PREFIX_PATH=/opt/ros/jazzy -DCMAKE_BUILD_TYPE=Release -DKARTO_SOURCE=/tmp/karto -S solver -B /tmp/graph \
+    && cmake --build /tmp/graph -j2 && ctest --test-dir /tmp/graph --output-on-failure && cmake --install /tmp/graph && rm -rf /tmp/graph /tmp/karto
 COPY solver solver
 COPY configs configs
 CMD ["python3", "solver/solve.py", "--help"]

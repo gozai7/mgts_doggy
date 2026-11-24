@@ -7,6 +7,8 @@ mkdir /data/capture-A
 mv /data/fixture-A /data/capture-A/sensors
 printf '%s\n' '{"complete":true,"lidar":"/scan"}' > /data/capture-A/manifest.json
 python3 solver/solve.py map /data/capture-A /runs/A --rate 2
+python3 solver/solve.py map /data/capture-A /runs/paired --keyframes /runs/A/trajectory.csv --directional-odom --rate 4
+python3 -c "import json; assert json.load(open('/runs/paired/run.json'))['directional_odom']"
 python3 solver/solve.py localize /data/fixture-B /runs/B --map /runs/A/map.yaml --profile /data/fixture-B/profile.yaml --initial 1 0 0 --refine --rate 2
 python3 solver/evaluate.py /runs/A /runs/B
 python3 -c "import json; assert json.load(open('/runs/B/report.json'))['absolute_errors'] is None"

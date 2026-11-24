@@ -59,6 +59,7 @@ endif
 
 SCENE ?= corridor
 RATE ?= 3
+DIRECTIONAL ?= 0
 export SCENE
 .PHONY: bags bench
 
@@ -67,14 +68,20 @@ bags: ## создать тестовые A/B и эталон для SCENE=corrid
 
 # Named benchmark outputs follow the same MAP and ROUTE convention as make test.
 ifeq ($(origin MAP),file)
-bench: MAP = $(SCENE)
+bench: MAP = $(SCENE)$(if $(filter 1,$(DIRECTIONAL)),-directional)
 endif
 ifeq ($(origin ROUTE),file)
 bench: ROUTE = routes/$(MAP)/$(SCENE)-B
 endif
 
-bench: ## построить карту по готовой паре SCENE и сравнить AMCL с офлайн-уточнением
+bench: ## построить карту по готовой паре SCENE и сравнить AMCL с офлайн-уточнением (DIRECTIONAL=1 для новой карты)
 	@if [ ! -f "runs/$$MAP/run.json" ]; then \
-		$(MAKE) map A="$(SCENE)-A" MAP="$(MAP)" ARGS="--profile /mgts/configs/planar.yaml --rate $(RATE)"; \
+		$(MAKE) map A="$(SCENE)-A" MAP="$(MAP)" ARGS="--profile /mgts/configs/planar.yaml --rate $(RATE) $(if $(filter 1,$(DIRECTIONAL)),--directional-odom)"; \
+	elif [ "$(DIRECTIONAL)" = 1 ] && ! grep -Eq '"directional_odom"[[:space:]]*:[[:space:]]*true' "runs/$$MAP/run.json"; then \
+		echo "MAP=$$MAP already contains a baseline map; select a new MAP" >&2; exit 1; \
 	fi
 	$(MAKE) test B="$(SCENE)-B" MAP="$(MAP)" ROUTE="$(ROUTE)" ARGS="--profile /mgts/configs/planar.yaml --rate $(RATE) --refine $(ARGS)"
+
+.PHONY: compare
+compare: ## сравнить картографы на одних ключевых кадрах A и на одном bag B для SCENE
+	@bash benchmarks/directional/compare.sh "$$SCENE"

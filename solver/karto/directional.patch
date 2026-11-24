@@ -1,0 +1,17 @@
+--- Mapper.cpp
++++ Mapper.cpp
+@@ -36,0 +37 @@
++#include "directional.hpp"
+@@ -558,0 +560,7 @@
++  const auto weak = mgts::weakAxis(pScan);
++  if (weak && !doPenalize) {  // non-sequential links require a unique translation
++    rMean = scanPose;
++    rCovariance.SetToIdentity();
++    return 0.;
++  }
++
+@@ -637,0 +646,4 @@
++  if (weak) {
++    mgts::keepOdometry(pScan, *weak, rMean, rCovariance);
++    std::clog << "mgts: directional odometry\n";
++  }
