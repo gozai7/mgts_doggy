@@ -18,15 +18,16 @@ from nav_msgs.msg import Odometry
 from rclpy.qos import DurabilityPolicy, QoSProfile, qos_profile_sensor_data
 from sensor_msgs.msg import Imu, LaserScan, PointCloud2
 from tf2_msgs.msg import TFMessage
-from world import office
+from world import SCENES, layout_for, write_world
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("role", choices=["mapping", "inspection"])
     parser.add_argument("session")
+    parser.add_argument("--scene", choices=["office", *SCENES], default="office")
     parser.add_argument("--cloud", action="store_true")
-    parser.add_argument("--spawn", type=float, nargs=3, default=[0.0, 0.0, 0.0], metavar=("X", "Y", "YAW"))
+    parser.add_argument("--spawn", type=float, nargs=3, metavar=("X", "Y", "YAW"))
     args = parser.parse_args()
     if Path(args.session).name != args.session or args.session in ("", ".", ".."):
         parser.error("session must be a directory name")
@@ -35,17 +36,30 @@ def main():
         parser.error("session already exists")
     data.mkdir()
     truth.mkdir()
-    layout = office(
+    layout = layout_for(args.scene, args.role)
+    if args.spawn is None:
+        route = layout["route"]
+        if route:
+            (x, y), (nx, ny) = route[:2]
+            args.spawn = [x, y, math.atan2(ny - y, nx - x)]
+        else:
+            args.spawn = [0.0, 0.0, 0.0]
+    world_file = truth / f"{args.scene}.sdf"
+    write_world(
         Path(get_package_share_directory("unitree_go2_description"), "worlds/default.sdf"),
-        args.role,
-        truth / "office.sdf",
+        layout,
+        world_file,
     )
     (truth / "layout.json").write_text(json.dumps(layout))
     (truth / "spawn.json").write_text(json.dumps(args.spawn))
     lidar = "/velodyne_points/points" if args.cloud else "/scan"
-    manifest = dict(
-        role=args.role, lidar=lidar, revision="55ff151632a0220bf3ae0c0772392615d86da7a8", complete=False
-    )
+    manifest = {
+        "role": args.role,
+        "scene": args.scene,
+        "lidar": lidar,
+        "revision": "55ff151632a0220bf3ae0c0772392615d86da7a8",
+        "complete": False,
+    }
     manifest_path = data / "manifest.json"
     manifest_path.write_text(json.dumps(manifest))
     rclpy.init()
@@ -114,7 +128,7 @@ def main():
                 "launch",
                 "unitree_go2_sim",
                 "unitree_go2_launch.py",
-                f"world:={truth}/office.sdf",
+                f"world:={world_file}",
                 "unitree_go2_description_path:=/mgts/sim/go2.xacro",
                 "rviz:=false",
                 "disable_d455:=true",

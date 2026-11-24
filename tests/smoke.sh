@@ -57,3 +57,4 @@ assert partial['coverage'] == 0.4 and partial['longest_gap_s'] == 3
 PY
 
 PYTHONPATH="solver:${PYTHONPATH:-}" python3 /tests/refine_trajectory.py
+PYTHONPATH="sim:${PYTHONPATH:-}" python3 /tests/scenes.py

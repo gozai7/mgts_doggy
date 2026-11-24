@@ -1,0 +1,56 @@
+{
+  "mapping": {
+    "imu_samples": 0,
+    "duplicate_imu_stamps": 0,
+    "input_scans": 949,
+    "forwarded": 949,
+    "pose_updates": 929
+  },
+  "inspection": {
+    "imu_samples": 0,
+    "duplicate_imu_stamps": 0,
+    "input_scans": 913,
+    "forwarded": 913,
+    "pose_updates": 913,
+    "max_pose_gap_s": 0.20000000000001705,
+    "max_pose_step_m": 0.11255855663689601
+  },
+  "absolute_errors": {
+    "mapping": {
+      "coverage": 1.0,
+      "longest_gap_s": 0.0,
+      "rmse_m": 0.08352459564958226,
+      "p95_m": 0.15266281106054527,
+      "yaw_rmse_deg": 0.40715193884403605
+    },
+    "inspection": {
+      "coverage": 1.0,
+      "longest_gap_s": 0.0,
+      "rmse_m": 0.08415295035471322,
+      "p95_m": 0.16587350869755896,
+      "yaw_rmse_deg": 0.3986253747425135
+    },
+    "odometry": null,
+    "amcl": {
+      "coverage": 1.0,
+      "longest_gap_s": 0.0,
+      "rmse_m": 2.1988662854791805,
+      "p95_m": 0.1282533698483883,
+      "yaw_rmse_deg": 11.810672354160985
+    }
+  },
+  "world_to_map": [
+    0.0,
+    0.0,
+    -1.5707963267948966
+  ],
+  "mapping_endpoints": {
+    "true_separation_m": 0.0,
+    "odometry_end_error_m": 0.6117472864721164,
+    "optimized_end_error_m": 0.0006136800158348715
+  },
+  "map_quality": {
+    "observed_fraction": 0.7536328349600082,
+    "occupied_iou": 0.4612408867728017
+  }
+}

@@ -24,9 +24,10 @@ build: ## собрать образы Gazebo и решателя
 build-solver: ## собрать только SLAM, AMCL и чекер
 	docker compose build solve
 
+robot: SCENE = office
 robot: ## записать обход A; MODE=inspection записывает маршрут B
 	@set -f; session="$$A"; if [ "$$MODE" = inspection ]; then session="$$B"; fi; \
-	exec docker compose run --rm --name mgts-capture sim "$$MODE" "$$session" $$ARGS
+	exec docker compose run --rm --name mgts-capture sim "$$MODE" "$$session" --scene "$$SCENE" $$ARGS
 
 teleop: ## управлять Go2 из второго терминала
 	docker exec -it mgts-capture /mgts/entrypoint ros2 run teleop_twist_keyboard teleop_twist_keyboard --ros-args -p speed:=0.25 -p turn:=0.5
@@ -53,5 +54,27 @@ ifneq ($(origin MAP),file)
 	$(MAKE) localize
 	$(MAKE) eval ARGS=
 else
-	docker run --rm --network none -v "$(CURDIR)/tests:/tests:ro" mgts-solver bash /tests/smoke.sh
+	docker run --rm --network none -v "$(CURDIR)/tests:/tests:ro" -v "$(CURDIR)/sim:/mgts/sim:ro" mgts-solver bash /tests/smoke.sh
 endif
+
+SCENE ?= corridor
+RATE ?= 3
+export SCENE
+.PHONY: bags bench
+
+bags: ## создать тестовые A/B и эталон для SCENE=corridor|colonnade|eight|atrium|atrium-opaque
+	docker compose run --rm --entrypoint /mgts/entrypoint sim python3 /mgts/sim/scene_bags.py "$$SCENE"
+
+# Named benchmark outputs follow the same MAP and ROUTE convention as make test.
+ifeq ($(origin MAP),file)
+bench: MAP = $(SCENE)
+endif
+ifeq ($(origin ROUTE),file)
+bench: ROUTE = routes/$(MAP)/$(SCENE)-B
+endif
+
+bench: ## построить карту по готовой паре SCENE и сравнить AMCL с офлайн-уточнением
+	@if [ ! -f "runs/$$MAP/run.json" ]; then \
+		$(MAKE) map A="$(SCENE)-A" MAP="$(MAP)" ARGS="--profile /mgts/configs/planar.yaml --rate $(RATE)"; \
+	fi
+	$(MAKE) test B="$(SCENE)-B" MAP="$(MAP)" ROUTE="$(ROUTE)" ARGS="--profile /mgts/configs/planar.yaml --rate $(RATE) --refine $(ARGS)"
