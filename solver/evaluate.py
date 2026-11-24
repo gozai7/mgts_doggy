@@ -152,6 +152,8 @@ def main():
             inspection=score(loc, ref_b, args.max_gap),
             odometry=score(baseline, ref_b, args.max_gap) if baseline is not None else None,
         )
+        if meta_b.get("refine"):
+            report["absolute_errors"]["amcl"] = score(trajectory(b, "amcl.csv"), ref_b, args.max_gap)
         raw_a = trajectory(a, "odometry.csv")
         ends = am[[0, -1], 0]
         if np.all((ends >= ta[0, 0]) & (ends <= ta[-1, 0])):

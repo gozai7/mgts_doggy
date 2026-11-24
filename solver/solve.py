@@ -23,6 +23,7 @@ from nav_msgs.msg import OccupancyGrid
 from PIL import Image
 from rcl_interfaces.msg import Log
 from rclpy.qos import DurabilityPolicy, QoSProfile
+from refine import refine
 from rosgraph_msgs.msg import Clock
 from sensor_msgs.msg import LaserScan
 from slam_toolbox.srv import SerializePoseGraph
@@ -124,6 +125,7 @@ def run(args, out, dataset, first, remaining):
         node.destroy_client(client)
         return response
 
+    modes = []
     with ExitStack() as stack:
         log = stack.enter_context((out / "ros.log").open("w"))
 
@@ -175,7 +177,7 @@ def run(args, out, dataset, first, remaining):
             service("/reinitialize_global_localization", Empty, Empty.Request())
 
         previous = stamp(first[0].header)
-        preview = []
+        preview, refinement_scans = [], []
         for scan, odom in chain([first], remaining):
             t = stamp(scan.header)
             due = time.monotonic() + min(t - previous, 1.0) / args.rate
@@ -186,6 +188,13 @@ def run(args, out, dataset, first, remaining):
             if not odom_rows:
                 spin_until(lambda: bool(updates), 2.0)
             odom_rows.append([t, *odom])
+            if args.refine:
+                ranges = np.asarray(scan.ranges)
+                indices = np.flatnonzero(np.isfinite(ranges))
+                indices = indices[::max(1, math.ceil(len(indices) / 160))]
+                angles = scan.angle_min + indices * scan.angle_increment
+                points = np.column_stack((np.cos(angles), np.sin(angles))) * ranges[indices, None]
+                refinement_scans.append(points + dataset.offset)
             if not mapping and len(odom_rows) % 5 == 1:
                 rs = np.asarray(scan.ranges)[::6]
                 angles = scan.angle_min + np.arange(len(rs)) * 6 * scan.angle_increment
@@ -218,6 +227,10 @@ def run(args, out, dataset, first, remaining):
                     poses.append([t, *compose(correction, od)])
             if not poses:
                 raise RuntimeError("no AMCL estimate matches a scan timestamp")
+            if args.refine:
+                csv_save(out / "amcl.csv", poses)
+                poses, modes = refine(maps[-1], odom_rows, poses, refinement_scans, args.initial)
+                print("Refinement segments:", ", ".join(modes), flush=True)
             csv_save(out / "trajectory.csv", poses)
             np.save(out / "scan_hits.npy", np.concatenate(preview))
         if not updates:
@@ -226,6 +239,7 @@ def run(args, out, dataset, first, remaining):
         csv_save(out / "odometry.csv", odom_rows)
         dataset.stats.update(forwarded=len(odom_rows), pose_updates=len(updates))
     node.destroy_node()
+    return modes
 
 
 def main():
@@ -237,8 +251,11 @@ def main():
     parser.add_argument("--lidar", help="override lidar topic from profile")
     parser.add_argument("--map", type=Path)
     parser.add_argument("--initial", type=float, nargs=3, metavar=("X", "Y", "YAW"))
+    parser.add_argument("--refine", action="store_true", help="offline bidirectional scan matching and SE(2) smoothing")
     parser.add_argument("--rate", type=float, default=1.0)
     args = parser.parse_args()
+    if args.refine and args.mode != "localize":
+        parser.error("--refine requires localize")
     if args.rate <= 0 or not math.isfinite(args.rate):
         parser.error("--rate must be positive")
     if args.mode == "localize":
@@ -264,11 +281,12 @@ def main():
         if first is None:
             raise ValueError(f"no usable scans: {dataset.stats}")
         args.out.mkdir(parents=True, exist_ok=False)
-        run(args, args.out, dataset, first, scans)
+        modes = run(args, args.out, dataset, first, scans)
         config_name = "mapping.yaml" if args.mode == "map" else "amcl.yaml"
         copyfile(Path("/mgts/configs", config_name), args.out / config_name)
         report = dict(
             mode=args.mode,
+            refine=args.refine,
             profile=profile,
             bag=str(args.bag),
             initial=args.initial,
@@ -276,6 +294,8 @@ def main():
             scan_window=dataset.scan_window,
             counts=dict(dataset.stats),
         )
+        if args.refine:
+            report["refinement_segments"] = modes
         if dataset.imu_offsets:
             report["scan_to_nearest_imu_p95_s"] = float(np.percentile(dataset.imu_offsets, 95))
         (args.out / "run.json").write_text(json.dumps(report, indent=2))
