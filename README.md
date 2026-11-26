@@ -6,17 +6,19 @@
 
 **[Скриншоты и записи RViz](media/go2-final/)** · **[Финальный релиз с картой, маршрутом, ROS 2 bag и замерами](https://github.com/gozai7/mgts_doggy/releases/tag/go2-window-3d-final)**
 
-## Запуск финального решения на официальных бэгах
+## Запуск на своих бэгах Go2
 
-На Linux x86_64 нужны Git, Make, curl, unzip и Docker с Compose и доступом к NVIDIA GPU через CDI. ROS 2 входит в контейнер.
+На Linux x86_64 нужны Git, Make и Docker с Compose и доступом к NVIDIA GPU через CDI. ROS 2 входит в контейнер.
 
 ```bash
 git clone https://github.com/gozai7/mgts_doggy.git
 cd mgts_doggy
-make go2-final
+make go2-final A="/путь/к/записи_A" B="/путь/к/записи_B"
 ```
 
-Команда сама скачает записи организаторов, при первом запуске соберёт GPU-образ, построит карту по A и локализует робота по B при скорости воспроизведения 1×. Для первой сборки нужен интернет и время на компиляцию GLIM. Если архивы уже скачаны, положите `bag_for_mapping.zip` и `bag_for_localization.zip` в `data/official/` перед запуском. Распакованные записи также подходят.
+**A** — запись для построения 3D-карты, **B** — запись для локализации на этой карте при 1×. Каждый путь может вести к каталогу ROS 2 bag с `metadata.yaml` или к отдельному файлу `.mcap`. ZIP предварительно распакуйте. Если записи уже лежат в `data/mapping/` и `data/localization/`, достаточно `make go2-final`.
+
+Профиль рассчитан на топики Go2 `/utlidar/cloud`, `/utlidar/imu`, `/utlidar/robot_odom` и калибровку сенсоров из [конфига Go2](configs/competition/official-go2.yaml). Старт B определяется автоматически. При первом запуске команда соберёт GPU-образ, для этого нужен интернет.
 
 В конце команда напечатает каталог результата и готовую команду для RViz (нужен рабочий стол X11/XWayland). В каталоге лежат **map.pcd** (3D-карта), **full_route.tum** (полный маршрут B), **result_bag/** (ROS 2 bag) и **timing.json** (замеры времени).
 

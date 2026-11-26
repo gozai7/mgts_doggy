@@ -8,7 +8,7 @@ export DATA_DIR RESULTS_DIR
 RUN = $(COMPOSE) run --rm competition
 .PHONY: help build build-gpu bundle-gpu doctor normalize prepare mapping localization baseline occupancy evaluate run-all smoke-test test-unit legacy-build legacy-help
 help:
-	@echo 'Official Go2 bags: make go2-final (download bags, build GPU image if missing, map A and localize B)'
+	@echo 'Go2 final: make go2-final A=/path/to/map_bag B=/path/to/route_bag'
 	@echo 'make build; edit configs/competition/dataset.yaml; make doctor; make baseline; make mapping; make localization; make occupancy; make evaluate'
 	@echo 'CONFIG=... chooses a configuration inside the project. make test-unit runs without ROS. Legacy: make -f Makefile.legacy help'
 build:
@@ -47,12 +47,24 @@ go2-map go2-route-odometry go2-locate:
 	DATA_DIR="$(CURDIR)/data/official" $(COMPOSE) -f compose.yaml -f compose.gpu.yaml run --rm --pull never -e MGTS_REPLAY_1X=1 -v "$(CURDIR)/competition:/mgts/competition:ro" competition python3 -m competition.runner $(GO2_ACTION) --config /mgts/configs/competition/official-go2.yaml
 
 RUN_NAME ?= go2-live-$(shell date +%Y%m%d-%H%M%S)
-.PHONY: go2-final
-go2-final:
+A ?= data/mapping
+B ?= data/localization
+go2-final: export GO2_A = $(A)
+go2-final: export GO2_B = $(B)
+go2-final: export GO2_RUN = $(RUN_NAME)
+.PHONY: go2-final go2-demo-data
+go2-demo-data:
 	bash tools/go2_inputs.sh
+go2-final:
+	@for bag in "$$GO2_A" "$$GO2_B"; do \
+	  test -f "$$bag/metadata.yaml" || { test -f "$$bag" && test "$${bag%.mcap}" != "$$bag"; } || \
+	    { echo "Expected a ROS 2 bag directory or .mcap file: $$bag" >&2; exit 2; }; done
 	@docker image inspect mgts-competition-glim:gpu >/dev/null 2>&1 || $(MAKE) build-gpu
-	@run="$(RUN_NAME)"; $(MAKE) go2-live RUN_NAME="$$run" ARGS=--window-se3 && \
-	  echo "Results: $(RESULTS_DIR)/$$run/ | RViz: make go2-result RUN_NAME=$$run"
+	$(COMPOSE) -f compose.yaml -f compose.gpu.yaml run --rm --pull never \
+	  -e MGTS_REPLAY_1X=1 -e OPENBLAS_NUM_THREADS=1 \
+	  -v "$$(realpath "$$GO2_A"):/inputs/A.mcap:ro" -v "$$(realpath "$$GO2_B"):/inputs/B.mcap:ro" \
+	  -v "$(CURDIR)/competition:/mgts/competition:ro" -v "$(CURDIR)/tools:/mgts/tools:ro" \
+	  competition python3 -m tools.go2_final "$$GO2_RUN"
 
 .PHONY: go2-live
 go2-live: go2-map go2-route-odometry
