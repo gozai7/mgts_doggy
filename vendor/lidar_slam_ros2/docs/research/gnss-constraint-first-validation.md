@@ -1,0 +1,99 @@
+# GNSS constraint — first real-data validation (2026-06-12)
+
+The GNSS pose-graph constraint and the `LocalCartesian` projector output had
+been documented as untested ⚠️ since they landed. #242 fixed the constraint's
+information-matrix block order (it had never pulled translation), which made a
+real validation meaningful for the first time. Substrate: RTK-SLAM
+`stadtgarten_seq2` (outdoor park, `/gnss/fix` NavSatFix at ~136 Hz, RTK-grade,
+total-station GT available), the v0.5 outdoor preset, A/B with
+`use_gnss: false/true`. Raw artifacts: `output/gnss_ab/`.
+
+## Validated ✅
+
+1. **The fixed constraint works mechanically on real data**: with the stamp
+   skew override (below), the final pose adjustment reports
+   `Added 163 GNSS position constraint edges (163 RTK-like by covariance)` —
+   origin initialization (3-sample + 20 m consistency), geodetic→ENU
+   conversion, covariance weighting and RTK classification all behave.
+2. **`LocalCartesian` projector output, first ever**:
+   `map_projector_info.yaml` came out as `LocalCartesian` + `WGS84` with
+   `map_origin` lat 48.7819948 / lon 9.1729486 — the actual Stuttgart
+   Stadtgarten. The `Local`-fallback path (GNSS off) is unchanged.
+3. **No-regression sanity**: the GNSS-off arm reproduces the v0.5 result
+   exactly (raw 0.835 m RMSE, 19/19 checkpoints, median 0.327) — also strong
+   end-to-end evidence that the Phase 1 changes (#238–#242) did not move the
+   benchmark path. GNSS-on raw is identical (GNSS only affects the graph), as
+   it must be.
+
+## The remaining gap ❌ — no odom→ENU yaw alignment
+
+The GNSS-on corrected trajectory diverges from GNSS-off by a pattern that is
+zero at the fixed vertex and grows linearly with distance from it:
+
+| pose index | 0 | 10 | 50 | 270 |
+|---|---|---|---|---|
+| on/off displacement [m] | 0.00 | 24.1 | 94.1 | 337.1 |
+
+That is a pure **frame-rotation mismatch**: the odometry frame's x axis is
+the robot's initial heading, the ENU anchors' x axis is east, and nothing in
+the pipeline estimates the yaw between them. With vertex 0 fixed (position
+*and* orientation), the optimizer cannot rotate the graph into the ENU frame,
+so 163 strong anchors shear the map instead of georeferencing it. The effect
+was unobservable before #242 because the anchors never pulled translation at
+all.
+
+**Conclusion: `use_gnss: true` remains unusable for accuracy on real data
+until a yaw alignment lands.** Design sketch for the follow-up:
+
+- estimate the odom→ENU yaw online once the GNSS track baseline exceeds a
+  few meters (2-D least squares between odometry positions at fix stamps and
+  the ENU track), then
+- either rotate the ENU anchors into the odometry frame (map stays in the
+  odometry frame; record the yaw in the projector metadata), or release the
+  vertex-0 gauge under GNSS so the graph itself rotates into ENU (map becomes
+  truly georeferenced; matches what `LocalCartesian` consumers expect).
+  The second is the production-correct target; it needs a minimum-anchor
+  guard before un-fixing the gauge.
+
+## Replay pitfalls worth keeping (cost a run each)
+
+- The RKO-LIO offline node reads the bag internally — `/gnss/fix` never
+  entered the ROS graph. Since 2026-11 the offline node passes it through
+  (`bag_gnss:=true`, runner `--bag-gnss`).
+- `gnss_header_stamp_max_skew_sec` (default 30 s) re-stamped fixes with the
+  receive time when the header was "too old" — on a recorded bag that was
+  *every* fix, silently producing 0 edges. Since 2026-11 the check compares
+  against the latest odometry stamp instead. Absolute accuracy:
+  [gnss-rtk-slam-absolute-accuracy.md](gnss-rtk-slam-absolute-accuracy.md).
+- A benchmark `--output-dir` whose basename is `on`/`off` becomes a boolean
+  `run_name` parameter via YAML and aborts RKO-LIO; name arms `gnss_on`-style.
+- The corrected (submap-node) trajectory still cannot be scored against the
+  total-station checkpoints (dwell-gap pairing, the known v0.5 limitation), so
+  the corrected-level A/B metric stays blocked until denser export exists.
+
+## Reproduce
+
+```bash
+# off arm = v0.5 outdoor preset; on arm adds use_gnss + the skew override
+bash output/gnss_ab/run_ab.sh   # see the file for the exact invocations
+```
+
+## Addendum: the yaw alignment landed (same day)
+
+With the planar odom→ENU alignment (closed-form 2-D Kabsch over the matched
+anchor pairs, `gnss_align_yaw`, min 10 anchors / 5 m baseline) and the
+vertex-0 gauge released when it succeeds:
+
+- the run estimates **yaw = −111.83°** (baseline 201.9 m, fit RMS 1.90 m) and
+  reports 165 anchors;
+- the corrected trajectory becomes a **rigid** −112.1° rotation of the
+  GNSS-off solution (independent best-fit), with post-alignment residuals of
+  mean 2.03 m / max 8.73 m — the anchors' actual drift corrections — instead
+  of the 180 m mean / 337 m max shear before;
+- raw stays 0.835 m, bit-for-bit.
+
+The map is georeferenced for the first time: poses live in the ENU frame of
+the `LocalCartesian` origin, which is what the projector metadata promises
+consumers. Quantifying the absolute-accuracy gain against the total-station
+checkpoints still needs the denser corrected export (the dwell-gap pairing
+limitation above).

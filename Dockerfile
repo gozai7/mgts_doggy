@@ -3,13 +3,18 @@ FROM ros:jazzy-ros-base@sha256:5147d3ae250ce754afd399f6bfec15b33dd4e473ca357e304
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 ARG BUILD_JOBS=2
 ARG WITH_VIEWER=OFF
+ARG BUILD_MAPPING_BACKENDS=glim,rko_lio
+ARG ROS_APT_MIRROR=http://packages.ros.org/ros2/ubuntu
 ENV DEBIAN_FRONTEND=noninteractive PYTHONUNBUFFERED=1
 ENV CMAKE_BUILD_PARALLEL_LEVEL=${BUILD_JOBS}
-RUN apt-get update && apt-get install -y --no-install-recommends \
+ENV BUILD_MAPPING_BACKENDS=${BUILD_MAPPING_BACKENDS}
+RUN sed -i -e 's/^Types: deb deb-src/Types: deb/' -e "s#http://packages.ros.org/ros2/ubuntu#${ROS_APT_MIRROR}#" /usr/share/ros-apt-source/ros2.sources \
+    && apt-get update && apt-get install -y --no-install-recommends \
     build-essential cmake ninja-build git curl ca-certificates python3-pip python3-venv \
     python3-colcon-common-extensions python3-rosdep python3-numpy python3-scipy python3-yaml \
     libboost-all-dev libeigen3-dev libmetis-dev libomp-dev libfmt-dev libspdlog-dev \
     libglm-dev libglfw3-dev libpng-dev libjpeg-dev libpcl-dev libtbb-dev \
+    librange-v3-dev libnanoflann-dev libopenvdb-dev libceres-dev ros-jazzy-sophus \
     ros-jazzy-ament-cmake-auto ros-jazzy-rosbag2-storage-mcap ros-jazzy-rosbag2-storage-default-plugins \
     ros-jazzy-tf2-sensor-msgs ros-jazzy-pcl-conversions ros-jazzy-rclcpp-components \
     ros-jazzy-nav2-map-server ros-jazzy-rviz2 ros-jazzy-plotjuggler-ros && rm -rf /var/lib/apt/lists/*
@@ -50,6 +55,8 @@ RUN --mount=type=cache,target=/tmp/build-glim \
 COPY BACKEND .
 COPY vendor/ vendor/
 COPY docker/competition/build.sh docker/competition/
+COPY docker/competition/beluga-sophus.cmake docker/competition/
+COPY localization_ros/ localization_ros/
 RUN BUILD_WITH_CUDA=ON bash docker/competition/build.sh
 COPY competition/ competition/
 COPY configs/ configs/

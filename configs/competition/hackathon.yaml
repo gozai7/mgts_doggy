@@ -1,0 +1,156 @@
+# Real ivr0ma/hackathon bags; see docs/LOCALIZATION.md for calibration provenance and limits.
+# IMU extrinsics are deliberately unknown; this profile cannot run GLIM/RKO mapping.
+schema_version: 1
+bags:
+  mapping: /data/hackathon/bag_for_mapping
+  localization: /data/hackathon/bag_for_localization
+output: /results/hackathon/localization
+topics:
+  lidar: /utlidar/cloud
+  imu: null
+  odometry: /utlidar/robot_odom
+frames:
+  map: map
+  odom: odom
+  base: base_link
+  lidar: lidar
+  imu: imu
+source_frames:
+  lidar: utlidar_lidar
+  imu: null
+  odometry: odom
+  odometry_child: base_link
+extrinsics:
+  T_base_lidar:
+  - 0.282160018
+  - 0.0
+  - -0.024670004
+  - 0.0
+  - 0.9914583559
+  - 0.0
+  - 0.1304236502
+  T_base_imu: null
+units:
+  xyz: m
+  acceleration: null
+  angular_velocity: null
+point_time:
+  field: null
+  unit: null
+  mode: none
+  offset_s: 0.0
+time_offsets_s:
+  lidar: 0.0
+  imu: 0.0
+  odometry: 0.0
+lidar:
+  scan_period_s: 0.0714
+  range_m:
+  - 0.35
+  - 20.0
+  intensity_field: intensity
+  body_box_base_m: null
+mapping:
+  profile: default_indoor
+  mode: cpu
+  timeout_s: 7200
+  min_trajectory_coverage: 0.75
+  backend: glim
+localization:
+  initial_pose: null
+  manual_initial_pose: false
+  prediction: kinematic
+  registration_method: GICP
+  ndt_resolution: 0.5
+  score_threshold: 1.0
+  voxel_leaf_size: 0.15
+  scan_timeout_s: 60.0
+  initialization_timeout_s: 180.0
+  min_accepted_fraction: 0.5
+  map_bundle: /results/hackathon/provided-map
+  backend: ndt_gicp
+occupancy:
+  resolution_m: 0.05
+  floor_z_m: 0.0
+  height_m:
+  - 0.15
+  - 1.8
+  angular_bins: 720
+  every_n_scans: 3
+  min_hit_scans: 2
+  max_pose_gap_s: 0.5
+  max_cells: 16000000
+odometry:
+  source: existing
+  gravity_aligned: true
+  initial_roll_pitch_rad:
+  - -0.0369222725
+  - 0.0297827919
+  max_gap_s: 0.5
+  position_variance_m2: 0.1
+  orientation_variance_rad2: 0.05
+beluga:
+  initial_base_height_m: 0.30722907
+  map_resolution_m: 0.15
+  robot_clearance_m: 0.25
+  min_particles: 2000
+  max_particles: 12000
+  max_points: 256
+  motion_noise: 0.15
+  seed: 42
+  particle_export_every_n: 10
+recovery:
+  confirmations: 3
+  odometry_fallback: true
+  max_fallback_s: 5.0
+  max_correction_gap_s: 1.0
+  max_motion_disagreement_m: 1.0
+  max_motion_disagreement_rad: 0.7
+  reinitialization_cooldown_s: 15.0
+benchmark:
+  profiles:
+  - baseline
+  - beluga
+  - ndt_kiss
+  - beluga_kiss
+  seeds:
+  - 42
+  - 43
+  - 44
+  fault_seed: 42
+  scenarios:
+  - name: unknown_start
+    unknown_start: true
+  - name: lidar_50
+    unknown_start: true
+    perturb:
+      keep_points: 0.5
+  - name: lidar_25
+    unknown_start: true
+    perturb:
+      keep_points: 0.25
+  - name: scan_drops
+    unknown_start: true
+    perturb:
+      drop_scans: 0.2
+  - name: gap_0.5
+    unknown_start: true
+    perturb:
+      gap_s:
+      - 20.0
+      - 20.5
+  - name: gap_2.0
+    unknown_start: true
+    perturb:
+      gap_s:
+      - 20.0
+      - 22.0
+  - name: gap_5.0
+    unknown_start: true
+    perturb:
+      gap_s:
+      - 20.0
+      - 25.0
+  notes: Existing odometry is precomputed vendor LiDAR/IMU odometry, not ground truth
+    or independent leg kinematics. IMU corruption cannot change an already-recorded
+    odometry stream.

@@ -56,7 +56,7 @@ def distinct(first, second):
             or Rotation.from_matrix(relative).magnitude() > np.deg2rad(20))
 
 
-def initialize(map_path, bag, config, reference_path=None):
+def initialize(map_path, bag, config, reference_path=None, odometry=None):
     model = pcd.xyz(map_path)
     floor = config["occupancy"]["floor_z_m"]
     low, high = np.asarray(config["occupancy"]["height_m"]) + floor
@@ -81,6 +81,7 @@ def initialize(map_path, bag, config, reference_path=None):
     mount = transform(config["extrinsics"]["T_base_lidar"])
     first_from_current = np.eye(4)
     previous = None
+    first_odometry = None
     last_stamp = None
     attempts = []
     query_after = 1.
@@ -96,12 +97,21 @@ def initialize(map_path, bag, config, reference_path=None):
                 raise ValueError("Insufficient B scan geometry for automatic initialization")
             if previous is None:
                 first_stamp = last_stamp = stamp
+                if odometry is not None:
+                    if stamp not in odometry:raise ValueError("Missing initial relative odometry for global search")
+                    first_odometry=transform(odometry[stamp])
                 accumulated, previous = points, cKDTree(points)
                 continue
-            step = fit(points, previous, np.eye(4))
+            if odometry is None:
+                step = fit(points, previous, np.eye(4))
+                next_first_from_current = first_from_current @ step
+            else:
+                if stamp not in odometry:raise ValueError("Missing scan-aligned relative odometry for global search")
+                next_first_from_current = np.linalg.inv(first_odometry) @ transform(odometry[stamp])
+                step = np.linalg.inv(first_from_current) @ next_first_from_current
             if distance(points, previous, step) > .24:
                 raise ValueError("Cannot link successive B scans for automatic initialization")
-            first_from_current = first_from_current @ step
+            first_from_current = next_first_from_current
             held_out = moved(points, first_from_current)
             elapsed = (stamp - first_stamp) * 1e-9
             if elapsed >= query_after:
@@ -128,7 +138,8 @@ def initialize(map_path, bag, config, reference_path=None):
                     alternate = next((score for score, p in ranked if distinct(pose, p)), None)
                     attempts.append(dict(elapsed_s=elapsed, error_m=best, alternate_error_m=alternate))
                     if best < .20 and alternate is not None and alternate > 1.25 * best + .005:
-                        return dict(initial_pose=pose7(pose), stamp_ns=first_stamp, attempts=attempts)
+                        return dict(initial_pose=pose7(pose), stamp_ns=first_stamp, attempts=attempts,
+                                    motion_source="external_relative_odometry" if odometry is not None else "pairwise_scan_icp")
                 query_after += min(15., max(2., elapsed))
             accumulated = sample(np.vstack([accumulated, held_out]), .14, 2400)
             previous, last_stamp = cKDTree(points), stamp

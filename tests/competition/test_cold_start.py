@@ -7,7 +7,8 @@ from competition.cold_start import initialize
 
 
 @pytest.mark.parametrize("duplicate", [False, True])
-def test_unknown_start(tmp_path, config, duplicate):
+@pytest.mark.parametrize("external_motion", [False, True])
+def test_unknown_start(tmp_path, config, duplicate, external_motion):
     rng = np.random.default_rng(12)
     # Perpendicular walls and an off-centre pillar distinguish position and heading.
     line = np.linspace(-3, 3, 81)
@@ -28,11 +29,13 @@ def test_unknown_start(tmp_path, config, duplicate):
     times = [1_000_000_000 + 300_000_000*i for i in range(9)]
     bagio.write_messages(bag, (("/competition/lidar", n,
                         cloud.pack(scene + rng.normal(0, .003, scene.shape), n, "lidar")) for n in times))
+    # An arbitrary odometry origin and heading must never become a global starting pose.
+    odometry={n:[100.,-50.,20.,*Rotation.from_euler("z",2.).as_quat()] for n in times} if external_motion else None
     if duplicate:
         with pytest.raises(ValueError, match="No unambiguous"):
-            initialize(name, bag, config)
+            initialize(name, bag, config, odometry=odometry)
     else:
-        result = initialize(name, bag, config)
+        result = initialize(name, bag, config, odometry=odometry)
         pose = result["initial_pose"]
         assert result["stamp_ns"] == times[0]
         assert np.linalg.norm(pose[:3] - t) < .12

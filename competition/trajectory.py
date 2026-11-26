@@ -65,3 +65,15 @@ def metrics(a, expected_span=None, gap_limit=.5):
             "covered_time_s": covered, "coverage_fraction": min(1.0, covered / denominator) if denominator > 0 else None,
             "coverage_denominator": "input sensor span" if expected_span is not None else "trajectory span only",
             "absolute_accuracy": None, "endpoint_distance_is_not_loop_error": float(np.linalg.norm(a[-1, 1:4] - a[0, 1:4]))}
+
+
+def deskew_scan(points, relative_times, stamp_s, odometry, T_base_lidar, max_gap=.5):
+    """Warp a raw sweep to its header pose using bounded spatial odometry and the measured lever arm."""
+    poses, valid = interpolate(odometry, stamp_s+np.asarray(relative_times), max_gap)
+    reference, reference_valid = interpolate(odometry, [stamp_s], max_gap)
+    if not reference_valid[0]:
+        return np.empty((0,3)), np.zeros(len(points),dtype=bool)
+    local = np.asarray(points)[valid] @ T_base_lidar[:3,:3].T+T_base_lidar[:3,3]
+    world = Rotation.from_quat(poses[valid,3:]).apply(local)+poses[valid,:3]
+    sensor = transform(reference[0])@T_base_lidar
+    return (world-sensor[:3,3])@sensor[:3,:3], valid

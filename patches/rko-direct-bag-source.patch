@@ -1,0 +1,43 @@
+--- a/vendor/rko_fork/rko_lio/ros/base_node.cpp
++++ b/vendor/rko_fork/rko_lio/ros/base_node.cpp
+@@ -532,6 +532,11 @@
+   radar_sigma_lateral_mps = config.radar_sigma_lateral_mps;
+   radar_sigma_vertical_mps = config.radar_sigma_vertical_mps;
+   timestamp_proc_config = config.timestamp_proc_config;
++  const auto backend_bag = node->declare_parameter<std::string>("competition_backend_bag", "");
++  if (!backend_bag.empty()) {
++    competition_backend_writer = std::make_unique<rosbag2_cpp::Writer>();
++    competition_backend_writer->open(backend_bag);
++  }
+   dump_results = config.dump_results;
+   results_dir = config.results_dir;
+   run_name = config.run_name;
+@@ -698,10 +703,14 @@
+     std_msgs::msg::Header header;
+     header.frame_id = lidar_frame;
+     header.stamp = utils::to_ros_time(lio->lidar_state.time);
+-    frame_publisher->publish(utils::eigen_to_point_cloud2(
++    const auto cloud = utils::eigen_to_point_cloud2(
+         deskewed_scan_voxel_size > 0.0 ? core::voxel_down_sample(deskewed_frame, deskewed_scan_voxel_size)
+-                                       : deskewed_frame,
+-        header));
++                                       : deskewed_frame, header);
++    if (competition_backend_writer) {
++      competition_backend_writer->write(cloud,
++          deskewed_scan_topic, rclcpp::Time(header.stamp));
++    }
++    frame_publisher->publish(cloud);
+   }
+   if (lio->output_poses_with_timestamps.empty()) {
+     publish_odometry(lio->lidar_state, odom_publisher);
+@@ -729,6 +738,10 @@
+   odom_msg.pose.covariance = driver::pose_covariance_from_state(state);
+   utils::eigen_vector3d_to_ros_xyz(state.velocity, odom_msg.twist.twist.linear);
+   utils::eigen_vector3d_to_ros_xyz(state.angular_velocity, odom_msg.twist.twist.angular);
++  if (competition_backend_writer && publisher == odom_publisher) {
++    competition_backend_writer->write(odom_msg,
++        odom_topic, rclcpp::Time(odom_msg.header.stamp));
++  }
+   publisher->publish(odom_msg);
+ }
+ 

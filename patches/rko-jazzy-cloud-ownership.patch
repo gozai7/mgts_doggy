@@ -1,0 +1,18 @@
+--- a/vendor/rko_fork/rko_lio/ros/base_node.cpp
++++ b/vendor/rko_fork/rko_lio/ros/base_node.cpp
+@@ -703,14 +703,14 @@
+     std_msgs::msg::Header header;
+     header.frame_id = lidar_frame;
+     header.stamp = utils::to_ros_time(lio->lidar_state.time);
+-    const auto cloud = utils::eigen_to_point_cloud2(
++    auto cloud = utils::eigen_to_point_cloud2(
+         deskewed_scan_voxel_size > 0.0 ? core::voxel_down_sample(deskewed_frame, deskewed_scan_voxel_size)
+                                        : deskewed_frame, header);
+     if (competition_backend_writer) {
+-      competition_backend_writer->write(cloud,
++      competition_backend_writer->write(*cloud,
+           deskewed_scan_topic, rclcpp::Time(header.stamp));
+     }
+-    frame_publisher->publish(cloud);
++    frame_publisher->publish(std::move(cloud));
+   }

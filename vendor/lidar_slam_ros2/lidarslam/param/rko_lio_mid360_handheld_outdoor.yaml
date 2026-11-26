@@ -1,0 +1,40 @@
+# RKO-LIO profile for a handheld (or walking-robot) Livox MID-360 outdoors.
+#
+# Selected on Koide Hard Point Cloud Localization Dataset outdoor_hard_02a
+# (CC BY 4.0), checked on outdoor_hard_02b / 01b and on the held-out 01a; see
+# docs/research/koide-handheld-outdoor-profile-2026-10.md. Compared with the
+# previous outdoor settings (voxel_size 1.0, no gravity alignment), 3D APE
+# drops from 1.03 m to 0.55 m (02a), 0.63 m to 0.34 m (02b), 4.82 m to 0.31 m
+# (01b) and 2.96 m to 0.72 m (01a).
+#
+# The datasets publish IMU acceleration in g; rescale to m/s^2 first
+# (tools/readme_media/scale_imu_bag.py).
+extrinsic_imu2base_quat_xyzw_xyz: [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
+extrinsic_lidar2base_quat_xyzw_xyz: [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
+initialization_phase: true
+deskew: true
+voxel_size: 0.5
+max_points_per_voxel: 20
+min_range: 1.0
+max_range: 100.0
+max_correspondence_distance: 0.5
+double_downsample: true
+# Slow pitch/roll drift integrates into height while walking. Long-window
+# gravity alignment (40 s, default 20 s) measures it. Re-levelling rotates
+# the local map together with the pose; a pose-only correction is pulled
+# back by the next registrations against the still-tilted map, leaving about
+# 1 deg of tilt (z RMSE 0.34 -> 0.23 m on 02a with re-levelling).
+gravity_window_alignment: true
+gravity_window_sec: 40.0
+gravity_alignment_relevel_map: true
+async.output_publish_delay_ms: 20
+# The MID-360 drops scans for up to 1.8 s on these recordings while the IMU
+# keeps streaming. Past max_scan_delta_sec (default 1.0 s) the scan is
+# dropped and the state re-anchored at the IMU-propagated pose (rko_lio#16;
+# before that the turn made during the gap was lost, 01b APE 4.8 m). Up to
+# 3 s, the scan is registered from the IMU prediction instead of dropped.
+max_scan_delta_sec: 3.0
+# A handheld sensor is sometimes covered by a hand or the body: on outdoor_hard_01a
+# a scan kept only 55 of 20k points beyond 1 m, and ICP on its few dozen keypoints
+# slid ~7 m upward into the map. Such scans are skipped (IMU propagation continues).
+min_icp_keypoints: 100

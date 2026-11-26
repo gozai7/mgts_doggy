@@ -1,0 +1,154 @@
+# Experimental profiles; fill measured calibration/units and gravity reference before running.
+schema_version: 1
+bags:
+  mapping: /data/mapping
+  localization: /data/localization
+output: /results/localization-experiments
+topics:
+  lidar: auto
+  imu: auto
+  odometry: null
+frames:
+  map: map
+  odom: odom
+  base: base_link
+  lidar: lidar
+  imu: imu
+source_frames:
+  lidar: null
+  imu: null
+  odometry: null
+  odometry_child: null
+extrinsics:
+  T_base_lidar: null
+  T_base_imu: null
+units:
+  xyz: m
+  acceleration: null
+  angular_velocity: null
+point_time:
+  field: null
+  unit: null
+  mode: null
+  offset_s: 0.0
+time_offsets_s:
+  lidar: 0.0
+  imu: 0.0
+  odometry: 0.0
+lidar:
+  scan_period_s: 0.1
+  range_m:
+  - 0.3
+  - 50.0
+  intensity_field: intensity
+  body_box_base_m: null
+mapping:
+  profile: default_indoor
+  mode: cpu
+  timeout_s: 7200
+  min_trajectory_coverage: 0.75
+  backend: glim
+localization:
+  initial_pose: null
+  manual_initial_pose: false
+  prediction: constant_velocity
+  registration_method: NDT_OMP
+  ndt_resolution: 0.5
+  score_threshold: 1.0
+  voxel_leaf_size: 0.15
+  scan_timeout_s: 60.0
+  initialization_timeout_s: 180.0
+  min_accepted_fraction: 0.5
+  map_bundle: /results/map-glim
+  backend: ndt_gicp
+occupancy:
+  resolution_m: 0.05
+  floor_z_m: 0.0
+  height_m:
+  - 0.1
+  - 1.8
+  angular_bins: 720
+  every_n_scans: 2
+  min_hit_scans: 2
+  max_pose_gap_s: 0.5
+  max_cells: 16000000
+odometry:
+  source: existing
+  gravity_aligned: false
+  initial_roll_pitch_rad: null
+  max_gap_s: 0.5
+  position_variance_m2: 0.1
+  orientation_variance_rad2: 0.05
+beluga:
+  initial_base_height_m: null
+  map_resolution_m: 0.15
+  robot_clearance_m: 0.25
+  min_particles: 2000
+  max_particles: 12000
+  max_points: 256
+  motion_noise: 0.15
+  seed: 42
+  particle_export_every_n: 10
+recovery:
+  confirmations: 3
+  odometry_fallback: true
+  max_fallback_s: 5.0
+  max_correction_gap_s: 1.0
+  max_motion_disagreement_m: 1.0
+  max_motion_disagreement_rad: 0.7
+  reinitialization_cooldown_s: 15.0
+benchmark:
+  profiles:
+  - baseline
+  - beluga
+  - ndt_kiss
+  - beluga_kiss
+  seeds:
+  - 42
+  - 43
+  - 44
+  fault_seed: 42
+  scenarios:
+  - name: unknown_start
+    unknown_start: true
+  - name: lidar_50
+    unknown_start: true
+    perturb:
+      keep_points: 0.5
+  - name: lidar_25
+    unknown_start: true
+    perturb:
+      keep_points: 0.25
+  - name: scan_drops
+    unknown_start: true
+    perturb:
+      drop_scans: 0.2
+  - name: gap_0.5
+    unknown_start: true
+    perturb:
+      gap_s:
+      - 20.0
+      - 20.5
+  - name: gap_2.0
+    unknown_start: true
+    perturb:
+      gap_s:
+      - 20.0
+      - 22.0
+  - name: gap_5.0
+    unknown_start: true
+    perturb:
+      gap_s:
+      - 20.0
+      - 25.0
+  - name: imu_shift_20ms
+    unknown_start: true
+    sensor: imu
+    perturb:
+      header_shift_s: 0.02
+  - name: imu_noise
+    unknown_start: true
+    sensor: imu
+    perturb:
+      gyro_noise: 0.03
+      accel_noise: 0.3

@@ -123,6 +123,32 @@ Visualization Manager:
       Durability Policy: Transient Local
       Reliability Policy: Reliable
       History Policy: Keep Last
+  - Class: rviz_default_plugins/PoseArray
+    Name: Beluga particles (hypotheses)
+    Enabled: true
+    Topic:
+      Value: /beluga/particles
+      Reliability Policy: Best Effort
+      Durability Policy: Volatile
+      Depth: 2
+    Color: 180; 100; 240
+    Shape: Arrow (Flat)
+  - Class: rviz_default_plugins/PoseWithCovariance
+    Name: Beluga raw pose and covariance
+    Enabled: false
+    Topic:
+      Value: /beluga/pose
+      Reliability Policy: Reliable
+      Durability Policy: Transient Local
+      Depth: 5
+  - Class: rviz_default_plugins/Odometry
+    Name: Relative odometry
+    Enabled: false
+    Topic:
+      Value: /competition/odometry
+      Reliability Policy: Reliable
+      Durability Policy: Volatile
+      Depth: 5
   Tools:
   - Class: rviz_default_plugins/Interact
   - Class: rviz_default_plugins/MoveCamera

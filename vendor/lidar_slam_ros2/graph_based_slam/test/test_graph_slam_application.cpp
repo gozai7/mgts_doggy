@@ -1,0 +1,346 @@
+// Copyright 2026 Sasaki
+// All rights reserved.
+//
+// Software License Agreement (BSD 2-Clause Simplified License)
+//
+// Redistribution and use in source and binary forms, with or without
+// modification, are permitted provided that the following conditions
+// are met:
+//
+//  * Redistributions of source code must retain the above copyright
+//    notice, this list of conditions and the following disclaimer.
+//  * Redistributions in binary form must reproduce the above
+//    copyright notice, this list of conditions and the following disclaimer
+//    in the documentation and/or other materials provided with the
+//    distribution.
+//
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+// "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+// LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
+// FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
+// COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+// INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+// BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+// LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+// CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+// LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
+// ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+// POSSIBILITY OF SUCH DAMAGE.
+
+#include <gtest/gtest.h>
+
+#include <memory>
+#include <vector>
+
+#include "graph_based_slam/graph_slam_application.hpp"
+#include "graph_based_slam/registration_factory.hpp"
+
+namespace graphslam
+{
+namespace
+{
+
+using Cloud = pcl::PointCloud<pcl::PointXYZI>;
+
+struct Fixture
+{
+  std::unique_ptr<GraphSlamApplication> makeApplication(int stride = 1)
+  {
+    GraphSlamApplicationConfig config;
+    config.registration_method = "GICP";
+    config.loop_search_query_stride = stride;
+    return std::unique_ptr<GraphSlamApplication>(new GraphSlamApplication(config));
+  }
+};
+
+backend_core::BackendCore::CloudPtr emptyCloud(int index)
+{
+  static_cast<void>(index);
+  backend_core::BackendCore::CloudPtr cloud(new Cloud);
+  return cloud;
+}
+
+std::vector<backend_core::SubmapMeta> submaps(int count)
+{
+  std::vector<backend_core::SubmapMeta> result(static_cast<std::size_t>(count));
+  for (int i = 0; i < count; ++i) {
+    result[static_cast<std::size_t>(i)].pose.translation().x() = i * 10.0;
+    result[static_cast<std::size_t>(i)].travel_distance = i * 10.0;
+  }
+  return result;
+}
+
+TEST(GraphSlamApplication, BatchAndIncrementalInputProduceTheSameQueryOrder)
+{
+  Fixture batch_fixture;
+  auto batch = batch_fixture.makeApplication();
+  const auto batch_events = batch->processSubmaps(submaps(5), emptyCloud);
+
+  Fixture incremental_fixture;
+  auto incremental = incremental_fixture.makeApplication();
+  std::vector<LoopSearchEvent> incremental_events;
+  for (int count = 1; count <= 5; ++count) {
+    const auto events = incremental->processSubmaps(submaps(count), emptyCloud);
+    incremental_events.insert(incremental_events.end(), events.begin(), events.end());
+  }
+
+  ASSERT_EQ(batch_events.size(), 4U);
+  ASSERT_EQ(incremental_events.size(), batch_events.size());
+  for (std::size_t i = 0; i < batch_events.size(); ++i) {
+    EXPECT_EQ(batch_events[i].query_index, incremental_events[i].query_index);
+    EXPECT_EQ(batch_events[i].registration_searched, incremental_events[i].registration_searched);
+    EXPECT_EQ(batch_events[i].graph_changed, incremental_events[i].graph_changed);
+    EXPECT_EQ(batch_events[i].loop_edges.size(), incremental_events[i].loop_edges.size());
+  }
+  EXPECT_EQ(batch->stateSnapshot().next_query_index, 5);
+  EXPECT_EQ(incremental->stateSnapshot().next_query_index, 5);
+}
+
+TEST(GraphSlamApplication, StrideSkipsRegistrationButStillAdvancesEveryQuery)
+{
+  Fixture fixture;
+  auto application = fixture.makeApplication(2);
+  const auto events = application->processSubmaps(submaps(6), emptyCloud);
+
+  ASSERT_EQ(events.size(), 5U);
+  EXPECT_TRUE(events[0].registration_searched);
+  EXPECT_FALSE(events[1].registration_searched);
+  EXPECT_TRUE(events[2].registration_searched);
+  EXPECT_FALSE(events[3].registration_searched);
+  EXPECT_TRUE(events[4].registration_searched);
+  EXPECT_EQ(application->stateSnapshot().next_query_index, 6);
+}
+
+TEST(GraphSlamApplication, OwnsDeterministicDescriptorAggregationAndFiltering)
+{
+  GraphSlamApplicationConfig config;
+  config.registration_method = "GICP";
+  config.descriptors.use_scan_context = true;
+  config.loop_search.search_submap_num = 3;
+  config.loop_search_query_stride = 100;
+  GraphSlamApplication application(config);
+  std::vector<int> requested_indices;
+  const auto provider = [&requested_indices](int index) {
+      requested_indices.push_back(index);
+      backend_core::BackendCore::CloudPtr cloud(new Cloud);
+      pcl::PointXYZI point;
+      point.x = static_cast<float>(index);
+      cloud->push_back(point);
+      return cloud;
+    };
+
+  const auto events = application.processSubmaps(submaps(3), provider);
+
+  ASSERT_EQ(events.size(), 2U);
+  const std::vector<int> expected {0, 1, 0, 2, 1, 0};
+  EXPECT_EQ(requested_indices, expected);
+}
+
+TEST(GraphSlamApplication, OwnsTheCanonicalDeduplicatedLoopEdgeSet)
+{
+  Fixture fixture;
+  auto application = fixture.makeApplication();
+  GraphSlamApplication::LoopEdge edge;
+  edge.pair_id = {9, 2};
+  edge.relative_pose.translation().x() = 7.0;
+  edge.fitness_score = 0.3;
+
+  ASSERT_TRUE(application->upsertLoopEdge(edge));
+  const auto edges = application->stateSnapshot().loop_edges;
+  ASSERT_EQ(edges.size(), 1U);
+  EXPECT_EQ(edges[0].pair_id, std::make_pair(2, 9));
+  EXPECT_DOUBLE_EQ(edges[0].relative_pose.translation().x(), -7.0);
+  EXPECT_DOUBLE_EQ(edges[0].fitness_score, 0.3);
+}
+
+TEST(GraphSlamApplication, OptimizesPlainPoseGraphRequestsThroughTheSharedEntryPoint)
+{
+  Fixture fixture;
+  auto application = fixture.makeApplication();
+  GraphSlamApplication::LoopEdge future_edge;
+  future_edge.pair_id = {0, 5};
+  future_edge.fitness_score = 0.1;
+  ASSERT_TRUE(application->upsertLoopEdge(future_edge));
+  PoseGraphRequest request;
+  request.submaps.resize(1);
+  request.submaps[0].pose.translation().x() = 3.5;
+
+  const auto result = application->optimize(request);
+
+  ASSERT_EQ(result.poses.size(), 1U);
+  EXPECT_DOUBLE_EQ(result.poses[0].translation().x(), 3.5);
+}
+
+TEST(GraphSlamApplication, OnlineAndOfflineBatchingProduceByteIdenticalArtifacts)
+{
+  Fixture fixture;
+  auto online = fixture.makeApplication();
+  auto offline = fixture.makeApplication();
+  const auto ordered_submaps = submaps(4);
+
+  // A live callback may receive the complete prefix, while bag replay can
+  // submit one ordered submap at a time. Both paths enter the same engine.
+  online->processSubmaps(ordered_submaps, emptyCloud);
+  for (int count = 1; count <= 4; ++count) {
+    offline->processSubmaps(submaps(count), emptyCloud);
+  }
+
+  GraphSlamApplication::LoopEdge edge;
+  edge.pair_id = {0, 3};
+  edge.relative_pose.translation().x() = 30.0;
+  edge.fitness_score = 0.125;
+  ASSERT_TRUE(online->upsertLoopEdge(edge));
+  ASSERT_TRUE(offline->upsertLoopEdge(edge));
+
+  PoseGraphRequest pose_graph_request;
+  pose_graph_request.submaps.resize(ordered_submaps.size());
+  for (std::size_t i = 0; i < ordered_submaps.size(); ++i) {
+    pose_graph_request.submaps[i].pose =
+      Eigen::Isometry3d(ordered_submaps[i].pose.matrix());
+  }
+  const std::vector<double> timestamps {1000.0, 1001.0, 1002.0, 1003.0};
+  const auto online_result = online->optimizeAndSerialize(
+    pose_graph_request, timestamps);
+  const auto offline_result = offline->optimizeAndSerialize(
+    pose_graph_request, timestamps);
+
+  EXPECT_EQ(
+    online_result.artifacts.loop_edges_csv,
+    offline_result.artifacts.loop_edges_csv);
+  EXPECT_EQ(
+    online_result.artifacts.trajectory_optimized_tum,
+    offline_result.artifacts.trajectory_optimized_tum);
+  EXPECT_EQ(
+    online_result.optimization.pose_graph_g2o,
+    offline_result.optimization.pose_graph_g2o);
+  EXPECT_EQ(online_result.artifacts.loop_edge_count, 1U);
+  EXPECT_FALSE(online_result.artifacts.trajectory_optimized_tum.empty());
+}
+
+TEST(GraphSlamApplication, ArtifactRequestRejectsMismatchedTimestamps)
+{
+  Fixture fixture;
+  auto application = fixture.makeApplication();
+  ArtifactRequest request;
+  request.timestamps.push_back(1.0);
+  EXPECT_THROW(
+    static_cast<void>(application->deterministicArtifacts(request)),
+    std::invalid_argument);
+}
+
+TEST(GraphSlamApplication, RejectsInvalidWorkflowConfiguration)
+{
+  GraphSlamApplicationConfig config;
+  config.registration_method = "GICP";
+  config.loop_search_query_stride = 0;
+  EXPECT_THROW(static_cast<void>(GraphSlamApplication(config)), std::invalid_argument);
+}
+
+TEST(GraphSlamApplication, RejectsInvalidOwnedEngineConfiguration)
+{
+  GraphSlamApplicationConfig config;
+  config.registration_method = "not-a-registration";
+  EXPECT_THROW(static_cast<void>(GraphSlamApplication(config)), std::invalid_argument);
+
+  config.registration_method = "GICP";
+  config.voxel_leaf_size = 0.0;
+  EXPECT_THROW(static_cast<void>(GraphSlamApplication(config)), std::invalid_argument);
+}
+
+// A corner of three planes (floor and two walls), so that every degree of freedom is constrained.
+Cloud::Ptr cornerCloud()
+{
+  Cloud::Ptr cloud(new Cloud);
+  for (int a = 0; a < 40; ++a) {
+    for (int b = 0; b < 40; ++b) {
+      const float u = 0.1F * static_cast<float>(a) + 0.01F * static_cast<float>(b % 3);
+      const float v = 0.1F * static_cast<float>(b) + 0.01F * static_cast<float>(a % 3);
+      pcl::PointXYZI point;
+      point.intensity = 0.0F;
+      point.x = u; point.y = v; point.z = 0.0F;
+      cloud->push_back(point);
+      point.x = u; point.y = 0.0F; point.z = v;
+      cloud->push_back(point);
+      point.x = 0.0F; point.y = u; point.z = v;
+      cloud->push_back(point);
+    }
+  }
+  return cloud;
+}
+
+TEST(GraphSlamApplication, SmallGicpLoopRegistrationRecoversAShift)
+{
+  // small_gicp is vendored (third_party/small_gicp), so SMALL_GICP is in every build.
+  const auto registration = backend_core::makeLoopRegistration("SMALL_GICP", 2.0, 1, 0.5, 1e-5);
+  ASSERT_TRUE(registration);
+  const Cloud::Ptr target = cornerCloud();
+  Eigen::Matrix4f shift = Eigen::Matrix4f::Identity();
+  shift.block<3, 1>(0, 3) = Eigen::Vector3f(0.05F, -0.03F, 0.02F);
+  Cloud::Ptr source(new Cloud);
+  pcl::transformPointCloud(*target, *source, shift);
+  registration->setInputTarget(target);
+  registration->setInputSource(source);
+  Cloud aligned;
+  registration->align(aligned, Eigen::Matrix4f::Identity());
+  ASSERT_TRUE(registration->hasConverged());
+  const Eigen::Matrix4f error = registration->getFinalTransformation() * shift;
+  const float translation_error = error.block<3, 1>(0, 3).norm();
+  const float rotation_error = (error.block<3, 3>(0, 0) - Eigen::Matrix3f::Identity()).norm();
+  EXPECT_LT(translation_error, 1e-3F);
+  EXPECT_LT(rotation_error, 1e-4F);
+
+  GraphSlamApplicationConfig config;
+  config.registration_method = "SMALL_GICP";
+  EXPECT_NO_THROW(static_cast<void>(GraphSlamApplication(config)));
+}
+
+// Registering against targets A, B, A, B, A with one registration (which keeps the state of earlier
+// targets) gives bit for bit what a new registration gives for each pair.
+TEST(GraphSlamApplication, SmallGicpKeptTargetsGiveTheSameResults)
+{
+  const Cloud::Ptr target_a = cornerCloud();
+  Eigen::Matrix4f move_b = Eigen::Matrix4f::Identity();
+  move_b.block<3, 3>(0, 0) =
+    Eigen::AngleAxisf(0.3F, Eigen::Vector3f::UnitZ()).toRotationMatrix();
+  move_b.block<3, 1>(0, 3) = Eigen::Vector3f(1.0F, -0.5F, 0.2F);
+  Cloud::Ptr target_b(new Cloud);
+  pcl::transformPointCloud(*target_a, *target_b, move_b);
+  Eigen::Matrix4f shift = Eigen::Matrix4f::Identity();
+  shift.block<3, 1>(0, 3) = Eigen::Vector3f(0.05F, -0.03F, 0.02F);
+  Cloud::Ptr source_a(new Cloud);
+  pcl::transformPointCloud(*target_a, *source_a, shift);
+  Cloud::Ptr source_b(new Cloud);
+  pcl::transformPointCloud(*target_b, *source_b, shift);
+
+  const auto kept = backend_core::makeLoopRegistration("SMALL_GICP", 2.0, 1, 0.5, 1e-5);
+  ASSERT_TRUE(kept);
+  const auto * caching =
+    dynamic_cast<const backend_core::TargetCachingSmallGicp<pcl::PointXYZI> *>(kept.get());
+  ASSERT_NE(caching, nullptr);
+  for (int round = 0; round < 5; ++round) {
+    const bool use_a = round % 2 == 0;
+    const Cloud::Ptr & target = use_a ? target_a : target_b;
+    const Cloud::Ptr & source = use_a ? source_a : source_b;
+    const auto fresh = backend_core::makeLoopRegistration("SMALL_GICP", 2.0, 1, 0.5, 1e-5);
+    Cloud kept_aligned;
+    Cloud fresh_aligned;
+    kept->setInputTarget(target);
+    kept->setInputSource(source);
+    kept->align(kept_aligned, Eigen::Matrix4f::Identity());
+    fresh->setInputTarget(target);
+    fresh->setInputSource(source);
+    fresh->align(fresh_aligned, Eigen::Matrix4f::Identity());
+    ASSERT_TRUE(kept->hasConverged());
+    EXPECT_EQ(kept->getFinalTransformation(), fresh->getFinalTransformation()) << round;
+    EXPECT_EQ(kept->getFitnessScore(), fresh->getFitnessScore()) << round;
+    const auto * fresh_gicp =
+      dynamic_cast<const backend_core::TargetCachingSmallGicp<pcl::PointXYZI> *>(fresh.get());
+    ASSERT_NE(fresh_gicp, nullptr);
+    EXPECT_EQ(caching->getFinalHessian(), fresh_gicp->getFinalHessian()) << round;
+  }
+  // A and B are kept; the current target (A) is kept as well.
+  EXPECT_EQ(caching->keptTargetCount(), 2U);
+}
+
+}  // namespace
+}  // namespace graphslam

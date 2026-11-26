@@ -1,0 +1,14 @@
+# v0.7 Phase 3 rollout (docs/roadmap/v0.7.md): outdoor maps are vegetation-
+# dominated (Stadtgarten baseline: planar coverage 0.12-0.16), so plane-based
+# thresholds stay REPORT-ONLY here — the rows are informational until outdoor
+# refinement evidence lands (v0.8 candidate). Only the indoor profile blocks.
+# The thickness row uses the same informative reference value as the indoor
+# profile; the coverage row only flags collapse below the meaningfulness
+# floor.
+map_quality_profile:
+  name: outdoor_vegetation
+  enforcement: report_only
+  require_meaningful_planes: false
+  thresholds:
+    thickness_rms_mean_max_m: 0.085
+    planar_coverage_min: 0.05

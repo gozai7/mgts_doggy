@@ -1,0 +1,46 @@
+.vscode
+lidarslam/launch/test.launch.py
+lidarslam/param/test.yaml
+lidarslam/rviz/test.rviz
+build/
+install/
+log/
+# Named colcon roots used by benchmark and release-profile worktrees.
+/build-*/
+/install-*/
+/log-*/
+/symlink_install_manifest.txt
+demo_data/
+# Local data roots may be directories or symlinks to an external SSD.
+/datasets
+/output
+map.pcd
+map_projector_info.yaml
+pointcloud_map/
+Thirdparty/dlio/
+Thirdparty/fast_gicp/
+Thirdparty/genz-icp/
+Thirdparty/kiss-icp/
+Thirdparty/kiss-slam/
+Thirdparty/lio-sam/
+Thirdparty/log/
+Thirdparty/output/
+Thirdparty/simple/
+Thirdparty/small_gicp/
+**/__pycache__/
+*.pyc
+.pytest_cache/
+imgui.ini
+pose_graph.g2o
+slam_output/
+
+# mkdocs build output (docs-site.yml builds this in CI; never commit it)
+site/
+
+# lidarslam wheel builds (lidarslam_core/wheel/build_deps.sh, cibuildwheel)
+/.wheel-deps/
+/wheelhouse/
+
+# Browser demo build output (web/build_wasm.sh)
+docs/demo/slam_web.js
+docs/demo/slam_web.wasm

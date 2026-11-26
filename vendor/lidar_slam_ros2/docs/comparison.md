@@ -1,0 +1,473 @@
+---
+title: LiDAR SLAM workflow and benchmark comparison
+description: Compare lidar_slam_ros2 map-authoring workflows, default-path licenses, and scoped benchmark evidence. Review datasets, metrics, reference types, and reproduction steps.
+---
+
+# Comparison
+
+This page is the public comparison snapshot for the
+`lidarslam_ros2 v0.11.0` release.
+
+It is intentionally scoped to workflows that are actually exercised in this
+repository. It is not trying to be a universal ranking of every LiDAR SLAM
+system.
+
+## Release Track vs Research Track
+
+`v0.3` introduced per-dataset release profiles so the gate stops squashing
+heterogeneous datasets onto a single APE threshold. `v0.4` then **graduated the
+former research-track profiles to blocking** (decision 2026-06-07,
+`docs/roadmap/v0.4.md`):
+
+- **Release track (blocking)** — a FAIL blocks the release. As of v0.5 this is:
+  `Newer College math-hard` (ground truth), `NTU VIRAL tnp_01` (ground truth),
+  the two `mid360_gt_rtkslam_construction_*` profiles (**total-station ground
+  truth**, graduated in v0.5), the Leo Drive applanix/velodyne open-data
+  cross-validation, and the KITTI Odometry 00/05/07 LO baseline comparison
+  (non-regression).
+- **Report-only** — `MID-360` vs GLIM was demoted in v0.5 (decision D-GT-2,
+  `docs/roadmap/v0.5.md`): cross-validation against another SLAM estimate
+  measures agreement, not accuracy, and the same sensor is now gated on real
+  total-station checkpoints. It stays as a regression canary. The Leo Drive
+  profile keeps its cross-validation caveat (separate track). New profiles
+  introduced mid-cycle (e.g. the outdoor Stadtgarten pair) soak as report-only
+  before graduating.
+
+The distinction is exercised by `scripts/run_release_readiness_checks.sh`,
+which evaluates each profile in `scripts/release_profiles.yaml` and emits
+`PASS` / `FAIL` / `WARN` / `TARGET_MET` / `NO_DATA` per dataset.
+
+## Strategic Position
+
+This repository is deliberately positioned as:
+
+- a ROS 2 pointcloud-map authoring stack
+- a benchmarkable mapping workflow
+- a non-GPL public path for reusable map artifacts
+
+It is not primarily positioned as:
+
+- the smallest possible LiDAR odometry package
+- a localization reliability research platform
+- a universal winner on every SLAM benchmark
+
+The intended differentiation is operational:
+
+- generate pointcloud maps
+- keep map metadata and georeference outputs usable
+- verify saved bundles
+- compare runs with tracked metrics and reports
+- standardize submission artifacts for repeatable evaluation
+
+That is the product layer this repository is trying to own.
+
+## Capability Comparison
+
+| Workflow | Role in this repo | License stance in the public path | Frontend / backend shape | Loop closure in the documented path | Pointcloud-map authoring / verification |
+| --- | --- | --- | --- | --- | --- |
+| `lidarslam_ros2` default | recommended public workflow | non-GPL default | `RKO-LIO` frontend + `graph_based_slam` backend | yes | yes |
+| `RKO-LIO` raw | odometry baseline | non-GPL default | LIO frontend only | no | no |
+| `KISS-ICP` baseline | comparison baseline | external comparison only | LiDAR odometry only | no | no |
+| `LIO-SAM` | research reference | excluded from the default release path | tightly coupled factor-graph SLAM | yes | no supported path in this repo |
+
+## Differentiators
+
+The public differentiators currently exercised in this repository are:
+
+- non-GPL default workflow
+- saved-map verification tooling
+- GNSS-aware `map_projector_info.yaml` export
+- save-time dynamic-object cleanup
+- tracked benchmark/report artifacts
+- real open-data packet-path evidence
+- a focused `map_authoring_report` that summarizes benchmark, georeference,
+  cleanup, and fallback-path evidence in one place
+- a standard submission-bundle helper that collects `pointcloud_map/`,
+  `map_projector_info.yaml`, `metrics.json`, trajectories, logs, focused reports,
+  and a generated `map_qa_summary.md`
+
+Those are stronger differentiators for map authoring and evaluation than for
+pure odometry novelty.
+
+## Local Benchmark Snapshot
+
+These numbers come from generated benchmark artifacts under local `output/`
+directories. `output/` is ignored by git; use the commands in
+[Benchmarking And Release Gate](benchmarking.md) to regenerate the reports.
+
+### Release-track datasets
+
+The current blocking profiles below sit under their `pass` thresholds. The
+Stadtgarten pair remains report-only while its outdoor evidence soaks.
+
+| Dataset | Configuration | Reference kind | APE RMSE (m) | Profile gate | Notes |
+| --- | --- | --- | --- | --- | --- |
+| `NTU VIRAL tnp_01` | current default | `ground_truth` | `0.952` | `PASS` (pass ≤ 1.00, target 0.30) | outdoor long-loop GT |
+| `NTU VIRAL tnp_01` | best observed   | `ground_truth` | `0.870` | `PASS` (same)                     | loop-gated backend run |
+| `MID-360` RTK-SLAM Construction Hall 2 | indoor default | `ground_truth` (total station, 16 chkpt) | `0.086` (median 0.064, 16/16) | `PASS` (pass ≤ 0.30, target 0.15) | dense odometry scored, 2.0 s association contract |
+| `MID-360` RTK-SLAM Construction Hall 1 | indoor default | `ground_truth` (total station, 16 chkpt) | `0.321` (median 0.163, 16/16) | `PASS` (pass ≤ 0.55, target 0.30) | hardest indoor hall (published baselines ~0.22) |
+| `MID-360` RTK-SLAM Stadtgarten 2 | sequence-specific compatibility preset | `ground_truth` (total station, 19 chkpt) | `0.426` (median 0.264, 19/19) | report-only soak (pass ≤ 1.20) | legacy voxel order + 105 m range; shared default unchanged |
+| `MID-360` RTK-SLAM Stadtgarten 1 | outdoor config | `ground_truth` (total station, 36 chkpt) | `0.838` (median 0.511, 36/36) | report-only soak (pass ≤ 2.20) | 26 min / ~1 km park loop; raw odometry, no GNSS / loop closure |
+| `MID-360` | current default                  | `cross_validation` vs GLIM | `3.641` | report-only since v0.5 (D-GT-2)   | solid-state LiDAR, non-360° FOV |
+| `MID-360` | best observed                    | `cross_validation` vs GLIM | `3.590` | report-only (same)                | rerun with same tuned backend family |
+| `MID-360` | Scan Context candidate           | `cross_validation` vs GLIM | `3.816` | report-only                       | fair current-code comparison; still opt-in |
+| `MID-360` | experimental BEV-assisted rerank | `cross_validation` vs GLIM | `3.607` | report-only                       | sensor-agnostic rerank of distance candidates; still opt-in |
+| Leo Drive (applanix/velodyne) | current default | `cross_validation` vs Applanix GSOF49 | varies per bag | `PASS` (pass ≤ 1.50, target 0.50) | open-data Velodyne packet path |
+
+The Newer College `Maths-Hard` profile (official ICP-to-survey-map ground
+truth) is the tightest gate (pass ≤ 0.10). Its form-gated, CC BY-NC-SA inputs
+and generated numbers are not checked in to this repo; the exact acquisition,
+calibration, and rerun contract is documented in
+[Benchmarking And Release Gate](benchmarking.md#newer-college-maths-hard).
+The KITTI Odometry 00/05/07 LO
+baseline comparison is wired through `scripts/run_kitti_00_05_07_report.sh` and
+emits a non-regression report under
+`output/kitti_dev_<timestamp>/kitti_dev_report.md`.
+
+As of v0.5 the MID-360 release evidence is **real ground truth**: the two
+RTK-SLAM Construction Hall profiles block on SE(3)-aligned total-station
+checkpoint RMSE (`ape_rmse_gt_m`), the same metric family as NTU VIRAL and
+Newer College. `MID-360` vs GLIM is report-only (regression canary, D-GT-2);
+Leo Drive still blocks on its cross-validation threshold. Dataset, metric
+definition and attribution:
+`docs/research/rtkslam-total-station-gt-methodology.md`.
+
+Source artifacts:
+
+- `output/benchmark_summary.md` (generated locally)
+- `output/latest_report.html` (generated locally)
+- `output/stress_validation_report_<YYYYMMDD>.md` (generated locally)
+- `scripts/release_profiles.yaml` (profile definitions)
+- `output/kitti_dev_<timestamp>/kitti_dev_report.md` (generated locally, KITTI LO baseline)
+
+## Same-input HILTI 2022 exp04 vs GLIM CPU
+
+This is the strongest directly comparable OSS result for the current
+competitive `lidarslam_ros2` profile. Both systems used the same HILTI 2022
+`exp04` ROS 2 bag, LiDAR--IMU calibration, CPU-only host, and the same six
+surveyed checkpoints. GLIM's trajectory starts after its three-second IMU
+initialization, so the earlier first checkpoint was excluded for both systems
+instead of being clamped or extrapolated. APE is SE(3)-aligned position RMSE;
+all aggregate values below are from three complete runs per system.
+
+### Same-VM rerun on the current develop (2026-10-19)
+
+| System | APE RMSE median (range), m | Processing RTF median (range) | Peak RSS maximum, MB | Completion |
+| --- | ---: | ---: | ---: | ---: |
+| **lidarslam_ros2** | **0.048218** (identical across runs) | **0.1936** (0.1778--0.2115) | **369.4** | 3/3, 1,258 poses |
+| GLIM CPU | 0.086269 (0.085242--0.087566) | 0.2179 (0.2125--0.3009) | 696.0 | 3/3, 1,228 poses |
+
+How it was measured:
+
+- **Host:** one 4-vCPU cloud VM (Ubuntu 24.04, ROS 2 Jazzy, 15 GiB).
+- **lidarslam_ros2:**
+  - build: `develop` at `904998a` (RKO-LIO `ec61a3e`);
+  - profile: the competitive profile (`configs/hilti2022/lidarslam_competitive_v2.yaml`,
+    `configs/hilti2022/rko_lio_hilti2022_pandar_competitive_v2.yaml`; loop closure off);
+  - command: `scripts/run_rko_lio_graph_benchmark.sh --gt-blind --skip-map-save`;
+  - processing time: the wall seconds that script records.
+- **GLIM CPU:**
+  - build: a native build of the pinned core v1.2.2 (`faa264a`) with the four
+    `configs/glim/hilti2022_cpu` overrides;
+  - command: the v1 command of
+    [`scripts/glim_container_run.sh`](https://github.com/rsasaki0109/lidar_slam_ros2/blob/v0.11.0/scripts/glim_container_run.sh)
+    at the `v0.11.0` tag (`glim_rosbag ... auto_quit:=true` under
+    `/usr/bin/time -v`), run without Docker because the VM has no Docker daemon;
+  - processing time: the wall time of that command.
+- **RTF:** processing time divided by the 125.814 s bag duration.
+- **Peak RSS:** the `/usr/bin/time -v` maximum resident set size, the largest
+  single process.
+- **Order:** the two systems alternated each round, 20 s apart. The bag was read
+  into the page cache before every run. GLIM's first run still read part of the
+  bag from disk (512,592 file-system input blocks against 29,272 and 1,968), and
+  it is the slowest.
+- **APE scorer:** `scripts/ape_from_tum.py --interpolate` on IMU-frame
+  trajectories (GLIM `dump/traj_imu.txt`, the lidarslam frontend trajectory,
+  which is also its result with loop closure off), without a lever-arm offset.
+  - This differs from the historical runner's prism-offset scoring, so these
+    values are comparable within this table, not with the historical one below.
+- **Data:** run rows, scores and the harness are in
+  [`bench_report`](https://github.com/rsasaki0109/lidar_slam_ros2/blob/develop/bench_report/REPORT.md)
+  (chapter 26).
+
+The results on this VM:
+
+- The `lidarslam_ros2` trajectory error is 44.1% lower and its maximum peak RSS
+  is 46.9% lower.
+- Its median processing RTF is 11.2% lower, but the ranges barely separate
+  (0.2115 against 0.2125).
+- Map quality was not re-measured in this rerun.
+
+### Historical Docker-based record (2026-07)
+
+| System | APE RMSE median (range), m | Processing RTF median | Peak RSS maximum, MB | Completion |
+| --- | ---: | ---: | ---: | ---: |
+| **lidarslam_ros2** | **0.056536** (identical across runs) | 0.993 | **586.83** | 3/3 |
+| GLIM CPU | 0.086624 (0.084876--0.086702) | **0.2437** | 690.88 | 3/3 |
+
+In that record, the `lidarslam_ros2` trajectory error was 34.7% lower and its
+maximum peak RSS was 15.0% lower. GLIM was substantially faster. Our individual
+processing RTFs were `1.094`, `0.993`, and `0.977`, so the median met 1.0 while
+the worst run did not. GLIM completed with 1,228 poses per run;
+`lidarslam_ros2` completed with 1,258 poses and ended within 0.0173 seconds of
+the bag end.
+
+That record does not establish complete map-quality superiority. At 0.1 m
+common downsampling, `lidarslam_ros2` had better mean plane thickness
+(`0.06081` vs `0.07911` m), but GLIM had slightly better p95 thickness
+(`0.12169` vs `0.12504` m) and substantially greater planar coverage
+(`0.43030` vs `0.17949`). Consequently this page claims a scoped trajectory
+result on this sequence, not a universal system-level victory.
+
+This is a scoped result on HILTI `exp04`, not an overall-SOTA claim. The
+historical table preserves the completed three-run Docker comparison; normal
+development needs only one new run.
+
+In a separate `n=1` development measurement, task-local correspondence
+reduction kept the 1,258-pose frontend trajectory byte-identical while mean ICP
+time moved from 21.60 ms to 20.92 ms and frontend wall time from 47.51 s to
+46.55 s. These timing deltas are directional optimization evidence, not a
+statistical or cross-system claim.
+
+Reproducibility identifiers:
+
+- HILTI bag SHA-256: `d1117a4c6e4c3626a3039e48719ec6e39af34b0a95f5a9807163bc717229c8ee`
+- common six-checkpoint SHA-256: `537b7e0f13f223a07f8329cc2b7080e33dc2765a13293d67a7eb3312090db1b8`
+- GLIM core v1.2.2: `faa264a1bce1bda406f73457e35511f56cdc2eaa`
+- GLIM ROS 2: `4a9e7a4cb084967c8525a1be529ad3ba2a118ae7`
+- runner and complete research record:
+  [`competitive-slam-plan-2026-07.md`](https://github.com/rsasaki0109/lidar_slam_ros2/blob/v0.11.0/docs/research/competitive-slam-plan-2026-07.md#glim-cpu-exp04-baseline)
+  at the `v0.11.0` tag
+
+The two-system comparison runners were retired after `v0.11.0`. One new run of
+each system therefore starts from that tag:
+
+```bash
+git checkout v0.11.0
+python3 scripts/run_ours_competitive_benchmark.py \
+  --bag <hilti-exp04-ros2-bag> \
+  --reference-tum <common-six-checkpoints.tum> \
+  --reference-meta <common-six-checkpoints.json> \
+  --rko-param configs/hilti2022/rko_lio_hilti2022_pandar_competitive_v2.yaml \
+  --lidarslam-param configs/hilti2022/lidarslam_competitive_v2.yaml \
+  --output output/hilti_exp04_ours_n1 --runs 1
+python3 scripts/run_glim_benchmark.py \
+  --bag <hilti-exp04-ros2-bag> \
+  --output output/hilti_exp04_glim_n1 --runs 1
+```
+
+## Voxel-SLAM v17 research candidate vs pinned OSS rivals
+
+This separate experiment evaluates a weak-axis/bounded-map Voxel-SLAM
+derivative. It is not the default `RKO-LIO + graph_based_slam` release path.
+The comparison used the common exposed SOTA-v5 references and frozen
+interpolating scorer. Values are median per-sequence APE RMSE in metres from
+three complete repetitions; the final column is the geometric mean across the
+three datasets.
+
+| System | NavINST Indoor02 | Oxford Spires Keble 05 | UrbanNav HK Tunnel 1 | Geometric mean |
+| --- | ---: | ---: | ---: | ---: |
+| **v17 candidate** | 0.17486 | 0.13949 | **488.22566** | **2.2836** |
+| GLIM | 1.52860 | **0.11316** | 757.80951 | 5.0779 |
+| Point-LIO | 0.65142 | 0.13626 | 638.93868 | 3.8388 |
+| FAST-LIO2 | 0.84663 | 0.52470 | 757.42790 | 6.9576 |
+| fixed Voxel-SLAM | **0.16664** | 0.14671 | 818.79944 | 2.7160 |
+
+Relative to the pinned rivals, v17's geometric-mean APE is 55.0% lower than
+GLIM, 40.5% lower than Point-LIO, 67.2% lower than FAST-LIO2, and 15.9% lower
+than fixed Voxel-SLAM. All nine v17 runs completed; maximum processing RTF was
+`0.83623`, maximum peak RSS was `274.50 MB`, and the frontend-only experiment
+accepted zero loop edges.
+
+Important limitations:
+
+- These datasets became exposed development data after the SOTA-v5 evaluation;
+  this is repeatable research evidence, not a fresh blind benchmark.
+- v17 loses Oxford to GLIM by about 23% and narrowly loses NavINST to fixed
+  Voxel-SLAM. The aggregate win must not be presented as a per-sequence sweep.
+- The hundreds-of-metres UrbanNav APE values mean every compared system still
+  struggles badly with the tunnel's longitudinal weak axis.
+- v17 is a research frontend with its built-in loop closure/HBA disabled. It
+  has not passed the map-geometry and fresh-holdout gates required for a SOTA
+  claim and is not shipped as the default public workflow.
+
+The reproducible candidate is fixed Voxel-SLAM revision
+`70fc8a28d63823d5989ff184daeea0787b672398` plus
+`weak_axis_bounded_map.patch` (SHA-256
+`62f6e1c5d055106b08b4037267f6b6ac7d8b1c06757719b763b7107c47795b25`).
+The frozen run configuration used replay rate `1.2` and CPU set `2-7`.
+
+## Degenerate LiDAR-IMU odometry on ENWIDE
+
+On all ten ENWIDE sequences (handheld Ouster OS0-128: tunnels, lake shore, fields,
+intersections and runways), RKO-LIO with the
+[`photometric_bump_no_radar`](degeneracy-guide.md) configuration (ENWIDE v10) had no
+failure and the lowest median ATE among the five methods reproduced on the same bags:
+
+| System | Median ATE | Sequences over 20 % 10 m RTE |
+| --- | ---: | ---: |
+| **RKO-LIO v10 (this repository)** | **0.29 m** | **0** |
+| BIEVR-LIO | 0.32 m | 3 |
+| COIN-LIO | 0.69 m | 0 |
+| FAST-LIO2 | 16.0 m | 6 |
+| Point-LIO | 32.0 m | 6 |
+
+- The official `degenerate_lio_sota_v4` profile run gave three identical repetitions per
+  sequence and was faster than real time. v10 equals v8 (the `_v3` record) on nine
+  sequences and is 0.017 m worse on TunnelD.
+- Three of the ten sequences were used to develop the configuration.
+- On GEODE's Hard sequences most methods fail almost everywhere. Only GEODE's Metro
+  Tunneling bags are held out from the GEODE configurations.
+  - **Held out: the Metro Tunneling holdout.** These are GEODE's UGV tunnels, 13 bags, each
+    run once under rules fixed before the run. On them RKO-LIO has the fewest failures (none),
+    but not the best accuracy.
+    - **tunnel1–3 (seven bags).** v18 is the only method without a failure, but BIEVR-LIO
+      (0.35 m) and FAST-LIO2 (0.36 m) have a lower median ATE than v18 (0.84 m), from the
+      three Livox bags.
+    - **tunnel4–5 (six bags).** These tested configurations per sensor and platform.
+      RKO-LIO has no failure and matches BIEVR-LIO on the Ouster and Livox bags, but
+      BIEVR-LIO's median ATE is lower (0.34 against 0.36 m), from the two VLP-16 bags.
+  - **Not held out: the 18 Hard sequences and the stairs.** From v13 on, every GEODE
+    configuration was chosen by its results there, while the rivals run their own
+    configurations with only the sensor settings changed. These numbers favour RKO-LIO and
+    do not compare the methods on unseen data.
+    - **Withdrawn.** An earlier version of this page said that the GEODE configuration v16
+      has the lowest median ATE there (5.6 m, against BIEVR-LIO's 180 m). On the Livox
+      device every method had been given an IMU 7.5–80 ms off the LiDAR clock.
+    - **On the synchronised internal IMU.** The median ATE over the 18 sequences is 8.5 m for
+      v16, 3.8 m for v17 and 2.85 m for v18, against 78.7 m for BIEVR-LIO.
+    - **GEODE's stairs.** v17's gait lost 6.3–6.5 m there. v18 was developed after that,
+      under a rule chosen after its results, and tracks them at 0.18 and 0.24 m, against 0.22
+      and 0.23 m for BIEVR-LIO.
+    - **On the six Livox shield tunnels.** BIEVR-LIO is better even so: median 0.85 m,
+      against 1.9 m for v18.
+
+Per-sequence tables, revisions and reproduction are in the
+[ENWIDE](research/enwide-photometric-registration-2026-10.md) and
+[GEODE](research/geode-hard-evaluation-2026-10.md) research notes.
+
+## Development-data results: MapsHD humanoid trials, Oxford Spires and exp04
+
+These results come from the 2026-10 benchmark report
+([`bench_report/REPORT.md`](https://github.com/rsasaki0109/lidar_slam_ros2/blob/develop/bench_report/REPORT.md),
+chapters 15–25). Every setting was chosen on these same sequences, so they are
+development-data results, not held-out evidence. The settings are kept as
+parameter files under `bench_report/params/`; the repository defaults and the
+competitive profile above are unchanged.
+
+- **Sequences:** the eight trials of MapsHD HUMANOID-LIO-DATASET (humanoid
+  walking with a Livox MID-360, zenodo record 21318128), Oxford Spires Keble 05
+  and HILTI 2022 `exp04`.
+- **Pipeline:** RKO-LIO + `graph_based_slam` with loop closure, one run per
+  sequence on a 4-vCPU cloud VM.
+- **Scoring:**
+  - MapsHD: the benchmark's own `evo_ape tum <ground truth> <estimate> -a`, in
+    the LiDAR frame.
+  - Oxford: SE(3)-aligned APE against the dataset ground truth.
+  - `exp04`: all seven surveyed checkpoints. This is different from the
+    six-checkpoint GLIM table above.
+- **Settings:**
+  - backend: `lidarslam_competitive_v2_loop_ndt1_res2_rot1e6_drift_adjt1e4_dist60_loopc.yaml`;
+  - MapsHD frontend: `rko_params_mapshd_gyro002_jerk1000_corr025_locn10.ros.yaml`, a
+    per-dataset profile that makes Oxford worse;
+  - Oxford and `exp04` frontends: `rko_params_oxford_gyro002_jerk1000.ros.yaml`
+    and `rko_params_gyro002_jerk1000.ros.yaml`.
+
+| Sequence | Pipeline APE RMSE, m | Frontend alone, m |
+| --- | ---: | ---: |
+| MapsHD calibration-room 1 | 0.0257 | 0.0263 |
+| MapsHD calibration-room 2 | 0.0206 | 0.0205 |
+| MapsHD flat-room 1 | 0.0149 | 0.0148 |
+| MapsHD long-corridor 1 | 0.0712 | 0.0712 |
+| MapsHD outdoor-urk 1 | 0.0506 | 0.0507 |
+| MapsHD underground-garage 1 | 0.0427 | 0.0440 |
+| MapsHD underground-garage 2 | 0.0381 | 0.0293 |
+| MapsHD underground-garage 3 | 0.0316 | 0.0267 |
+| Oxford Spires Keble 05 | 0.0463 | 0.0503 |
+| HILTI 2022 `exp04` (seven checkpoints) | 0.0517 | 0.0520 |
+| Geometric mean | 0.0358 | 0.0348 |
+
+The geometric mean over these ten sequences was 0.0908 m at the start of the
+report (chapter 15). The pipeline is still above the frontend alone, mostly on
+the garage trials: there, the NDT loop edges are 5–25 cm off while the frontend
+is 1–3 cm off between the same submaps.
+
+This table uses NDT 2 m loop registration. The walking preset registers loops
+with small_gicp (correspondences within 0.5 m) since 2026-11 (report chapters
+50 and 51). With the later Phase 1 frontend, chapter 37 measured these ten
+sequences at a geometric mean of 0.0354 m with small_gicp 0.5 m and 0.0364 m
+with NDT 2 m (frontend alone 0.0353 m); small_gicp made no sequence more than
+2.7 % worse than the frontend alone, NDT 2 m two garage trials 16–22 % worse.
+
+Context, not a ranking:
+
+- **MapsHD calibration-room trial 1:** the benchmark's published table lists
+  APE values from 0.0365 m to 0.150 m for 25 methods. These cannot be ranked
+  against the value above:
+  - the settings above were chosen on this trial;
+  - the benchmark records each method's trajectory through an HDMapping
+    session and a wrapper-specific frame;
+  - a same-VM rerun of the benchmark's GLIM configuration did not reproduce its
+    published value (0.663 m against 0.150 m; report chapter 15.7).
+- **Oxford Spires Keble 05:** on the same VM, bag and scorer, GLIM CPU (core
+  `faa264a`, the `hilti2022_cpu` configuration with Oxford's extrinsics) gave
+  0.125 and 0.112 m in two runs (report chapter 14.5). That measurement predates
+  chapters 15–25 and was not alternated with the final settings.
+- **Runtime and memory** were not measured with alternated repetitions in these
+  chapters, so they are not reported here.
+
+## Current Default Position
+
+The current tagged-release position is:
+
+- default workflow: `RKO-LIO + graph_based_slam`
+- official product entrypoints: the three commands in
+  [`docs/product-contract.md`](product-contract.md)
+- release gate: `bash scripts/run_release_readiness_checks.sh --fail-on-profiles`
+  using `scripts/release_profiles.yaml` (per-dataset pass/target thresholds)
+- map-cleanup benchmark: `bash scripts/run_dynamic_object_filter_benchmark.sh`
+- classic-path suite: `bash scripts/run_open_data_classic_path_benchmark_suite.sh`
+- place-recognition suite: `bash scripts/run_place_recognition_benchmark.sh`
+- KITTI Odometry dev split: `bash scripts/run_kitti_00_05_07_report.sh`
+- research-track MID360 default tuning (kept for parity with prior numbers):
+  `voxel_size=0.5`, `max_range=80.0`, `search_submap_num=5`,
+  `loop_edge_dedup_index_window=20`, `loop_edge_info_weight=200`
+
+## Interpretation
+
+Safe claims:
+
+- the default path is benchmarked on `NTU VIRAL` and reports on `MID-360`
+- the pointcloud-map flow is dogfooded into Autoware end-to-end (map loaders)
+- the repository already provides reusable comparison artifacts for
+  dynamic-filtering, classic-path open-data runs, and place-recognition
+- the release gate is now data-aware (per-dataset pass/target thresholds) so
+  hard datasets (`MID-360`, `NTU VIRAL`) can be reported without being
+  forced to one global APE threshold
+- the built-in GPL-free `Scan Context` path is now benchmarked and improves the
+  fair current-code `MID-360` rerun baseline, but it is still documented as
+  opt-in
+- the experimental submap-BEV path currently works better as a
+  distance-candidate rerank than as a standalone loop source
+
+Unsafe claims:
+
+- that this repo is already the universal winner on every dataset
+- that this repo should be judged primarily as a localization-research stack
+- that the current default path is fully validated against every aggressive
+  motion edge case
+- that the `MID-360` research-track number (3.5–4.0 m vs GLIM) is anywhere
+  near production accuracy on solid-state LiDAR
+
+## Release Scope Reminder
+
+`v0.12.0` is the current release. The maintained product boundary is
+offline rosbag2-to-verified-map authoring through the three official
+entrypoints. Lanelet generation remains operator-reviewed, and evaluation-tier
+sensor, GNSS, radar, coloured-map, and optional loop-detector paths do not
+become universal hardware guarantees merely because benchmark evidence exists.
+
+The authoritative supported outcome, support tiers, compatibility policy, and
+non-goals are in [`docs/product-contract.md`](product-contract.md). Product
+maturation toward v0.9 and v1.0 follows
+[`docs/roadmap/v0.9.md`](roadmap/v0.9.md).

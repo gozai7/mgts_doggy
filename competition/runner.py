@@ -23,11 +23,30 @@ ROOT = Path(__file__).resolve().parents[1]
 def command(cmd, logfile, timeout):
     logfile = Path(logfile); logfile.parent.mkdir(parents=True, exist_ok=True)
     started = time.monotonic()
+    peak_ram = 0
+    peak_cpu = 0.
     with logfile.open("w") as log:
         log.write("COMMAND " + json.dumps(cmd) + "\n"); log.flush()
         proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
         try:
-            rc = proc.wait(timeout=timeout)
+            while proc.poll() is None:
+                if time.monotonic()-started > timeout:
+                    raise subprocess.TimeoutExpired(cmd,timeout)
+                rss, ticks = 0, 0
+                for stat in Path("/proc").glob("[0-9]*/stat"):
+                    try:
+                        fields = stat.read_text().rsplit(")",1)[1].split()
+                        if int(fields[2]) == proc.pid:
+                            ticks += int(fields[11])+int(fields[12])
+                            rss += int(fields[21])*os.sysconf("SC_PAGE_SIZE")
+                    except (OSError,ValueError,IndexError):
+                        continue
+                peak_ram=max(peak_ram,rss); peak_cpu=max(peak_cpu,ticks/os.sysconf("SC_CLK_TCK"))
+                try:
+                    proc.wait(timeout=.1)
+                except subprocess.TimeoutExpired:
+                    pass
+            rc = proc.returncode
         except BaseException:
             if proc.poll() is None:
                 os.killpg(proc.pid, signal.SIGINT)
@@ -37,7 +56,9 @@ def command(cmd, logfile, timeout):
                     os.killpg(proc.pid, signal.SIGKILL); proc.wait()
             raise
     receipt = {"command": cmd, "exit_code": rc, "wall_time_s": time.monotonic() - started,
-               "peak_ram_bytes": None, "peak_vram_bytes": None}
+               "peak_ram_bytes": peak_ram or None, "sampled_cpu_time_s": peak_cpu or None,
+               "resource_method": "Linux process-group /proc samples at 100 ms; short-lived children may be missed",
+               "peak_vram_bytes": None}
     write_json(logfile.with_suffix(".json"), receipt)
     if rc:
         raise RuntimeError(f"Command failed ({rc}); see {logfile}")
@@ -69,6 +90,8 @@ def run_phase(phase, c, root, backend):
     folder = root / phase
     if (folder / "complete.json").exists():
         saved = json.loads((folder / "complete.json").read_text())
+        if phase == "mapping" and saved.get("backend") != backend:
+            raise ValueError("Mapping checkpoint belongs to another backend; choose a new output root")
         if saved.get("phase_config_sha256") != phase_fingerprint(c, phase):
             raise ValueError("Completed phase uses a different config; choose a new output root")
         required = ["trajectory_optimized.tum", "map.pcd"] if phase == "mapping" else ["trajectory.tum", "diagnostics.json"]
@@ -150,17 +173,46 @@ def run_phase(phase, c, root, backend):
 
 def main(argv=None):
     p = argparse.ArgumentParser(description="Competition SLAM workflow")
-    p.add_argument("action", choices=["doctor","normalize","prepare","mapping","localization","baseline","occupancy","evaluate","run-all"])
+    p.add_argument("action", choices=["doctor","normalize","prepare","mapping","localization","baseline","odometry","occupancy","evaluate","run-all","benchmark-localization"])
     p.add_argument("--config", default="configs/competition/dataset.yaml")
     p.add_argument("--phase", choices=["mapping","localization"], default="mapping")
+    p.add_argument("--profile", choices=["baseline","beluga","ndt_kiss","beluga_kiss"])
+    p.add_argument("--backend", choices=["glim","rko_lio"])
     args = p.parse_args(argv); c = load(args.config)
     root = Path(c["output"]).resolve(); root.mkdir(parents=True, exist_ok=True)
-    backend = (ROOT / "BACKEND").read_text().strip()
+    from .localization import mapping_backend
+    if args.backend:
+        c["mapping"]["backend"] = args.backend
+    backend = mapping_backend(c, (ROOT / "BACKEND").read_text().strip())
+    experimental = args.profile or c["localization"].get("backend") == "beluga" or c.get("odometry",{}).get("source") == "kiss_icp" or c["localization"].get("map_bundle")
+    if args.action in ("odometry","benchmark-localization") or args.action == "localization" and experimental:
+        from .experiments import run
+        if args.action == "benchmark-localization":
+            from .benchmark import benchmark
+            benchmark(c, root)
+        else:
+            run(c, root, args.profile or ("ndt_kiss" if args.action == "odometry" else None), odometry_only=args.action=="odometry")
+        return 0
     if args.action == "doctor":
         result = audit(c["bags"][args.phase], root / "diagnostics" / args.phase)
         print(json.dumps({k: result[k] for k in ("bag","errors","warnings")}, ensure_ascii=False, indent=2))
         return 2 if result["errors"] else 0
     if args.action == "prepare":
+        if experimental:
+            from .localization import select
+            selected = select(phase_config(c,"localization"),args.profile)
+            validate(selected, selected["localization"]["prediction"]=="imu")
+            d = root/"prepared"/selected["localization"]["profile"]; d.mkdir(parents=True,exist_ok=True)
+            if selected["localization"]["backend"]=="beluga":
+                from .experiments import beluga_params, map_bundle
+                (d/"config").mkdir(exist_ok=True)
+                beluga_params(selected,None,map_bundle(selected,root),root,d)
+            else:
+                bundle=Path(selected["localization"].get("map_bundle",root))
+                backends.localization_config(selected,d/"localization.yaml",bundle/"mapping/map.pcd")
+            (d/"resolved_config.yaml").write_text(yaml.safe_dump(selected))
+            print(f"Prepared {d}; no localization was executed")
+            return 0
         validate(c)
         d = root / "prepared"; d.mkdir(exist_ok=True)
         if backend == "glim":
@@ -175,13 +227,18 @@ def main(argv=None):
     write_json(root / "diagnostics/system.json", {"python": platform.python_version(), "platform": platform.platform(),
                "backend": backend, "upstreams": json.loads((ROOT / "THIRD_PARTY.lock.json").read_text())})
     actions = ["mapping","localization","occupancy","evaluate"] if args.action == "run-all" else [args.action]
+    if args.action=="run-all" and experimental:
+        actions=["mapping","occupancy","localization","evaluate"]
     if args.action == "run-all":
         for phase in ("mapping","localization"):
             report = audit(c["bags"][phase], root / "diagnostics" / phase)
             if report["errors"]:
                 raise ValueError(f"Bag Doctor found errors in {phase}: {report['errors']}")
     for action in actions:
-        if action in ("mapping","localization","baseline"):
+        if action=="localization" and experimental:
+            from .experiments import run
+            run(c,root,args.profile)
+        elif action in ("mapping","localization","baseline"):
             run_phase(action, c, root, backend)
         elif action == "occupancy":
             from .occupancy import build
@@ -206,8 +263,12 @@ def main(argv=None):
                   lidar_topic="/rko_lio/frame" if use_backend_scans else "/competition/lidar", deskewed=use_backend_scans)
             write_json(marker, identity)
         elif action == "evaluate":
-            from .evaluate import evaluate
-            evaluate(root)
+            if experimental:
+                from .benchmark import comparison_report
+                comparison_report(root)
+            else:
+                from .evaluate import evaluate
+                evaluate(root)
     return 0
 
 

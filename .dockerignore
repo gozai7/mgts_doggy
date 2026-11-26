@@ -12,3 +12,4 @@ install
 log
 .venv
 dist
+pull

@@ -1,0 +1,159 @@
+// MIT License
+//
+// Copyright (c) 2022 Ignacio Vizzo, Tiziano Guadagnino, Benedikt Mersch, Cyrill
+// Stachniss.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+//
+// NOTE: This implementation is heavily inspired in the original CT-ICP VoxelHashMap implementation,
+// although it was heavily modifed and drastically simplified, but if you are using this module you
+// should at least acknoowledge the work from CT-ICP by giving a star on GitHub.
+//
+// Ported to rko_lio from kiss-icp (kiss_icp/cpp/kiss_icp/core/VoxelHashMap.{hpp,cpp}).
+#pragma once
+
+// brings VoxelHash and point_to_voxel
+#include "voxel_down_sample.hpp"
+
+#include <Eigen/Core>
+#include <array>
+#include <cstdint>
+#include <optional>
+#include <sophus/se3.hpp>
+#include <tsl/robin_map.h>
+#include <string>
+#include <tuple>
+#include <vector>
+
+namespace rko_lio::core {
+
+using Voxel = Eigen::Vector3i;
+using VoxelBlock = std::vector<Eigen::Vector3d>;
+/** A voxel's points as 32-bit offsets from the voxel's corner (set_compact_points). */
+using CompactVoxelBlock = std::vector<Eigen::Vector3f>;
+
+struct VoxelHashMap {
+  explicit VoxelHashMap(const double voxel_size,
+                        const double clipping_distance,
+                        const unsigned int max_points_per_voxel);
+
+  void clear() {
+    map_.clear();
+    compact_map_.clear();
+    normal_map_.clear();
+    voxel_fronts_.clear();
+    far_bound_sq_ = 0.0;
+  }
+  bool empty() const { return compact_points_ ? compact_map_.empty() : map_.empty(); }
+  /** Keep the points as 32-bit offsets from their voxel's corner instead of 64-bit coordinates:
+   *  12 instead of 24 bytes a point, within about 1e-8 m of the point at a 0.25 m voxel, in hash
+   *  tables filled to 0.9 instead of 0.5. Set it while the map is empty. */
+  void set_compact_points(bool compact) {
+    compact_points_ = compact;
+    // The compact map's hash tables are also filled further (0.9 instead of 0.5 of their buckets
+    // in use), about half the bucket memory; the default map's tables, and so its order, stay.
+    if (compact) {
+      compact_map_.max_load_factor(0.9f);
+      normal_map_.max_load_factor(0.9f);
+    }
+  }
+  void update(const std::vector<Eigen::Vector3d>& points, const Sophus::SE3d& pose);
+  void add_points(const std::vector<Eigen::Vector3d>& points);
+  void remove_points_far_from_location(const Eigen::Vector3d& origin);
+  std::vector<Eigen::Vector3d> pointcloud() const;
+  /** Diagnostic only (RKO_LIO_MAP_DIAG): one line of the map's sizes, its tables' bucket counts and
+   *  the voxels by number of points (1, 2, 3-4, 5-8, 9-16, 17+) with their summed point capacity. */
+  std::string memory_summary() const;
+  /** Re-express every stored point as `transform * point`, rebuilding the voxel grid. */
+  void transform(const Sophus::SE3d& transform);
+  std::tuple<Eigen::Vector3d, double> get_closest_neighbor(const Eigen::Vector3d& query) const;
+  // Widened neighbor search: scans a (2*voxel_search_radius+1)^3 block of voxels instead of the
+  // fixed 3x3x3 neighborhood used by the single-argument overload above. Ported from this fork's
+  // SparseVoxelGrid::GetClosestNeighbor (see git history); used by the degeneracy-aware solve /
+  // relocalization paths that need a wider correspondence search than plain ICP.
+  std::tuple<Eigen::Vector3d, double> get_closest_neighbor(const Eigen::Vector3d& query,
+                                                           int voxel_search_radius) const;
+
+  /** Points of the 3x3x3 voxels around one query voxel, looked up lazily and kept across calls.
+   *  ICP queries every keypoint once per iteration and keypoints rarely change voxels between
+   *  iterations, so most hash lookups can be reused. Valid only while the map is not modified.
+   *
+   *  It also keeps the last full search in this voxel: its query, the point it found, and a lower
+   *  bound on the distance from that query to every other point of the 3x3x3 voxels. A later
+   *  query that has moved less than that gap leaves the same point the nearest by a clear margin,
+   *  so the search is not repeated. */
+  struct NeighborhoodCache {
+    Voxel voxel = Voxel::Zero();
+    bool has_reference = false;
+    Eigen::Vector3d reference_query = Eigen::Vector3d::Zero();
+    Eigen::Vector3d reference_neighbor = Eigen::Vector3d::Zero();
+    double reference_others_distance = 0.0; // lower bound, from reference_query
+    std::uint32_t looked_up = 0;            // bit i: shift i has been looked up
+    std::array<const void*, 27> points{}; // Eigen::Vector3d, or Eigen::Vector3f with compact points
+    std::array<std::uint32_t, 27> sizes{};
+  };
+  /** Same result as the single-argument overload, reusing `cache` for the voxel lookups. */
+  std::tuple<Eigen::Vector3d, double> get_closest_neighbor(const Eigen::Vector3d& query,
+                                                           NeighborhoodCache& cache) const;
+
+  /** Opt into per-voxel surface-normal maintenance (localizability weighting). Off by
+   *  default so the common path pays nothing; when on, add_points() refreshes a PCA
+   *  normal for every voxel it modifies. */
+  void set_maintain_normals(bool maintain) { maintain_normals_ = maintain; }
+
+  /** Cached unit surface normal of the voxel containing `point`, if that voxel has one.
+   *  Normals exist only for voxels with >= min_normal_points points whose neighborhood
+   *  is planar (mid eigenvalue > planarity_ratio * smallest); orientation is arbitrary
+   *  (callers should use |n . axis| style expressions only). */
+  std::optional<Eigen::Vector3d> voxel_normal(const Eigen::Vector3d& point) const;
+
+  double voxel_size_;
+  double inv_voxel_size_;
+  double clipping_distance_;
+  unsigned int max_points_per_voxel_;
+  tsl::robin_map<Voxel, VoxelBlock, VoxelHash> map_;
+  bool maintain_normals_ = false;
+  unsigned int min_normal_points_ = 5;
+  double planarity_ratio_ = 3.0;
+  double min_mid_to_major_ratio_ = 0.05;
+  tsl::robin_map<Voxel, Eigen::Vector3d, VoxelHash> normal_map_;
+  bool compact_points_ = false;
+  tsl::robin_map<Voxel, CompactVoxelBlock, VoxelHash> compact_map_;
+
+private:
+  template <typename Points>
+  void refresh_normal(const Voxel& voxel, const Points& points);
+  template <typename Map>
+  void add_points_to(Map& map, const std::vector<Eigen::Vector3d>& points);
+  /** The corner of `voxel`, from which compact points are offsets. */
+  Eigen::Vector3d corner(const Voxel& voxel) const { return voxel.cast<double>() * voxel_size_; }
+
+  // The first point of every voxel, which remove_points_far_from_location() judges the voxel by,
+  // in no particular order; the voxel's key is that point's voxel. Scanning this list is much
+  // cheaper than walking map_.
+  struct VoxelFront {
+    Eigen::Vector3d point;
+  };
+  std::vector<VoxelFront> voxel_fronts_;
+  // Upper bound on the squared distance from far_bound_origin_ to any point of voxel_fronts_.
+  Eigen::Vector3d far_bound_origin_ = Eigen::Vector3d::Zero();
+  double far_bound_sq_ = 0.0;
+};
+
+} // namespace rko_lio::core

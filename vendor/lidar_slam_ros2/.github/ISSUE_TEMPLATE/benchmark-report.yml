@@ -1,0 +1,107 @@
+name: Benchmark Report
+description: Submit a reproducible benchmark run with metrics and artifacts.
+title: "[Benchmark] "
+labels:
+  - benchmark
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this template for reproducible benchmark reports.
+        Put the key metrics in the form. Attach a reviewed `metrics.json` or
+        public aggregate report only when it contains no private values.
+        Never attach a rosbag, map, trajectory, raw log, raw sensor data, or
+        private-site image to this public issue.
+
+  - type: input
+    id: dataset
+    attributes:
+      label: Public dataset or redacted input summary
+      description: For public input, give its canonical dataset, sequence, source, and license. For a private or custom bag, give only a redacted sensor/environment/duration summary; do not identify the site or upload the bag.
+      placeholder: NTU VIRAL tnp_01 (public) — or custom rosbag2 / OS1-32 / indoor / 180 s / location REDACTED
+    validations:
+      required: true
+
+  - type: input
+    id: environment
+    attributes:
+      label: ROS 2 / Ubuntu / hardware
+      description: Include distro, Ubuntu version, CPU/GPU, and sensor model if relevant.
+      placeholder: Jazzy / Ubuntu 24.04 / i7-12700 / Ouster OS1-32
+    validations:
+      required: true
+
+  - type: textarea
+    id: command
+    attributes:
+      label: Redacted command shape
+      description: Keep the executable, options, and non-private values, but replace credentials, private paths, host or user names, and precise locations with the literal REDACTED placeholder.
+      placeholder: bash scripts/run_benchmark.sh REDACTED --profile public-preset
+      render: bash
+    validations:
+      required: true
+
+  - type: input
+    id: params
+    attributes:
+      label: Configuration summary
+      description: Name a tracked or public preset and list changed non-private arguments. Never paste a private file path or complete custom YAML; replace credentials, private paths, host or user names, and coordinates with the literal REDACTED placeholder.
+      placeholder: rko_lio_ntu_viral.yaml; scan_context_threshold=0.55; map origin=REDACTED
+    validations:
+      required: true
+
+  - type: textarea
+    id: outputs
+    attributes:
+      label: Privacy-reviewed metrics evidence
+      description: Summarize the key metrics below first. Optionally attach or link one reviewed metrics.json or public aggregate report. Do not paste local paths or attach APE/raw logs, parameter files, rosbags, maps, trajectories, raw sensor data, private-site images, or precise coordinates.
+      placeholder: |
+        Attached: metrics.json (reviewed; no private paths or coordinates)
+        or: No file attached; key metrics are entered below.
+    validations:
+      required: true
+
+  - type: textarea
+    id: metrics
+    attributes:
+      label: Key metrics
+      description: Summarize the important numbers from metrics.json.
+      placeholder: |
+        corrected APE RMSE: 0.078
+        raw APE RMSE: 0.082
+        lidarslam success: true
+        map verify: PASS
+      render: text
+    validations:
+      required: true
+
+  - type: dropdown
+    id: autoware
+    attributes:
+      label: Autoware map verification
+      description: Did the generated map pass the local Autoware verifier?
+      options:
+        - PASS
+        - FAIL
+        - Not tested
+    validations:
+      required: true
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: Regression or comparison notes
+      description: Mention whether this improves, regresses, or matches prior runs.
+      placeholder: Better than backend_clean on the same bag by 0.04 m RMSE.
+
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Public evidence review
+      options:
+        - label: I replaced credentials, private paths, host or user names, and precise locations in the command and configuration with the literal REDACTED placeholder.
+          required: true
+        - label: The input is public and licensed, or I supplied redacted metadata only; I attached no rosbag, map or trajectory geometry, raw log, raw sensor data, or private-site image.
+          required: true
+        - label: I reviewed every attachment and link; it is only a safe metrics.json or public aggregate report, or I attached no file.
+          required: true

@@ -71,6 +71,13 @@ def normalize(msg, c):
     xyz, a = unpack(msg)
     xyz *= {"m": 1.0, "mm": .001, "cm": .01}[c["units"]["xyz"]]
     times = point_seconds(a, ns(msg), c["point_time"], c["lidar"]["scan_period_s"])
+    if c["lidar"].get("already_deskewed") and times is not None:
+        raise ValueError("Already deskewed input requires point_time.mode:none; refusing double deskew")
+    if c.get("odometry",{}).get("source")=="kiss_icp" and times is not None and len(times)>1 and np.ptp(times)<=0:
+        raise ValueError("KISS deskew requires varying valid point timestamps; explicitly select mode:none otherwise")
+    if c.get("odometry",{}).get("source")=="kiss_icp" and c.get("odometry",{}).get("deskew") and times is not None and len(times):
+        if times.max()>.002 or times.max()<-.002:
+            raise ValueError("KISS deskew requires point times relative to the verified end-of-sweep header")
     r = np.linalg.norm(xyz, axis=1)
     lo, hi = c["lidar"]["range_m"]
     mask = np.isfinite(xyz).all(axis=1) & (r >= lo) & (r <= hi)

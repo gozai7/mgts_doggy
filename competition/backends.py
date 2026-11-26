@@ -159,8 +159,8 @@ def localization_config(c, path, map_path):
         "ndt_num_threads": 4, "score_threshold": float(l["score_threshold"]), "reject_above_score_threshold": True,
         "voxel_leaf_size": float(l["voxel_leaf_size"]), "scan_period": float(c["lidar"]["scan_period_s"]),
         "scan_min_range": float(c["lidar"]["range_m"][0]), "scan_max_range": float(c["lidar"]["range_m"][1]),
-        "publish_tf": True, "enable_map_odom_tf": predictor == "kinematic",
-        "use_odom": predictor == "kinematic", "use_odom_tf_prediction": False,
+        "publish_tf": not l.get("supervised_tf", False), "enable_map_odom_tf": predictor in ("kinematic", "external_tf"),
+        "use_odom": predictor == "kinematic", "use_odom_tf_prediction": predictor == "external_tf",
         "use_twist_prediction": False, "use_imu_preintegration": predictor == "imu",
         "imu_preintegration_use_base_frame_transform": True, "imu_accel_scale": 1.0,
         "predict_pose_from_previous_delta": predictor == "constant_velocity",
@@ -171,6 +171,8 @@ def localization_config(c, path, map_path):
         "enable_reinitialization_request_output": True, "enable_reinitialization_request_latch": True}
     if initial is not None:
         params.update({"initial_pose_" + k: float(v) for k, v in zip(("x","y","z","qx","qy","qz","qw"), initial)})
+    if predictor == "external_tf":
+        params["level_map_to_odom"] = False
     yaml_params(path, params)
     return params
 

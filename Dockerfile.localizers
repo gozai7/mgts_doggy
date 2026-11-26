@@ -1,0 +1,46 @@
+FROM ros:jazzy-ros-base@sha256:5147d3ae250ce754afd399f6bfec15b33dd4e473ca357e30432a3182031bfad6 AS dependencies
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+ARG ROS_APT_MIRROR=http://packages.ros.org/ros2/ubuntu
+ARG BUILD_JOBS=2
+RUN sed -i -e 's/^Types: deb deb-src/Types: deb/' -e "s#http://packages.ros.org/ros2/ubuntu#${ROS_APT_MIRROR}#" /usr/share/ros-apt-source/ros2.sources \
+    && apt-get update && apt-get install -y --no-install-recommends \
+       build-essential cmake git python3-pip python3-venv python3-colcon-common-extensions \
+       libeigen3-dev libpcl-dev libomp-dev libtbb-dev libfmt-dev libspdlog-dev \
+       librange-v3-dev libnanoflann-dev libopenvdb-dev libceres-dev robin-map-dev \
+       ros-jazzy-sophus ros-jazzy-tf2-sensor-msgs ros-jazzy-pcl-conversions \
+       ros-jazzy-rclcpp-components ros-jazzy-ament-cmake-auto ros-jazzy-diagnostic-msgs \
+       ros-jazzy-tf2-eigen ros-jazzy-tf2-geometry-msgs ros-jazzy-pybind11-vendor \
+       ros-jazzy-rosbag2-storage-mcap && rm -rf /var/lib/apt/lists/*
+WORKDIR /mgts
+COPY requirements-competition.txt .
+RUN python3 -m venv --system-site-packages /opt/competition-venv \
+    && /opt/competition-venv/bin/pip install --no-cache-dir -r requirements-competition.txt
+ENV PATH=/opt/competition-venv/bin:${PATH} PYTHONUNBUFFERED=1
+FROM dependencies AS localizers
+COPY vendor/beluga/ vendor/beluga/
+COPY vendor/kiss-icp/ vendor/kiss-icp/
+COPY vendor/ndt_omp_ros2/ vendor/ndt_omp_ros2/
+COPY vendor/lidar_localization_ros2/ vendor/lidar_localization_ros2/
+COPY docker/competition/build-localizers.sh docker/competition/
+COPY docker/competition/beluga-sophus.cmake docker/competition/
+RUN BUILD_JOBS=${BUILD_JOBS} bash docker/competition/build-localizers.sh dependencies
+COPY localization_ros/ localization_ros/
+RUN BUILD_JOBS=${BUILD_JOBS} bash docker/competition/build-localizers.sh adapter
+COPY competition/ competition/
+COPY configs/ configs/
+COPY tests/competition/ tests/competition/
+COPY tools/ tools/
+COPY THIRD_PARTY.lock.json BACKEND ./
+COPY --chmod=755 docker/competition/entrypoint.sh docker/competition/entrypoint.sh
+ENTRYPOINT ["/mgts/docker/competition/entrypoint.sh"]
+CMD ["python3", "-m", "competition.runner", "--help"]
+
+# Optional CPU mapper for end-to-end checks without the GLIM/CUDA toolchain.
+FROM localizers AS rko
+RUN apt-get update && apt-get install -y --no-install-recommends ros-jazzy-libg2o nlohmann-json3-dev \
+    && rm -rf /var/lib/apt/lists/*
+COPY vendor/rko_fork/ /opt/competition_ws/src/rko_lio/
+COPY vendor/lidar_slam_ros2/ /opt/competition_ws/src/lidar_slam/
+RUN source /opt/ros/jazzy/setup.bash && source /opt/competition_ws/install/setup.bash \
+    && cd /opt/competition_ws && MAKEFLAGS=-j2 colcon build --packages-up-to graph_based_slam rko_lio \
+       --executor sequential --cmake-args -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF -DRKO_LIO_FETCH_CONTENT_DEPS=OFF

@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_PATH="${BASH_SOURCE[0]}"
+LINK_DEPTH=0
+while [[ -L "${SCRIPT_PATH}" ]]; do
+  LINK_DEPTH=$((LINK_DEPTH + 1))
+  if [[ ${LINK_DEPTH} -gt 40 ]]; then
+    echo "error: lidarslam launcher symlink depth exceeds 40" >&2
+    exit 70
+  fi
+  LINK_TARGET=$(readlink "${SCRIPT_PATH}")
+  if [[ "${LINK_TARGET}" == /* ]]; then
+    SCRIPT_PATH="${LINK_TARGET}"
+  else
+    SCRIPT_PATH="$(dirname "${SCRIPT_PATH}")/${LINK_TARGET}"
+  fi
+done
+
+SCRIPT_DIR=$(cd "$(dirname "${SCRIPT_PATH}")" && pwd)
+CLI_PATH="${SCRIPT_DIR}/lidarslam_cli.py"
+SOURCE_LAYOUT=false
+
+if [[ ! -f "${CLI_PATH}" ]]; then
+  for candidate in \
+    "${SCRIPT_DIR}/../share/lidarslam/product/scripts/lidarslam_cli.py" \
+    "${SCRIPT_DIR}/../../share/lidarslam/product/scripts/lidarslam_cli.py"
+  do
+    if [[ -f "${candidate}" ]]; then
+      CLI_PATH="${candidate}"
+      break
+    fi
+  done
+else
+  SOURCE_LAYOUT=true
+fi
+
+if [[ ! -f "${CLI_PATH}" ]]; then
+  echo "error: installed lidarslam product CLI resources were not found" >&2
+  exit 70
+fi
+
+# A direct source or installed launcher should be useful from a fresh terminal.
+# Source only a setup that can be tied to this checkout/install; never scan the
+# user's filesystem or execute an unrelated parent workspace setup.
+SETUP_CANDIDATES=()
+if [[ "${SOURCE_LAYOUT}" == true ]]; then
+  REPO_ROOT=$(cd "${SCRIPT_DIR}/.." && pwd)
+  # Expose the source benchmark Python package so the product CLI subcommands
+  # can import lidarslam_benchmark_tools from a plainly sourced shell.  The
+  # source package projects scripts/ and tools/; the manually installed
+  # copy is intentionally left off PYTHONPATH to avoid shadowing it.
+  export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+  REPO_PARENT=$(dirname "${REPO_ROOT}")
+  if [[ "$(basename "${REPO_PARENT}")" == "src" ]]; then
+    SETUP_CANDIDATES+=("$(dirname "${REPO_PARENT}")/install/setup.bash")
+  fi
+  SETUP_CANDIDATES+=(
+    "${REPO_ROOT}/install/setup.bash"
+    "${REPO_PARENT}/install/setup.bash"
+  )
+else
+  CLI_DIR=$(cd "$(dirname "${CLI_PATH}")" && pwd)
+  PRODUCT_PREFIX=$(cd "${CLI_DIR}/../../../.." && pwd)
+  SETUP_CANDIDATES+=(
+    "${PRODUCT_PREFIX}/setup.bash"
+    "$(dirname "${PRODUCT_PREFIX}")/setup.bash"
+  )
+fi
+
+for setup_candidate in "${SETUP_CANDIDATES[@]}"; do
+  [[ -f "${setup_candidate}" ]] || continue
+  ACTIVATED_CLI_PATH="${CLI_PATH}"
+  if [[ "${SOURCE_LAYOUT}" == true ]]; then
+    SETUP_ROOT=$(dirname "${setup_candidate}")
+    MERGED_CLI_PATH="${SETUP_ROOT}/share/lidarslam/product/scripts/lidarslam_cli.py"
+    ISOLATED_CLI_PATH="${SETUP_ROOT}/lidarslam/share/lidarslam/product/scripts/lidarslam_cli.py"
+    if [[ -f "${MERGED_CLI_PATH}" ]]; then
+      ACTIVATED_CLI_PATH="${MERGED_CLI_PATH}"
+    elif [[ -f "${ISOLATED_CLI_PATH}" ]]; then
+      ACTIVATED_CLI_PATH="${ISOLATED_CLI_PATH}"
+    else
+      continue
+    fi
+  fi
+
+  set +u
+  if ! source "${setup_candidate}"; then
+    set -u
+    echo "error: failed to activate lidarslam setup: ${setup_candidate}" >&2
+    exit 70
+  fi
+  set -euo pipefail
+  CLI_PATH="${ACTIVATED_CLI_PATH}"
+  break
+done
+
+# A source launcher runs the matching installed CLI so the activated runtime
+# and the command implementation stay together.  Edits to this checkout's
+# product scripts therefore take effect only after a rebuild; say so instead
+# of silently running the older installed copy.
+if [[ "${SOURCE_LAYOUT}" == true && "${CLI_PATH}" != "${SCRIPT_DIR}/lidarslam_cli.py" ]]; then
+  RUNTIME_MANIFEST="${REPO_ROOT}/lidarslam/product-runtime-files.txt"
+  INSTALLED_SCRIPTS=$(dirname "${CLI_PATH}")
+  STALE_SCRIPTS=()
+  if [[ -f "${RUNTIME_MANIFEST}" ]]; then
+    while IFS= read -r runtime_name || [[ -n "${runtime_name}" ]]; do
+      runtime_name="${runtime_name%%#*}"
+      runtime_name="${runtime_name//[[:space:]]/}"
+      [[ -n "${runtime_name}" && -f "${SCRIPT_DIR}/${runtime_name}" ]] || continue
+      if ! cmp -s "${SCRIPT_DIR}/${runtime_name}" "${INSTALLED_SCRIPTS}/${runtime_name}"; then
+        STALE_SCRIPTS+=("${runtime_name}")
+      fi
+    done < "${RUNTIME_MANIFEST}"
+  fi
+  if [[ ${#STALE_SCRIPTS[@]} -gt 0 ]]; then
+    BUILT_WORKSPACE=$(dirname "${SETUP_ROOT}")
+    echo "note: running the installed lidarslam-map under ${SETUP_ROOT};" \
+      "${#STALE_SCRIPTS[@]} product script(s) in this checkout differ from it" \
+      "(first: ${STALE_SCRIPTS[0]})." >&2
+    echo "      Rebuild to use your edits: cd $(printf '%q' "${BUILT_WORKSPACE}")" \
+      "&& colcon build --packages-select lidarslam" >&2
+  fi
+fi
+
+export LIDARSLAM_CLI_NAME
+LIDARSLAM_CLI_NAME=$(basename "$0")
+export PYTHONDONTWRITEBYTECODE=1
+exec python3 "${CLI_PATH}" "$@"

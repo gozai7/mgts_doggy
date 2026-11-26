@@ -1,0 +1,61 @@
+/*
+ * MIT License
+ *
+ * Copyright (c) 2025 Meher V.R. Malladi.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+
+#pragma once
+#include "rko_lio/driver/point_cloud.hpp"
+#include <Eigen/Core>
+#include <sophus/se3.hpp>
+// ros
+#include <sensor_msgs/msg/point_cloud2.hpp>
+#include <sensor_msgs/point_cloud2_iterator.hpp>
+
+#include <string>
+#include <vector>
+
+// The readers below are the ROS-free ones of rko_lio/driver/point_cloud.hpp applied to a view of
+// the message, so the ROS 2 node and the ROS-free driver read point clouds identically.
+namespace rko_lio::ros::utils {
+// Borrows msg.data; keep the message alive while the view is used.
+driver::PointCloudView point_cloud_view(const sensor_msgs::msg::PointCloud2& msg);
+
+std::vector<Eigen::Vector3d> point_cloud2_to_eigen(const sensor_msgs::msg::PointCloud2::ConstSharedPtr& msg);
+
+std::tuple<std::vector<Eigen::Vector3d>, std::vector<double>>
+point_cloud2_to_eigen_with_timestamps(const sensor_msgs::msg::PointCloud2::ConstSharedPtr& msg);
+
+/**
+ * Per-point reflectivity/intensity, same order as the point cloud. Prefers a "reflectivity"
+ * field (Ouster-calibrated, uint16), falling back to "intensity" (float32) when absent.
+ * Returns an empty vector if the cloud carries neither field or an unsupported datatype --
+ * callers treat that as "intensity unavailable", not an error.
+ */
+std::vector<float> point_cloud2_to_intensity(const sensor_msgs::msg::PointCloud2::ConstSharedPtr& msg);
+
+/**
+ * Per-point values of the named field as float, same order as the point cloud (float32,
+ * float64, uint8/16/32 or int8/16/32 fields). Empty when the field is missing.
+ */
+std::vector<float> point_cloud2_field_as_float(const sensor_msgs::msg::PointCloud2::ConstSharedPtr& msg,
+                                               const std::string& field_name);
+}; // namespace rko_lio::ros::utils

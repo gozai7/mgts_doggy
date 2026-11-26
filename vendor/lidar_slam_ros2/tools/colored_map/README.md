@@ -1,0 +1,475 @@
+# tools/colored_map — カメラ着色点群マップとエクスポート
+
+カメラ画像を LiDAR 点群へ投影して実色の SLAM マップを作り、GIS / mesh /
+LAS / CAD-BIM へ書き出すためのツール群。**3D Gaussian Splatting には依存しない**
+(古典的な投影 + z バッファ遮蔽 + medoid 色決定。レンダも `--device cpu` の
+numpy ラスタライザで CUDA / torch 不要)。歴史的経緯で
+`tools/gaussian_splatting/` に同居していたが 2026-07 に分離した。旧パスは
+互換 shim で import / 実行とも動き続ける。
+
+## 主なエントリポイント
+
+| ツール | 役割 |
+|---|---|
+| `colored_map_pipeline.py` | bag + TUM 軌跡 → posed images → 着色マップ → 品質ゲートまでの一括実行 |
+| `extract_posed_images.py` | bag から姿勢付きカメラ画像 (`transforms.json`) を抽出 |
+| `attach_dynamic_image_masks.py` | 外部の動的物体PNG maskを検証し、hash/coverage付きmanifestへ接続 |
+| `build_lidar_init.py` | スキャン蓄積 + robust着色（overlap RGB balance / view confidence対応） |
+| `refine_camera_poses.py` | 画像特徴点とLiDAR地図で view ごとにカメラ姿勢を補正（held-out ペアのエピポーラ誤差が改善したときだけ採用） |
+| `recolor_pointcloud.py` | 既存PLYのXYZを保持してcamera画像から再着色し、coverage JSONを出力 |
+| `render_map_flythrough.py` | 着色マップ動画（cinematic path / surface splat / 描画指標対応） |
+| `colorize_from_bag.py` | SLAM なし・静的 extrinsic での単発着色 (マルチカメラ融合対応) |
+| `map_export.py` / `las_export.py` / `mesh_export.py` | GIS delimited text / LAS 1.2 / 色付き mesh 出力 |
+| `bim_export.py` / `bim_pipeline.py` | 平面抽出 → IfcSlab/IfcWall/IfcDoor/IfcWindow/IfcSpace (IFC4) |
+
+品質評価は `scripts/evaluate_heldout_point_colors.py --image-margin`(忠実度)、
+`scripts/evaluate_colored_map_appearance.py`(彩度保持・胡椒ノイズ・coverage)、
+`scripts/check_colored_map_quality.py`(ゲート統合)の3点セットで行う。
+RTK-SLAM construction_seq1 の較正済み report-only 閾値は
+`configs/colored_map_quality_profiles/rtkslam_seq1_report_only.yaml` にある。
+品質ゲートのレポート引数はプロファイルが参照する領域だけ指定すればよい。
+`appearance_planar_roughness_*` 閾値を持つプロファイルでは平面限定roughnessも
+パイプラインが自動計算する。
+
+`evaluate_heldout_point_colors.py` の露出正規化は、着色に使う学習画像の
+輝度中央値を基準にする。レポートの `exposure_reference` は
+`training_views`（正規化無効時は `null`）。全画像の中央値を使っていた旧版の
+スコアとは直接比較せず、同じ版・分割・設定で再評価する。
+パイプラインの held-out 評価は、地図生成コマンドの実効着色設定を
+`--fusion-options` で受け渡し、同じ着色処理を学習画像だけで実行する。
+レポートに設定と学習・評価画像のインデックスを保存する。単独実行でこの指定を
+省略した場合は従来の既定設定による再着色を維持する。評価画像の露出補正と
+評価用 `--image-margin` は別設定で、パイプラインは露出設定を着色側と揃える。
+以前のパイプライン評価値とは条件が変わるため、候補と基準をともに再評価する。
+`--use-pointcloud-colors` は着色に使った画像集合や未着色点を検証しないため、
+その出力だけで held-out 精度を主張しない。
+
+パイプラインは各段階の成功した実行条件を
+`pipeline_stage_commands.json` に保存し、同じ条件の出力を再利用する。
+着色設定を変更すると地図と評価を、カメラ時刻・外部較正・画像設定を変更すると
+画像とその後続を再生成する。着色だけの変更では画像や較正を再計算しない。
+中断・失敗した段階と未実行の後続は再開時に作り直す。`--dry-run` は履歴を変更しない。
+旧出力など実行履歴がない場合は、一度元のbagから再生成する必要がある。
+`--force-images` / `--force-map` / `--force-quality` は従来どおり明示的な再生成に使える。
+判定にはコマンドと作業ディレクトリ、および対応する入力の更新時刻を使う。
+ソフトウェアの更新や更新時刻を保持した入力の置換は検出しないため、その場合は
+該当段階を `--force-*` で再生成する。
+
+`refine_camera_poses.py` は着色前に view ごとのカメラ姿勢を補正する。
+近い view 同士（既定 1・3 フレーム差）で ORB 特徴点を対応付け、片方の view の
+深度画像で LiDAR 面に持ち上げた点に、もう片方の view を PnP で合わせる。
+これを全 view で数回繰り返す。2 フレーム差のペアは当てはめに使わず、
+そのエピポーラ（Sampson）誤差が `--min-improvement` 以上下がったときだけ
+補正後の姿勢を書き出す（下がらなければ元の姿勢をそのまま書く）。色は使わないので、
+着色後の held-out 色誤差は独立した確認になる。近い view 同士の食い違い
+（色ぼけの原因）は数回で消えるが、全 view に共通する誤差（一定の外部較正誤差）は
+ほとんど観測できない。RTK-SLAM construction_seq1（260 view）での結果は
+下記「カメラ姿勢の補正」を参照。
+
+```bash
+python3 tools/colored_map/refine_camera_poses.py \
+  --transforms posed/transforms.json --pointcloud geometry.ply \
+  --out posed/transforms_refined.json --workers 4
+python3 tools/colored_map/recolor_pointcloud.py \
+  --input geometry.ply --transforms posed/transforms_refined.json --out colored.ply
+```
+
+realtime nodeの出力確認には`scripts/evaluate_realtime_colored_map.py`を使い、
+confirmed coverageとchromaをJSON保存できる。
+CPU rendererの`--soft-edge-px 1`は不透明surfaceを変えず黒い隙間だけをfadeで
+埋める。mesh exportは`--thin-voxel`でmulti-million-point入力を事前に間引ける。
+RTK-SLAMで検証済みのビネット補正は `--color-image-margin 120
+--color-vignette-gain-limit 2.5`。補正はgain limitが1のとき無効で、従来出力を
+維持する。
+K3構成ではさらに `--color-overlap-balance --color-view-confidence
+--color-normal-voxel 0.12 --color-view-score-power 1` を使う。前者は同じ3D点を
+見る画像間のRGB差から露出・white balanceを安定化し、後者はsurface normalの
+入射角と投影解像度で観測を順位付けする。いずれもdefault-off。
+
+品質を優先する場合は、既存の実行コマンドに `--color-max-samples 32` を追加して
+比較できる（既定値12）。固定geometry・姿勢・学習/評価画像分割で、この値だけを
+変更した結果は次の通り。数値はheld-out画像とのRGB L2誤差の平均で、小さい方がよい。
+
+| データ | 12観測 | 32観測 | 改善率 |
+|---|---:|---:|---:|
+| AIST 162554 | 37.442 | 35.807 | 4.37% |
+| AIST 162651 | 31.327 | 29.978 | 4.31% |
+| RTK construction_seq1 K4 | 61.850 | 51.329 | 17.01% |
+
+各走行の着色被覆と評価対象点は同一。ただし視点別中央値はAISTで各8視点、
+RTKで12視点が悪化した。反射面や誤投影の解決、測色的な真値への精度向上を
+証明するものではない。手元のGo2/JEPLO屋内5本は画像topicがなく、着色は未評価。
+
+RTK-SLAMの配布bagでは、カメラとIMUの約−20.6msの差は補正済みである
+（[公式の時刻説明](https://rtk-slam-dataset.github.io/#download)）。
+保存較正の `timeshift_cam_imu` を画像headerへ再度加えない。
+配布bagの補正済み時計と同じ時計の軌跡を使う場合は、既存の
+`--time-offset 0 --time-offset-adjustment 0` で追加補正を明示的に無効にできる。
+独自に変換したbagや別時計の軌跡では、その生成履歴を先に確認する。
+この指定はscan内の点時刻によるdeskewや外部較正を代替しない。
+
+RTK約491万点の単回比較では、12→32観測で処理時間274→426秒、ピークRSS
+2.97→4.24 GiBとなった（同じ旧medoid実装）。現在のmedoid実装は全観測間の
+距離配列をソートと累積和に置き換え、32観測で色・未着色mask・全品質評価値を
+完全一致させたままRSSを4.01 GiBに削減した。時間は430秒で、全処理の高速化は
+確認していない。さらに深度・品質の観測順位配列を共有し、同じRTK32設定の
+新しい比較でRSSを4.01→3.42 GiB（14.6%減）に削減した。点群色・未着色mask・
+全52評価視点の品質値は完全一致し、AIST 2本×12/32観測でも出力が完全一致した。
+この比較の時間は276→392秒だが、変更後の実行中に別の計算処理を観測しており、
+速度への影響は未確定。比較は単回で、実行順・cache・外部負荷の影響を含む。
+観測保持用メモリは残るため、余裕がない環境では既定値12を使う。
+
+検証記録（2026-09-25、ローカルデータルート
+`/media/sasaki/aiueo2/jeplo_data/experiments/colorization_accuracy/`）:
+`aist_all_training_samples_r1/`、`rtk_samples_paired_r1/comparison.json`、
+`medoid_memory_validation/`、`rtk_medoid_memory_r1/comparison.json`、
+`sample_rank_memory/{aist_completed,rtk_comparison,host_load_observation}.json`。
+入力・実効設定・ソースhashと、disjoint画像分割を各実験に保存している。
+
+地図geometry自体の動的障害物は、任意依存の
+[`dynamic-object-removal`](https://github.com/rsasaki0109/dynamic-3d-object-removal)
+0.5以降を導入し、`--dynamic-map-cleaner fusion`で除去できる。各LiDAR scanを
+trajectoryでworld座標へ変換した点と同じ時刻のsensor originをcleanerへ渡すため、
+単純な完成地図の点数削減ではない。大規模bagでは
+`--dynamic-map-cleaner-evidence-stride N`で判定用scanを間引ける。除去点数、比率、
+使用scan数、実装versionは`dynamic_map_cleaning.json`へ保存する。この機能も
+default-offで、静的構造の保持と既存quality profileをpaired評価してから有効化する。
+
+```bash
+pip install 'dynamic-object-removal>=0.5'
+python3 tools/colored_map/colored_map_pipeline.py BAG TRAJECTORY OUT \
+  --dynamic-map-cleaner fusion --dynamic-map-cleaner-workers 4 \
+  --dynamic-map-cleaner-evidence-stride 5
+```
+
+物体境界の色滲みを抑えるgeometry-aware fusionもdefault-offで利用できる。
+`--color-geometry-aware`は1 pixel z-buffer近傍で、手前silhouetteの隣に投影された
+背景点と、深度不連続の両側をRGB候補から除外する。外部segmentationのPNGを
+`--dynamic-mask-dir`で接続し`--color-dynamic-exclusion`を指定すると動的領域も
+除外する。`--refine-spatiotemporal-calibration`と
+`--color-calibration-sigma-multiplier`を組み合わせると、較正の7DoF不確実性と
+camera速度をpixel半径へ伝播し、各guardを観測ごとに拡張する。棄却数は
+`fusion_diagnostics`としてmap/recolor reportへ残る。
+
+```bash
+python3 tools/colored_map/colored_map_pipeline.py BAG TRAJECTORY OUT \
+  --extrinsic BODY_CAMERA.json --refine-spatiotemporal-calibration \
+  --color-geometry-aware \
+  --dynamic-mask-dir dynamic_masks --color-dynamic-exclusion \
+  --color-dynamic-mask-margin-px 2 \
+  --color-calibration-sigma-multiplier 1.0
+```
+
+maskは各posed imageと同じstemのPNGで、非zero pixelを除外領域とする。
+補間着色では色を混ぜる画素の範囲も除外判定する。edge-awareも保守的に同じ範囲を確認し、
+除外画素に接する観測を使わないため、境界で着色される点が減る場合がある。動的除外を
+有効にする場合は全frameのmaskが必須。露出・画像間色合わせ・周辺減光の補正量も
+除外領域を使わず推定する。全域除外などで支持がない画像は補正の根拠にしない。詳しい設計と安全条件は
+[`colored-map-geometry-aware-fusion-2026-07.md`](../../docs/research/colored-map-geometry-aware-fusion-2026-07.md)
+を参照。
+silhouette/depth-edge marginはConstruction Seq1の全量候補が既存planar quality
+gateを通らなかったため既定0。dataset固有のpaired A/Bと既存profileを通すまで
+明示的に有効化しないこと。
+
+edge-aware samplingは4 cornerの巨大な一時stackを作らず、同じcornerからRGBの
+min/maxをin-place更新する。旧式との完全一致testに加え、Construction Seq1の
+paired screenでPLY SHA-256とreportが一致し、wall timeを25.0%短縮した。詳細は
+[`colored-map-fusion-performance-2026-07.md`](../../docs/research/colored-map-fusion-performance-2026-07.md)。
+
+README動画の再現設定は `render_map_flythrough.py --device cpu
+--soft-edge-px 1 --surface-splat --surface-aspect-limit 2.5
+--surface-normal-voxel 0.12 --camera-preset cinematic --render-voxel 0.03
+--render-workers 4 --metrics-out metrics.json`。legacy camera、円形splat、直列描画は
+既定値のままで互換性を維持する。
+
+## 引き継ぎ文書
+
+- [`COLORING_HANDOFF.md`](COLORING_HANDOFF.md) — 着色品質枝 (2026-07-18)
+- [`BIM_HANDOFF.md`](BIM_HANDOFF.md) — Scan-to-BIM 枝 (2026-07-11)
+- [`colored-map-release-readiness-2026-07.md`](../../docs/research/colored-map-release-readiness-2026-07.md) — 公開判定と制約
+
+チュートリアル: [`docs/3dgs-map-tutorial.md`](../../docs/3dgs-map-tutorial.md)
+(フライスルー生成)、[`docs/workflows.md`](../../docs/workflows.md)。
+
+### Camera models and posed-image export
+
+The shared transforms loader uses one intrinsic matrix and image size for all
+frames. Per-frame `fl_x`, `fl_y`, `cx`, `cy`, `w`, and `h` may repeat the root
+values, but differing overrides are rejected. Split inputs by camera calibration
+instead of silently coloring or rendering them with the root camera.
+
+Use `extract_posed_images.py --undistort` for the internal pinhole training,
+rendering and recoloring tools. The integrated pipeline does this by default.
+Its shared transforms loader rejects nonzero distortion and non-pinhole camera
+models, including zero-coefficient fisheye. Clearing JSON coefficients without
+rectifying the images does not produce a valid dataset.
+
+Raw export preserves ordinary OpenCV coefficients, or writes fisheye images as
+`OPENCV_FISHEYE` with `k1` through `k4`, for compatible external consumers
+([Nerfstudio model mapping](https://github.com/nerfstudio-project/nerfstudio/blob/main/nerfstudio/cameras/cameras.py)).
+Nonzero rational denominator or extended coefficients cannot be represented by
+this exporter: use `--undistort`; raw export fails before writing images rather
+than dropping coefficients. This does not add raw-image support to the internal
+pinhole tools. For direct bag coloring without resampling the image,
+`colorize_from_bag.py --no-undistort` projects using the CameraInfo lens model.
+
+## カメラ姿勢の補正（RTK-SLAM construction_seq1）
+
+K4 採用構成の地図形状（4.9M 点）と posed images（260 view）を固定し、
+`refine_camera_poses.py --workers 4`（既定設定、14 分、最大 RSS 1.5 GB）で補正した。
+
+| 指標 | 記録姿勢 | 補正後 |
+|---|---:|---:|
+| held-out ペアのエピポーラ誤差（中央値 / p90、800x600 px、143 ペア） | 3.82 / 8.58 | 0.69 / 2.46 |
+| held-out 色誤差 RGB L2（中央値 / p90） | 40.02 / 151.80 | 37.67 / 150.45 |
+| RGB L2 ≤ 20 の割合 | 0.290 | 0.314 |
+| 評価 view ごとの中央値 | — | 41/52 view で改善（最大悪化 +2.9） |
+
+補正量は回転 中央値 0.40°（p90 1.56°）、カメラ中心 中央値 3.6 cm（p90 18 cm）。
+色誤差は 5 枚に 1 枚（index mod 5 = 1）を評価に残し、残りの 208 枚で K4 の
+着色設定のまま着色して、評価画像に投影して測った（両条件とも同じ分割・設定・
+形状）。評価画像の姿勢も補正するが、補正には特徴点の対応と LiDAR 形状だけを使い、
+地図の色は使わない。画像だけから推定した F 行列の誤差は同じ対応で約 0.34 px なので、
+補正後もまだ差が残る。
+
+## README の着色フライスルー（RTK-SLAM Stadtgarten 2）
+
+`lidarslam/images/map_flythrough_stadtgarten.{webp,mp4}` は stadtgarten_seq2 の
+20–180 s（公園の約 110 m）から次の手順で作った。`refine_camera_poses.py` の held-out
+エピポーラ誤差は 1.09 → 0.34 px（640 view、448 ペア）。
+
+```bash
+# 1) 軌跡: RKO-LIO（Livox offset_time で deskew、静止時の重力初期化）+ RTK GNSS 補正。
+#    19 測量点への絶対誤差 0.100 m（docs/research/gnss-rtk-slam-absolute-accuracy.md）。
+bash scripts/run_rko_lio_graph_benchmark.sh --bag <stadtgarten_seq2> \
+  --lidar-topic /livox/points --imu-topic /livox/imu --base-frame os_sensor \
+  --rko-param configs/mid360_robot/rko_lio_rtk_slam_mid360_stadtgarten_seq2.yaml \
+  --lidarslam-param lidarslam/param/lidarslam_rtk_gnss.yaml --bag-gnss --gt-blind \
+  --run-name sg2 --output-dir <out>   # -> <out>/traj_corrected.tum = <tum>
+#    GNSS 補正済みの軌跡（/modified_path）は /map_save で出るので --skip-map-save は
+#    付けない（付けると traj_corrected.tum は traj_raw.tum の複製になる）。
+# 2) posed images
+python3 tools/colored_map/extract_posed_images.py --bag <bag> --traj <tum> \
+  --camera-topic /camera/image_raw/compressed \
+  --intrinsics-yaml configs/gaussian_splatting/rtk_slam_cam0_intrinsics.yaml \
+  --extrinsic configs/gaussian_splatting/rtk_slam_cam0_extrinsic.yaml \
+  --undistort --time-offset 0 --start-time 20 --end-time 180 --stride 5 \
+  --max-extrapolation 0.2 --out <out>/posed
+# 3) 形状: 屋外の疎な遠方地面を残すため --min-neighbors 2。一緒に歩く人物の軌跡は
+#    動的除去で消す（pip install 'dynamic-object-removal>=0.5'）。
+python3 tools/colored_map/build_lidar_init.py --bag <bag> --traj <tum> \
+  --points-topic /livox/points --start-time 20 --end-time 180 --voxel 0.015 \
+  --min-range 1.5 --max-range 60 --max-points 12000000 --min-neighbors 2 \
+  --sparse-voxel 0.1 --dynamic-map-cleaner fusion --out geometry.ply
+# 4) 姿勢補正、撮影者が通った空間の残像除去と地面の穴埋め（下の節）、着色（K4 の設定 + 空の色の混入除去）
+python3 tools/colored_map/refine_camera_poses.py --transforms <out>/posed/transforms.json \
+  --pointcloud geometry.ply --out <out>/posed/transforms_refined.json --workers 4
+python3 tools/colored_map/carve_swept_corridor.py --input geometry.ply \
+  --transforms <out>/posed/transforms_refined.json --out geometry_carved.ply \
+  --fill-ground-holes
+python3 tools/colored_map/recolor_pointcloud.py --input geometry_carved.ply \
+  --transforms <out>/posed/transforms_refined.json --out colored.ply \
+  --exposure-scale-limit 1.5 --max-samples 12 --min-samples 3 --image-margin 120 \
+  --vignette-gain-limit 2.5 --overlap-balance --view-confidence --normal-voxel 0.12 \
+  --sky-rejection --sky-fill-radius-m 2
+# 5) 描画（CPU、surface splat）と README アセット
+python3 tools/colored_map/render_map_flythrough.py --pointcloud colored.ply \
+  --transforms <out>/posed/transforms_refined.json --color-mode rgb --frames 240 \
+  --fps 30 --point-size 0.03 --scale 0.375 --device cpu --camera-preset cinematic \
+  --surface-splat --loop-fade 12 --render-workers 4 \
+  --label "Camera-coloured LiDAR map (RTK-SLAM Stadtgarten 2)" --mp4 master.mp4
+ffmpeg -i master.mp4 -vf "fps=15,scale=600:-2:flags=lanczos" -loop 0 \
+  -c:v libwebp -quality 78 map_flythrough_stadtgarten.webp   # + crf26 mp4
+```
+
+既知の残差:
+- 水平線から 2° 以内でしか見えない遠景の樹冠は白が残る（`--sky-min-elevation-deg 0.5` も効かなかった。下の節）。
+- 出発点では撮影者と機材の影しか写っていないので、埋めた地面も暗い。
+- カメラは前向き 1 台なので、経路から外れた範囲は色が付かない。
+
+### 軌跡を改善したとき（2026-11）
+
+RKO-LIO が Livox の `offset_time` を読めるようになり、Stadtgarten 2 の RKO-LIO プリセットは
+deskew と静止時の重力初期化を有効にした（19 測量点への SE(3) ATE 0.296 m）。この軌跡に
+`lidarslam/param/lidarslam_rtk_gnss.yaml` の GNSS 補正を加えたもの（絶対誤差 0.100 m）で
+同じ手順（動的物体除去なし）を回すと、姿勢補正前のエピポーラ誤差が 4.20 → 1.09 px、
+補正後が 0.66 → 0.33 px（記録姿勢に戻した view 61 → 4）、held-out 色誤差（RGB L2 平均）が
+47.6 → 45.1、coverage が 0.928 → 0.946 になった。カメラ時刻を較正ファイルの −0.0206 s に
+すると悪化した（補正前 2.29 px）ので `--time-offset 0` のままにする。詳細は
+`docs/research/gnss-rtk-slam-absolute-accuracy.md`。
+
+README アセットはこの軌跡に動的物体除去（手順 3）を戻して作り直した（上の手順そのまま。
+2026-11-06 に地面の穴埋めを加えて再描画）。
+旧アセットは機材の前傾のまま地図が約 20° 傾いていたが、新しい地図は水平になり、階段の段、
+柵、建物の輪郭が締まった。動的物体除去は 636,495 点（9,293,181 → 8,656,686、6.8 %）を消し、
+指標はわずかに良くなる（同じ軌跡、同じ posed images）:
+
+| 指標 | 動的物体除去なし | あり（README アセット） |
+|---|---:|---:|
+| coverage | 0.9461 | 0.9505 |
+| chroma_retention | 1.068 | 1.069 |
+| roughness median / p90 | 4.56 / 13.65 | 4.47 / 13.47 |
+| planar roughness median / p90 | 4.65 / 11.84 | 4.51 / 11.54 |
+| held-out 色誤差 RGB L2 mean / median / p90 | 45.12 / 30.70 / 103.08 | 45.03 / 30.73 / 102.84 |
+| 姿勢補正後の held-out エピポーラ誤差 | 0.329 px | 0.336 px |
+
+描画（240 frame、5,163,414 点、`--render-workers 4`）は 4 コア CPU で約 28 分。
+
+## 空の色の混入除去（`--sky-rejection`、既定オフ）
+
+屋外では細い枝や樹冠の縁が、姿勢のわずかなずれで枝の間の空に投影され、白や青で
+塗られる。`--sky-rejection`（`build_lidar_init.py` と `colored_map_pipeline.py` では
+`--color-sky-rejection`）は、視線がカメラの水平線より上を向き（既定 2°、
+`--sky-min-elevation-deg`）、画素が「明るく彩度が低い」か「青い」サンプルを空らしい
+サンプルとし、点にそれ以外のサンプルがあればそれだけで色を決める。空らしいサンプル
+しかない点（白い外壁など）はそのまま。上方向は全 view のカメラ上向きの平均で、地図が
+傾いていても使える。どの点に色が付くか、`--min-samples` が数えるサンプル数は変えない。
+
+Stadtgarten 2（上の手順 4 の設定に追加、同じ形状 8,264,141 点）:
+
+| 指標 | なし | `--sky-rejection` |
+|---|---:|---:|
+| coverage | 0.9417 | 0.9417 |
+| chroma_retention | 0.993 | 1.024 |
+| roughness median / p90 | 4.60 / 13.35 | 4.56 / 13.10 |
+| planar roughness p90 | 12.92 | 12.45 |
+| held-out 色誤差、正解画素が空でない点（84 %）median / p90 | 29.4 / 93.0 | 28.3 / 88.0 |
+| 同 RGB L2 ≤ 20 の割合 | 0.367 | 0.379 |
+| held-out 色誤差、正解画素が水平線より上で空らしい点（16 %）median | 49.6 | 92.3 |
+
+held-out は偶数 view で着色し、奇数 view の 5 枚に 1 枚（64 枚、`--image-margin 140`）で
+測った。正解画素が空の点で誤差が増えるのは、ずれた投影先の空を正解とするためで、
+枝を空の色で塗った方が一致する。この指標は空の混入を検出できないので、改善は
+同一視点グリッドの目視（樹冠と生垣の白斑が減る）と、空でない画素の誤差で確かめた。
+
+### 空しか背にない点の補色（`--sky-fill-radius-m`、既定 0）
+
+`--sky-rejection` は、空らしいサンプルしか無い点をそのまま残す。白い外壁を守るためだが、
+どの view でも空を背にしか写らない枝や樹冠の縁も白いまま残る。`--sky-fill-radius-m R`
+（`--sky-rejection` と併用）は、そのような点のうち 0.3 m voxel が平面でない（PCA 最小固有値が
+和の 2 % 以上、または 10 点未満）ものを、半径 R 以内で空色でない色を持つ近傍 8 点の中央値で塗る。
+平面の外壁は残る。色だけを変え、coverage とサンプル数は変えない。
+
+Stadtgarten 2（手順 4 の設定 + `--sky-rejection`、R = 2 m）では 241,881 点を塗り替え、空色の
+点は 481,834 → 295,907 になった。
+
+| 指標 | `--sky-rejection` | + `--sky-fill-radius-m 2` |
+|---|---:|---:|
+| coverage | 0.9417 | 0.9417 |
+| chroma_retention | 1.024 | 1.033 |
+| roughness median / p90 | 4.56 / 13.10 | 4.50 / 12.56 |
+| planar roughness p90 | 12.45 | 12.35 |
+| held-out 色誤差、正解画素が空でない点 median / p90 | 28.30 / 87.96 | 28.23 / 87.39 |
+| 同 RGB L2 ≤ 20 の割合 | 0.3788 | 0.3795 |
+
+正解画素が空の点の誤差は増える（median 92 → 137）が、上と同じ理由でこの指標の盲点。
+同一視点グリッドでは生垣と樹冠の白斑が消える。水平線から 2° 以内でしか見えない遠景の
+樹冠には、空らしいと判定されないサンプルが混じるため白が残る。
+
+### 撮影者が通った空間の残像を消す（`carve_swept_corridor.py`）
+
+撮影経路の上に立っていて、カメラが来る前に立ち去った人（同行者など）は、前向きの LiDAR が
+振り返らないので空間が空いたという証拠が残らず、動的除去（fusion）で消えずに残像になる。
+撮影者はその後その空間を体ごと通り抜けているので、そこに静止物は無い。
+`carve_swept_corridor.py` は、カメラ経路から水平 `--radius`（既定 0.5 m）以内、高さがカメラの
+`--below`（既定 0.8 m）下から `--above`（既定 0.4 m）上までの点を地図から除く。上方向は posed
+images のカメラ上向きの平均。地面を残すため `--below` はカメラの地上高より小さくする。
+`--report` の高さヒストグラムで地面の帯（Stadtgarten 2 ではカメラの 1.0–1.5 m 下）を確かめる。
+
+```bash
+python3 tools/colored_map/carve_swept_corridor.py --input geometry.ply \
+  --transforms <out>/posed/transforms_refined.json --out geometry_carved.ply \
+  --report carve.json
+```
+
+Stadtgarten 2 では 11,513 点（0.14 %）を除き、GIF 冒頭の経路上の白い人影が消えた。除いた点は
+人影のあった区間（view 133–145 付近）に集中している。人影の陰で LiDAR が地面を測れなかった
+場所は、小さな穴として残る（次の節で埋める）。
+
+### 経路沿いの地面の穴を埋める（`--fill-ground-holes`、既定オフ）
+
+前を歩く同行者の陰、機材を置いた場所の真下、濡れた暗いアスファルトでは、LiDAR が地面を測って
+いない。カメラは後からそこを写しているので、地面の点さえあれば色は付く。`--fill-ground-holes`
+は残像除去のあとで次の穴を埋め、点は後段の着色で画像から色を付ける。
+
+- 対象: カメラ経路から `--fill-reach`（既定 2 m）以内にあり、0.1 m の格子で半径 0.5 m の
+  closing が埋める空きセル（周りを地面に囲まれた穴）。格子のセルは、最寄りのカメラ位置の
+  2.5 m 下から 0.5 m 上までに点があれば埋まっているとみなす。
+- 条件: 面積 `--fill-max-area`（既定 4 m²）以下。周り 0.5 m の地面のセルが 12 方向のうち
+  10 方向以上を囲む。それらが平面に乗る（5 cm 以内が 7 割以上、その RMS が `--fill-max-rms`、
+  既定 4 cm 以下）。
+- 段差、縁石、植え込みの壁は平面の条件で外れる。
+- 埋め方: 平面上に、周りのセルと同じ密度で点を置く（乱数の種は固定）。
+
+Stadtgarten 2（上の手順）の結果:
+- 穴の候補 317 のうち 289（19.6 m²、11,263 点、全体の 0.13 %）を埋めた。
+- 外れたもの: 囲まれていない 17、平面でない 11。
+- 全体の指標は変わらない: coverage 0.9505 → 0.9504、held-out 色誤差（RGB L2 平均）45.032 → 45.032。
+- 同一視点の 12 枚では画素の 0.9 % が変わった。同行者の陰の黒い穴（view 573 付近）や、機材を
+  置いた場所の穴が、地面の色になった。
+- 埋めた点の色は、周り 0.3 m の元の点の中央値と中央値 9.9 違う（元の点どうしでは 6.4）。
+  大きく違うのは出発点（view 0）など。そこでは画像に撮影者と機材の影しか写っておらず、
+  暗い地面になる。
+
+`--sky-min-elevation-deg 0.5`（既定 2°）も同じ地図で試した。空色の点は 351,192 → 344,684
+（−1.9 %）。変わったのは主に経路脇の生垣で、遠景の樹冠の白は残ったため採らない。
+
+## 独立した正解での色評価（Oxford Spires の TLS）
+
+held-out 再投影誤差は、地図を塗った写真と同じ写真で採点するので、姿勢のずれで正解画素も一緒に
+ずれる（空の混入を見逃す）。[Oxford Spires](https://dynamic.robots.ox.ac.uk/datasets/oxford-spires/)
+（CC BY-NC-SA 4.0）は、手持ち機材（魚眼 3 台 + Hesai QT64）の系列と、別カメラで着色された
+地上設置型レーザースキャナ（TLS）の地図を持つので、これを正解にする。
+
+- `scripts/prepare_oxford_spires_colour_eval.py`: 正解軌跡と外部パラメータで、3 台の魚眼を共通
+  ピンホール（既定 f = 530 px）に平行化した posed images、歪み補正済み点群からの地図（`map.ply`）、
+  軌跡周辺の TLS（`reference.ply`）を TLS 座標で書く。`undist-clouds-image-synced` は LiDAR
+  フレーム（TLS との最近傍距離の中央値 0.035 m、base と読むと 0.36 m）。
+- `scripts/evaluate_colored_map_reference.py`: 地図の着色点と TLS 点を 5 cm 以内の最近傍で双方向に
+  対応させ、MPEG 式の色 PSNR（BT.709 Y/Cb/Cr、`PSNR_YUV = (6Y + Cb + Cr) / 8`、悪い方向を
+  `symmetric`）と RGB L2 を出す。TLS は別カメラ・別露出なので、チャンネルごとのアフィン補正後の値
+  （`affine`）で手法を比べる。
+
+```bash
+python3 scripts/prepare_oxford_spires_colour_eval.py --images SEQ/raw/images \
+  --clouds SEQ/processed/lidar-undistortion/undist-clouds-image-synced \
+  --trajectory SEQ/processed/trajectory/gt-tum.txt --calibration DATA/calibration \
+  --reference DATA/ground_truth_map/observatory-quarter/merged-clouds-5cm.pcd \
+  --out roq01_60s --duration 60 --image-stride 20
+python3 tools/colored_map/recolor_pointcloud.py --input roq01_60s/map.ply \
+  --transforms roq01_60s/posed/transforms.json --out colored.ply <着色の設定>
+python3 scripts/evaluate_colored_map_reference.py --pointcloud colored.ply \
+  --reference roq01_60s/reference.ply --out ref.json
+```
+
+Radcliffe Observatory Quarter 01 の最初の 60 秒（3 台 × 60 枚、地図 667 万点、TLS 343 万点）:
+
+| 着色 | PSNR_YUV（affine / raw） | 地図→TLS RGB L2 median / p90（affine） | 未着色点 |
+|---|---:|---:|---:|
+| robust 既定 | 24.04 / 21.78 | 23.8 / 61.9 | 20,175 |
+| K4 設定（README 手順 4） | 24.23 / 22.12 | 23.2 / 60.3 | 109,125 |
+| + `--sky-rejection` | 24.26 / 22.30 | 23.1 / 59.6 | 109,130 |
+| + `--sky-fill-radius-m 2` | 24.26 / 22.35 | 23.1 / 59.5 | 109,136 |
+| + `carve_swept_corridor.py` | 24.26 / 22.35 | 23.1 / 59.5 | 109,127 |
+
+K4 設定と空の色除去は独立した正解でも良くなる。補色と残像除去はこの区間（建物中心で木が少なく、
+立ち止まった人もいない。残像除去は 91 点）ではほぼ効かない。誤差の大半は輝度（affine 後の
+PSNR Y 21.3、Cb 33.2、Cr 40.3）で、アフィン補正のゲインは 0.59–0.65 と、手持ちカメラの方が
+TLS よりかなり明るい。
+
+残差の内訳（同じ区間、`--sky-rejection` まで入れた着色、affine 後の輝度 RMSE 22.1、PSNR_Y 21.3）:
+
+| 切り分け | 結果 |
+|---|---|
+| 5 m / 2 m / 1 m セルごとに輝度アフィンを当て直す | RMSE 18.6 / 17.1 / 15.9（PSNR_Y +1.5 / +2.2 / +2.9 dB）。空間的に低周波な明るさの差が大きい |
+| TLS の局所的な模様（10 cm 内の輝度標準偏差）別 | 標準偏差 15 以上の 21 % の点が誤差の 45 % |
+| 撮影軌跡からの距離別 | 0–3 m で RMSE 18、10–20 m で 29 |
+| 地図の色を TLS と同じ 5 cm voxel で平均してから比較 | PSNR_YUV +0.1 dB、順位は変わらない |
+| `--min-view-cosine 0.1 / 0.25` | 24.23 / 24.14（悪化、未着色が増える） |
+| `--min-projected-scale 26.5 / 53`（20 m / 10 m より遠い観測を捨てる） | 24.28 / 24.49 だが未着色が 11 万→46 万 / 167 万点。精度と被覆の交換で改善ではない |
+| `refine_camera_poses.py` | エピポーラ誤差 0.32→0.29 px、PSNR_YUV 24.23（正解姿勢が既に正確で伸びしろなし） |
+
+上から見ると、低周波の差は芝や舗装の上の広い斑として現れ、屋根（地上のカメラからほぼ見えない）は
+TLS の赤茶に対して暗い灰色になる。TLS は別の日時・別のカメラで撮られており、照明と影の違いは
+着色側では直せない。正確な姿勢のもとでは、角度・距離・姿勢補正のどれもこの正解で測れる改善を
+生まない。

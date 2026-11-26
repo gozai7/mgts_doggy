@@ -1,0 +1,329 @@
+// Copyright 2026 Sasaki
+// All rights reserved.
+//
+// Software License Agreement (BSD 2-Clause Simplified License)
+//
+// Redistribution and use in source and binary forms, with or without
+// modification, are permitted provided that the following conditions
+// are met:
+//
+//  * Redistributions of source code must retain the above copyright
+//    notice, this list of conditions and the following disclaimer.
+//  * Redistributions in binary form must reproduce the above
+//    copyright notice, this list of conditions and the following disclaimer
+//    in the documentation and/or other materials provided with the
+//    distribution.
+//
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+// "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+// LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
+// FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
+// COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+// INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+// BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+// LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+// CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+// LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
+// ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+// POSSIBILITY OF SUCH DAMAGE.
+
+#ifndef GRAPH_SLAM_CONFIG_HPP_
+#define GRAPH_SLAM_CONFIG_HPP_
+
+#include <string>
+#include <vector>
+
+#include <rclcpp/rclcpp.hpp>
+
+namespace graphslam
+{
+
+// Complete, typed snapshot of the ROS parameter surface. This source-private
+// type keeps parameter declaration/loading out of the component lifecycle and
+// separates the normalized startup snapshot from live graph and sensor state.
+struct GraphSlamConfig
+{
+  // Registration and loop search.
+  // Loop-closure registration: "NDT" (pclomp NDT), "GICP" (pclomp GICP) or "SMALL_GICP" (small_gicp
+  // GICP). Case-sensitive; any other value stops the node at startup.
+  std::string registration_method {"NDT"};
+  // Voxel size (m) of the loop registration's source and target aggregates and of the clouds the
+  // place-recognition descriptors are computed from. The saved map uses map_leaf_size.
+  double voxel_leaf_size {0.2};
+  // NDT cell size (m) of the loop registration (registration_method NDT).
+  double ndt_resolution {5.0};
+  // Threads of the NDT and SMALL_GICP loop registration; 0 or less leaves the library default (all
+  // OpenMP threads for NDT). GICP does not use it.
+  int ndt_num_threads {0};
+  // GICP loop registration: largest point-to-point distance taken as a correspondence (m).
+  double gicp_max_correspondence_distance {30.0};
+  // GICP loop registration: converged once the transformation changes by less than this between
+  // iterations.
+  double gicp_transformation_epsilon {1e-8};
+  // A loop candidate is accepted only if its registration fitness (mean squared distance of the
+  // aligned source points to the target, m^2) is below this; the lowest fitness among the accepted
+  // candidates wins.
+  double threshold_loop_closure_score_ {1.0};
+  double scan_context_loop_closure_score_threshold_ {-1.0};
+  // A submap is a loop candidate only if the trajectory travelled more than this (m) since it.
+  double distance_loop_closure_ {20.0};
+  // Distance candidates must lie closer than this (m) to the query submap's estimated position.
+  // ScanContext and triangle candidates are not limited by it.
+  double range_of_searching_loop_closure_ {20.0};
+  // Submaps aggregated for loop registration: the query and the N-1 before it as the source, the
+  // candidate and N on each side as the target. Each descriptor is computed on a submap and its
+  // N-1 predecessors.
+  int search_submap_num_ {3};
+  // Loop search runs for every N-th new submap; descriptors are still computed for all.
+  int loop_search_query_stride_ {1};
+  // Nearest distance candidates registered per query (also the ScanContext query's top-K; BEV and
+  // SOLiD rerank the nearest 4 x this).
+  int max_loop_candidate_count_ {3};
+  // An accepted loop edge whose two submap indices are both within this many of an existing edge's
+  // replaces that edge only if its fitness is lower; otherwise it is dropped.
+  int loop_edge_dedup_index_window_ {8};
+  // Rejects a loop whose registration correction translates by more than this (m). The correction
+  // is a world-frame transform, so its rotation also moves it in proportion to the distance from
+  // the map origin.
+  double loop_max_translation_delta_ {15.0};
+  // Rejects a loop whose registration correction rotates by more than this (deg).
+  double loop_max_rotation_delta_deg_ {45.0};
+  double loop_min_overlap_ratio_ {0.0};
+  double loop_min_overlap_ratio_large_correction_ {0.0};
+  double loop_overlap_large_correction_translation_m_ {0.0};
+  double loop_overlap_max_distance_m_ {0.5};
+  // If above 0, rejects a loop that moves the query submap by more than loop_max_drift_offset_m +
+  // this x the distance travelled between the two submaps.
+  double loop_max_drift_ratio_ {0.0};
+  // Constant term (m) of the drift check (loop_max_drift_ratio).
+  double loop_max_drift_offset_m_ {0.5};
+  double loop_max_translation_delta_descriptor_ {-1.0};
+  double loop_max_rotation_delta_deg_descriptor_ {-1.0};
+
+  // Pose graph optimization.
+  // Each submap gets odometry edges to its previous N submaps; an edge across k submaps has 1/k of
+  // the information.
+  int num_adjacent_pose_cnstraints_ {5};
+  // Write the whole map bundle (map, pose graph, trajectory, loop edges) to map_save_dir after
+  // every accepted loop edge, not only on the map_save service.
+  bool use_save_map_in_loop_ {true};
+  // Extra loop-search logging; it changes no result.
+  bool debug_flag_ {false};
+  // Information (times the identity) of an odometry edge between neighbouring submaps. The
+  // starting value when adjacent_edge_info_auto_scale is on.
+  double adjacent_edge_info_weight_ {1000.0};
+  bool adjacent_edge_info_auto_scale_ {false};
+  double adjacent_edge_info_auto_scale_target_nis_ {6.0};
+  double adjacent_edge_info_auto_scale_ema_alpha_ {0.3};
+  double adjacent_edge_info_auto_scale_min_ {1.0};
+  double adjacent_edge_info_auto_scale_max_ {1.0e6};
+  // Odometry edges take separate translation and rotation information
+  // (adjacent_edge_info_weight_trans / _rot), each auto-scaled on its own when
+  // adjacent_edge_info_auto_scale is on.
+  bool adjacent_edge_info_auto_scale_split_trans_rot_ {false};
+  // Translation information of odometry edges with split_trans_rot; 0 or less:
+  // adjacent_edge_info_weight.
+  double adjacent_edge_info_weight_trans_ {-1.0};
+  // Rotation information of odometry edges with split_trans_rot; 0 or less:
+  // adjacent_edge_info_weight.
+  double adjacent_edge_info_weight_rot_ {-1.0};
+  double adjacent_edge_info_auto_scale_target_nis_trans_ {3.0};
+  double adjacent_edge_info_auto_scale_target_nis_rot_ {3.0};
+  // Loop edge information: this / the registration fitness (times the identity), unless both
+  // loop_edge_info_constant_* are above 0.
+  double loop_edge_info_weight_ {100.0};
+  // If this and loop_edge_info_constant_rot are both above 0, loop edges take this fixed
+  // translation information instead of the fitness-based one.
+  double loop_edge_info_constant_trans_ {0.0};
+  // Fixed rotation information of loop edges; see loop_edge_info_constant_trans.
+  double loop_edge_info_constant_rot_ {0.0};
+  // Delta of the robust kernel on loop edges (g2o setDelta).
+  double loop_edge_robust_kernel_delta_ {1.0};
+  // Robust kernel on loop edges: "huber", "dcs" or "cauchy" (any case); any other value means
+  // huber.
+  std::string loop_edge_robust_kernel_type_ {"huber"};
+
+  // Place recognition and verification.
+  // Adds at most one ScanContext candidate per query (not range-limited), registered with its yaw
+  // hint.
+  bool use_scan_context_ {false};
+  // Reranks the nearest distance candidates by a bird's-eye-view descriptor once there are more
+  // than 50 submaps; adds no candidates of its own.
+  bool use_bev_descriptor_ {false};
+  // Adds SOLiD candidates from the nearest distance-pool submaps once there are more than 50,
+  // registered with their yaw hint.
+  bool use_solid_descriptor_ {false};
+  // Adds at most one triangle-descriptor candidate per query, from a vote over all earlier submaps
+  // verified by RANSAC (not range-limited).
+  bool use_triangle_descriptor_ {false};
+  double triangle_descriptor_grid_size_m_ {60.0};
+  int triangle_descriptor_grid_cells_ {100};
+  int triangle_descriptor_max_keypoints_ {40};
+  double triangle_descriptor_min_salience_m_ {0.8};
+  double triangle_descriptor_min_edge_m_ {2.0};
+  double triangle_descriptor_max_edge_m_ {50.0};
+  int triangle_descriptor_max_triangles_ {3000};
+  double triangle_descriptor_edge_bin_m_ {0.5};
+  double triangle_descriptor_quad_feature_bin_m_ {0.0};
+  std::string triangle_descriptor_keypoint_mode_ {"bev_max_height"};
+  double triangle_descriptor_edge_voxel_size_m_ {0.4};
+  double triangle_descriptor_edge_neighbor_radius_m_ {1.0};
+  int triangle_descriptor_edge_min_neighbors_ {6};
+  double triangle_descriptor_edge_min_edgeness_ {0.5};
+  double triangle_descriptor_edge_nms_radius_m_ {2.0};
+  int triangle_descriptor_min_votes_ {6};
+  int triangle_descriptor_min_inliers_ {4};
+  double triangle_descriptor_min_inlier_ratio_ {0.0};
+  int triangle_descriptor_max_pairs_ {64};
+  int triangle_descriptor_min_4th_point_agreements_ {0};
+  double triangle_descriptor_fourth_point_max_distance_m_ {2.0};
+  bool triangle_descriptor_refine_se3_with_all_inliers_ {false};
+  bool triangle_descriptor_skip_ransac_ {false};
+  double triangle_descriptor_inlier_translation_m_ {2.0};
+  double triangle_descriptor_inlier_rotation_deg_ {5.0};
+  int triangle_descriptor_exclude_recent_ {4};
+  bool triangle_verify_with_bev_ {false};
+  double triangle_verify_bev_max_distance_ {0.30};
+  double scan_context_threshold_ {0.3};
+  int scan_context_query_stride_ {1};
+  int scan_context_exclude_recent_ {50};
+  double bev_descriptor_threshold_ {0.20};
+  double bev_descriptor_grid_size_m_ {80.0};
+  int bev_descriptor_grid_cells_ {40};
+  int bev_descriptor_yaw_bins_ {24};
+  int bev_descriptor_sequence_window_ {0};
+  double bev_descriptor_sequence_threshold_ {-1.0};
+  double bev_descriptor_pose_consistency_threshold_m_ {-1.0};
+  double bev_descriptor_max_euclidean_distance_m_ {-1.0};
+  double bev_descriptor_rerank_weight_m_ {100.0};
+  bool bev_use_mutual_visibility_ {false};
+  double bev_mutual_visibility_min_overlap_ratio_ {0.05};
+  double bev_mutual_visibility_occupancy_eps_ {0.5};
+  double solid_descriptor_min_similarity_ {0.70};
+  int solid_descriptor_sequence_window_ {0};
+  double solid_descriptor_sequence_min_similarity_ {-1.0};
+  double solid_descriptor_pose_consistency_threshold_m_ {-1.0};
+  double solid_descriptor_max_euclidean_distance_m_ {-1.0};
+  bool prefer_scan_context_candidates_ {false};
+  bool use_3d_bbs_for_scan_context_ {false};
+  double three_d_bbs_min_level_res_ {1.0};
+  int three_d_bbs_max_level_ {3};
+  double three_d_bbs_score_threshold_percentage_ {0.25};
+  int three_d_bbs_timeout_msec_ {50};
+  int three_d_bbs_num_threads_ {0};
+  double three_d_bbs_voxel_leaf_size_ {1.0};
+  int three_d_bbs_source_submap_num_ {2};
+  int three_d_bbs_target_submap_radius_ {1};
+  double three_d_bbs_translation_search_margin_m_ {15.0};
+  double three_d_bbs_roll_pitch_search_deg_ {10.0};
+  double three_d_bbs_yaw_search_deg_ {180.0};
+
+  // Map filtering, storage and export.
+  // When the map is saved, drops voxels that too few submaps saw within a short index window
+  // (transient objects). Not applied to the published map.
+  bool use_dynamic_object_filter_ {false};
+  // Voxel size (m) of the dynamic object filter; the saved points become voxel centroids.
+  double dynamic_object_filter_voxel_size_ {0.3};
+  // A voxel within range is kept only if at least this many submaps saw it within the temporal
+  // window.
+  int dynamic_object_filter_min_observations_ {2};
+  // Window of that count, in submap indices (not seconds).
+  int dynamic_object_filter_temporal_window_ {5};
+  // Points farther than this (m) from their submap's origin are always kept.
+  double dynamic_object_filter_max_range_from_sensor_m_ {30.0};
+  bool use_planar_map_filter_ {false};
+  double planar_map_filter_voxel_size_ {0.1};
+  int planar_map_filter_min_neighbors_ {3};
+  double planar_map_filter_max_small_eigenvalue_ratio_ {0.24};
+  double planar_map_filter_min_middle_eigenvalue_ratio_ {0.0};
+  double planar_map_filter_min_retained_ratio_ {0.90};
+  bool use_pcd_cache_ {false};
+  std::string pcd_cache_dir_ {"/tmp/graph_slam_pcd_cache"};
+  std::string map_save_dir_ {"."};
+  std::string save_pose_graph_path_ {"pose_graph.g2o"};
+  double map_grid_size_x_ {20.0};
+  double map_grid_size_y_ {20.0};
+  // Voxel size (m) the saved map is downsampled to.
+  double map_leaf_size_ {0.2};
+  // The saved map is downsampled from the submap clouds in passes of at most this many points,
+  // without assembling the whole map (map_saver::voxelGridFilterStreamed). 0: assemble it and
+  // downsample it with one VoxelGrid, as before Phase 4. Not used when the map is also published
+  // or the dynamic object filter is on (both need the whole map).
+  int map_save_points_per_pass_ {2000000};
+
+  // Optional absolute and inertial constraints.
+  bool use_gnss_ {false};
+  std::string gnss_topic_ {"/gnss/fix"};
+  double gnss_info_weight_ {1.0};
+  bool gnss_use_covariance_weighting_ {true};
+  double gnss_covariance_min_variance_m2_ {0.01};
+  double gnss_covariance_max_variance_m2_ {25.0};
+  double gnss_rtk_fix_max_horizontal_stddev_m_ {0.3};
+  double gnss_rtk_fix_weight_scale_ {3.0};
+  double gnss_non_rtk_weight_scale_ {1.0};
+  // Vertical GNSS information relative to horizontal (on top of the covariance):
+  // RTK height is about 2x noisier than position (~0.25); 0.1 trusts it less.
+  double gnss_vertical_weight_scale_ {0.1};
+  double gnss_header_stamp_max_skew_sec_ {30.0};
+  bool gnss_align_yaw_ {true};
+  int gnss_yaw_alignment_min_anchors_ {10};
+  double gnss_yaw_alignment_min_baseline_m_ {5.0};
+  int gnss_origin_min_samples_ {3};
+  double gnss_origin_consistency_threshold_m_ {20.0};
+  // GNSS antenna phase centre in the base frame [x, y, z] (m); the anchor then
+  // constrains that point of each submap instead of the base origin.
+  std::vector<double> gnss_antenna_offset_xyz_ {0.0, 0.0, 0.0};
+  // Interpolate the anchor between the fixes either side of a submap stamp when
+  // they are at most this far apart (s); 0 keeps the nearest fix within 1 s.
+  double gnss_interpolation_max_gap_sec_ {0.0};
+  // > 0: Huber kernel on each GNSS anchor, in sigmas of its covariance (a wrong
+  // fix then pulls linearly instead of quadratically); 0 = no kernel.
+  double gnss_robust_kernel_delta_ {0.0};
+  // Subscribe to the GNSS topic with reliable QoS; false: best effort, which also matches
+  // best-effort drivers. The offline bag pass-through publishes reliably and fast, and a
+  // best-effort reader can lose its first fixes, so the offline launch turns this on.
+  bool gnss_subscriber_qos_reliable_ {false};
+  // > 0: absolute roll/pitch prior on every submap from its odometry attitude
+  // (the frontend's frame must be gravity-aligned, as LIO's is), information
+  // per axis of the up-vector error (~rad^-2; 3300 ~ 1 deg). Keeps GNSS anchors
+  // from tilting the graph. 0 = off.
+  double gravity_prior_info_ {0.0};
+  bool use_imu_preintegration_ {false};
+  double imu_rotation_info_roll_pitch_ {100.0};
+  double imu_rotation_info_yaw_ {10.0};
+
+  // Direct odometry input and diagnostics.
+  bool use_odom_input_ {false};
+  // Odometry input (use_odom_input): a scan becomes a new submap once the odometry has moved this
+  // far (m) from the last submap.
+  double submap_distance_threshold_ {1.5};
+  // Odometry input: queue size of the odometry/cloud synchronizer and history depth of both
+  // subscriptions.
+  int odom_cloud_sync_queue_size_ {100};
+  // Odometry input: pair odometry and cloud only by identical stamps (ExactTime); false:
+  // ApproximateTime.
+  bool odom_cloud_sync_use_exact_time_ {false};
+  // Odometry input: subscribe to the cloud with reliable QoS; false: best effort (sensor data).
+  bool cloud_subscriber_qos_reliable_ {true};
+  // LiDAR-to-base extrinsic of cloud_input, [qx, qy, qz, qw, x, y, z] as in
+  // RKO-LIO: its deskewed scan is in the LiDAR frame while the odometry pose
+  // is the base frame's (base_from_lidar: p_base = R p_lidar + t). The identity keeps the cloud
+  // unchanged.
+  std::vector<double> extrinsic_lidar2base_quat_xyzw_xyz_ {0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0};
+  std::string degeneracy_diagnostics_csv_path_;
+  bool save_degeneracy_report_ {false};
+};
+
+struct ConfigNormalization
+{
+  std::vector<std::string> warnings;
+};
+
+GraphSlamConfig loadGraphSlamConfig(rclcpp::Node & node);
+ConfigNormalization normalizeGraphSlamConfig(GraphSlamConfig & config);
+std::vector<std::string> validateGraphSlamConfig(const GraphSlamConfig & config);
+void logGraphSlamConfig(const GraphSlamConfig & config, const rclcpp::Logger & logger);
+
+}  // namespace graphslam
+
+#endif  // GRAPH_SLAM_CONFIG_HPP_

@@ -48,5 +48,28 @@
     "name": "iridescence",
     "url": "https://github.com/koide3/iridescence",
     "commit": "1139d6e358c1432c284a06686632113d24f7c16f"
+  },
+  {
+    "name": "lidar_slam_ros2",
+    "url": "https://github.com/rsasaki0109/lidar_slam_ros2",
+    "commit": "bfe6d280e06cf6433f714a70f8e0f725a274890c",
+    "date": "2026-11-25T05:45:06Z",
+    "archive_bytes": 149194480
+  },
+  {
+    "name": "rko_fork",
+    "url": "https://github.com/rsasaki0109/rko_lio",
+    "commit": "74e6c27e9533e77b564638b18923ce573086acb4"
+  },
+  {
+    "name": "beluga",
+    "url": "https://github.com/Ekumen-OS/beluga",
+    "commit": "e6323da8c7bee863e29950910737bb3502af1306",
+    "license": "Apache-2.0",
+    "included": [
+      "beluga",
+      "beluga_vdb"
+    ],
+    "note": "Unmodified upstream libraries; examples, bags and unrelated ROS nodes excluded."
   }
 ]

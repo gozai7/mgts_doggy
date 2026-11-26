@@ -65,3 +65,11 @@ ZIP не содержит CUDA binaries, готовые apt-пакеты, Docker
 
 Приложенные заметки/вебинары команды сохранены в исходных reports/research_notes;
 предположения о будущих bag не превратились в выдуманные калибровки или результаты измерений.
+# Localization extension
+
+The unified checkout additionally includes the RKO frontend/backend at the same revisions as
+`competition-rko-lio`, and unmodified `beluga` / `beluga_vdb` libraries from Ekumen-OS/beluga
+`e6323da8c7bee863e29950910737bb3502af1306` (Apache-2.0). The original LICENSE is retained in
+`vendor/beluga/LICENSE`. Large example bags and unrelated ROS wrappers are excluded. The small
+`localization_ros` package adapts these libraries; it is not a fork of their filter or sensor model.
+Full source identities remain in `THIRD_PARTY.lock.json`.

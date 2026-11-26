@@ -7,6 +7,8 @@ services:
       args:
         BUILD_JOBS: ${BUILD_JOBS:-2}
         WITH_VIEWER: ${WITH_VIEWER:-OFF}
+        BUILD_MAPPING_BACKENDS: ${BUILD_MAPPING_BACKENDS:-glim,rko_lio}
+        ROS_APT_MIRROR: ${ROS_APT_MIRROR:-http://packages.ros.org/ros2/ubuntu}
     image: mgts-competition-${COMPETITION_BACKEND:-local}:cpu
     init: true
     network_mode: none

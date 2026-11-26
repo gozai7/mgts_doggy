@@ -1,0 +1,92 @@
+name: ros-free core
+
+# Builds the mapping core (backend + RKO-LIO frontend core) with plain CMake on a runner that has
+# no ROS 2 install, and runs its unit tests. ROS 2 stays one option; this job keeps the core usable
+# without it. See lidarslam_core/CMakeLists.txt.
+
+on:
+  push:
+    branches:
+      - develop
+      - main
+  pull_request:
+    branches:
+      - develop
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ros-free-core-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: ROS-free core build and unit tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      # The packages compile with -g; -g1 comes after it and wins. It keeps line tables, leaves
+      # the generated code byte-identical and keeps offline_pipeline.cpp (6.5 GB with -g) well
+      # inside the runner's 16 GB while other units compile beside it.
+      CXXFLAGS: -g1
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          submodules: recursive
+
+      - name: Install build dependencies (Ubuntu packages only, no ROS)
+        shell: bash
+        run: |
+          # This runner is Ubuntu 24.04. Use its signed packages from the official archive.
+          # Runner-provided regional mirrors can exhaust the timeout downloading PCL dependencies.
+          ubuntu_sources="$(mktemp --suffix=.sources)"
+          trap 'rm -f "$ubuntu_sources"' EXIT
+          cat > "$ubuntu_sources" <<'EOF'
+          Types: deb
+          URIs: https://archive.ubuntu.com/ubuntu
+          Suites: noble noble-updates noble-security
+          Components: main restricted universe multiverse
+          Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+          EOF
+          chmod 0644 "$ubuntu_sources"
+          apt_sources=(-o "Dir::Etc::sourcelist=$ubuntu_sources" -o Dir::Etc::sourceparts=-)
+          sudo apt-get "${apt_sources[@]}" update
+          sudo apt-get "${apt_sources[@]}" install -y --no-install-recommends \
+            build-essential cmake libeigen3-dev libpcl-dev libg2o-dev libzstd-dev \
+            libtbb-dev robin-map-dev libgtest-dev python3-pytest python3-venv
+
+      - name: No ROS 2 on the runner
+        shell: bash
+        run: |
+          test ! -d /opt/ros
+          python3 -m pytest lidarslam_core/test/test_lidarslam_core_build.py -q
+
+      - name: Configure
+        shell: bash
+        run: cmake -S lidarslam_core -B build-core -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        shell: bash
+        run: cmake --build build-core -j "$(nproc)"
+
+      - name: Unit tests
+        shell: bash
+        run: ctest --test-dir build-core -j "$(nproc)" --output-on-failure
+
+      - name: pip install the Python package and run its tests
+        shell: bash
+        run: |
+          python3 -m venv "${RUNNER_TEMP}/venv"
+          "${RUNNER_TEMP}/venv/bin/pip" install ./lidarslam_core pytest
+          cd "${RUNNER_TEMP}"
+          "${RUNNER_TEMP}/venv/bin/python" -m pytest -q -p no:cacheprovider "${GITHUB_WORKSPACE}/lidarslam_core/test"
+          "${RUNNER_TEMP}/venv/bin/python" -m lidarslam --help
+          "${RUNNER_TEMP}/venv/bin/lidarslam-map" --version
+          "${RUNNER_TEMP}/venv/bin/lidarslam-map" doctor --json

@@ -1,0 +1,9 @@
+services:
+  competition:
+    build:
+      dockerfile: Dockerfile.localizers
+      target: localizers
+      args:
+        BUILD_JOBS: ${BUILD_JOBS:-2}
+        ROS_APT_MIRROR: ${ROS_APT_MIRROR:-http://packages.ros.org/ros2/ubuntu}
+    image: mgts-localizers:cpu

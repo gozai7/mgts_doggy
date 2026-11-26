@@ -65,7 +65,7 @@ def validate(c, require_imu=True):
     for v in c["time_offsets_s"].values():
         if not np.isfinite(v):
             raise ValueError("Time offsets must be finite")
-    if c["localization"]["prediction"] not in ("constant_velocity", "kinematic", "imu"):
+    if c["localization"]["prediction"] not in ("constant_velocity", "kinematic", "imu", "external_tf"):
         raise ValueError("Choose one localization predictor")
     occ = c["occupancy"]
     for key in ("resolution_m", "angular_bins", "every_n_scans", "min_hit_scans", "max_pose_gap_s", "max_cells"):
