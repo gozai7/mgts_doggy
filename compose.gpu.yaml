@@ -1,0 +1,11 @@
+services:
+  competition:
+    build:
+      target: gpu
+    image: mgts-competition-glim:gpu
+    devices:
+      - nvidia.com/gpu=all
+    environment:
+      GLIM_SMOKE_MODE: gpu
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility

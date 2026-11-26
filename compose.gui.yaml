@@ -1,0 +1,11 @@
+# Opt-in local X11 GUI. Set DISPLAY and XAUTHORITY to your desktop session.
+services:
+  competition:
+    network_mode: host
+    environment:
+      DISPLAY: ${DISPLAY}
+      XAUTHORITY: /tmp/competition.xauthority
+      QT_X11_NO_MITSHM: '1'
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix:ro
+      - ${XAUTHORITY:?Set XAUTHORITY to a readable X11 authority file}:/tmp/competition.xauthority:ro

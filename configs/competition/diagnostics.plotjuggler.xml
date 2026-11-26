@@ -1,0 +1,81 @@
+<?xml version='1.0' encoding='utf-8'?>
+<root>
+  <tabbed_widget name="Main Window" parent="main_window">
+    <Tab containers="1" tab_name="Gyro">
+      <Container>
+        <DockSplitter orientation="|" count="1" sizes="1">
+          <DockArea name="Gyro">
+            <plot style="Lines" mode="TimeSeries" flip_x="false" flip_y="false">
+              <range bottom="-1" top="1" left="0" right="20" />
+              <limitY />
+              <curve name="gyro_x" color="#377eb8" />
+              <curve name="gyro_y" color="#e41a1c" />
+              <curve name="gyro_z" color="#4daf4a" />
+            </plot>
+          </DockArea>
+        </DockSplitter>
+      </Container>
+    </Tab>
+    <Tab containers="1" tab_name="Acceleration">
+      <Container>
+        <DockSplitter orientation="|" count="1" sizes="1">
+          <DockArea name="Acceleration">
+            <plot style="Lines" mode="TimeSeries" flip_x="false" flip_y="false">
+              <range bottom="-1" top="1" left="0" right="20" />
+              <limitY />
+              <curve name="accel_x" color="#377eb8" />
+              <curve name="accel_y" color="#e41a1c" />
+              <curve name="accel_z" color="#4daf4a" />
+            </plot>
+          </DockArea>
+        </DockSplitter>
+      </Container>
+    </Tab>
+    <Tab containers="1" tab_name="Intervals">
+      <Container>
+        <DockSplitter orientation="|" count="1" sizes="1">
+          <DockArea name="Intervals">
+            <plot style="Lines" mode="TimeSeries" flip_x="false" flip_y="false">
+              <range bottom="-1" top="1" left="0" right="20" />
+              <limitY />
+              <curve name="imu_dt_s" color="#377eb8" />
+              <curve name="lidar_dt_s" color="#e41a1c" />
+            </plot>
+          </DockArea>
+        </DockSplitter>
+      </Container>
+    </Tab>
+    <Tab containers="1" tab_name="Odometry">
+      <Container>
+        <DockSplitter orientation="|" count="1" sizes="1">
+          <DockArea name="Odometry">
+            <plot style="Lines" mode="TimeSeries" flip_x="false" flip_y="false">
+              <range bottom="-1" top="1" left="0" right="20" />
+              <limitY />
+              <curve name="odom_x" color="#377eb8" />
+              <curve name="odom_y" color="#e41a1c" />
+              <curve name="odom_z" color="#4daf4a" />
+            </plot>
+          </DockArea>
+        </DockSplitter>
+      </Container>
+    </Tab>
+    <Tab containers="1" tab_name="Registration">
+      <Container>
+        <DockSplitter orientation="|" count="1" sizes="1">
+          <DockArea name="Registration">
+            <plot style="Lines" mode="TimeSeries" flip_x="false" flip_y="false">
+              <range bottom="-1" top="1" left="0" right="20" />
+              <limitY />
+              <curve name="fitness_score" color="#377eb8" />
+              <curve name="alignment_time_s" color="#e41a1c" />
+              <curve name="accepted" color="#4daf4a" />
+            </plot>
+          </DockArea>
+        </DockSplitter>
+      </Container>
+    </Tab>
+    <currentTabIndex index="0" />
+  </tabbed_widget>
+  <use_relative_time_offset enabled="1" />
+</root>

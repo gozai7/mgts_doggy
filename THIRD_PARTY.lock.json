@@ -1,0 +1,52 @@
+[
+  {
+    "name": "lidar_localization_ros2",
+    "url": "https://github.com/rsasaki0109/lidar_localization_ros2",
+    "commit": "a1d56ecbde0eb65ad6e238bca124aac95a226c30",
+    "date": "2026-11-23T12:46:41Z",
+    "archive_bytes": 33166209
+  },
+  {
+    "name": "ndt_omp_ros2",
+    "url": "https://github.com/rsasaki0109/ndt_omp_ros2",
+    "commit": "8b77fa5a6cdcad45bf35918361c892b6d94a287e"
+  },
+  {
+    "name": "kiss-icp",
+    "url": "https://github.com/PRBonn/kiss-icp",
+    "commit": "1ffa7d7512f10bfc8b1185095011fa31184019e3",
+    "date": "2026-05-04T10:33:52Z",
+    "archive_bytes": 76529
+  },
+  {
+    "name": "glim",
+    "url": "https://github.com/koide3/glim",
+    "commit": "1a197c999e4865f5cab7c9cd25474128413ebbca",
+    "date": "2026-10-08T00:28:49Z",
+    "archive_bytes": 521596
+  },
+  {
+    "name": "glim_ros2",
+    "url": "https://github.com/koide3/glim_ros2",
+    "commit": "4d4ec524ccf1b02aa09b0af2af767ecc54343798",
+    "date": "2026-08-14T00:43:55Z",
+    "archive_bytes": 25810
+  },
+  {
+    "name": "gtsam",
+    "url": "https://github.com/borglab/gtsam",
+    "commit": "3ad4b4c3cb28394c9597f48fa02dad361c8450e3"
+  },
+  {
+    "name": "gtsam_points",
+    "url": "https://github.com/koide3/gtsam_points",
+    "commit": "8e94654558dfbe7ddb0341de300daaf17e25ee02",
+    "date": "2026-10-06T01:33:57Z",
+    "archive_bytes": 7780672
+  },
+  {
+    "name": "iridescence",
+    "url": "https://github.com/koide3/iridescence",
+    "commit": "1139d6e358c1432c284a06686632113d24f7c16f"
+  }
+]

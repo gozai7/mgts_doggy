@@ -1,0 +1,25 @@
+/competition/result/map:
+  reliability: reliable
+  durability: transient_local
+  history: keep_last
+  depth: 1
+/competition/result/localization:
+  reliability: reliable
+  durability: transient_local
+  history: keep_last
+  depth: 1
+/competition/result/mapping:
+  reliability: reliable
+  durability: transient_local
+  history: keep_last
+  depth: 1
+/competition/result/glim_b:
+  reliability: reliable
+  durability: transient_local
+  history: keep_last
+  depth: 1
+/competition/result/full_route:
+  reliability: reliable
+  durability: transient_local
+  history: keep_last
+  depth: 1
