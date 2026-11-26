@@ -1,34 +1,21 @@
 services:
-  sim:
-    image: mgts-sim
-    entrypoint: [/mgts/entrypoint, python3, /mgts/sim/capture.py]
-    build: {context: ., target: sim}
+  competition:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: cpu
+      args:
+        BUILD_JOBS: ${BUILD_JOBS:-2}
+        WITH_VIEWER: ${WITH_VIEWER:-OFF}
+    image: mgts-competition-${COMPETITION_BACKEND:-local}:cpu
     init: true
-    stop_grace_period: 30s
+    network_mode: none
+    shm_size: 1gb
     environment:
-      DISPLAY: ${DISPLAY:-}
-      XAUTHORITY: /tmp/mgts.xauth
-      MGTS_HEADLESS: ${MGTS_HEADLESS:-0}
-      QT_X11_NO_MITSHM: "1"
+      ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-91}
+      ROS_LOCALHOST_ONLY: '1'
+      PYTHONUNBUFFERED: '1'
     volumes:
-      - /tmp/.X11-unix:/tmp/.X11-unix:ro
-      - ${XAUTHORITY:-/dev/null}:/tmp/mgts.xauth:ro
-      - ./data:/data
-      - ./truth:/truth
-  solve:
-    image: mgts-solver
-    build: {context: ., target: solver}
-    init: true
-    network_mode: none
-    entrypoint: [/mgts/entrypoint, python3, /mgts/solver/solve.py]
-    volumes:
-      - ./data:/data:ro
+      - ${DATA_DIR:-./data}:/data:ro
+      - ${RESULTS_DIR:-./results}:/results
       - ./configs:/mgts/configs:ro
-      - ./runs:/runs
-  eval:
-    image: mgts-solver
-    network_mode: none
-    entrypoint: [/mgts/entrypoint, python3, /mgts/solver/evaluate.py]
-    volumes:
-      - ./truth:/truth:ro
-      - ./runs:/runs

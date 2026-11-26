@@ -1,0 +1,2838 @@
+/*
+ * MIT License
+ *
+ * Copyright (c) 2025 Meher V.R. Malladi.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+
+#include "lio.hpp"
+#include "robust_gravity_residual.hpp"
+#include "degeneracy_aware_solve.hpp"
+#include "gravity_alignment.hpp"
+#include "kinematic_scene_range_gate.hpp"
+#include "kinematic_velocity_blend.hpp"
+#include "kinematic_velocity_gate.hpp"
+#include "localizability_weighting.hpp"
+#include "preprocess_scan.hpp"
+#include "profiler.hpp"
+#include "radar_ego_velocity.hpp"
+#include "util.hpp"
+// other
+#include <sophus/se3.hpp>
+// tbb
+#include <tbb/blocked_range.h>
+#include <tbb/global_control.h>
+#include <tbb/parallel_for.h>
+#include <tbb/parallel_reduce.h>
+#include <tbb/task_arena.h>
+// stl
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstdlib>
+#include <fstream>
+#include <iomanip>
+#include <unordered_map>
+#include <functional>
+#include <iostream>
+#include <limits>
+#include <numeric>
+#include <optional>
+#include <stdexcept>
+#include <tuple>
+
+namespace {
+constexpr double EPSILON = 1e-8;
+constexpr auto EPSILON_TIME = std::chrono::nanoseconds(10);
+using namespace rko_lio::core;
+
+// Each point is transformed on its own, so splitting the range across threads changes nothing.
+// `transformed` may be `points`.
+inline void transform_points(const Sophus::SE3d& T, const Vector3dVector& points, Vector3dVector& transformed) {
+  tbb::parallel_for(tbb::blocked_range<std::size_t>{0, points.size()}, [&](const tbb::blocked_range<std::size_t>& r) {
+    for (std::size_t i = r.begin(); i != r.end(); ++i) {
+      transformed[i] = T * points[i];
+    }
+  });
+}
+
+inline void transform_points(const Sophus::SE3d& T, Vector3dVector& points) { transform_points(T, points, points); }
+
+struct AccelInfo {
+  double accel_mag_variance;
+  Eigen::Vector3d local_gravity_estimate;
+  Eigen::Vector3d gravity_world;
+};
+
+struct BodyAccelKF {
+  Eigen::Vector3d mean;
+  Eigen::Matrix3d covariance;
+};
+
+struct AccelFilterStep {
+  std::optional<AccelInfo> info;
+  BodyAccelKF updated;
+};
+
+AccelFilterStep step_body_accel_filter(const BodyAccelKF& prev,
+                                       const IntervalStats& stats,
+                                       const Sophus::SO3d& rotation_estimate,
+                                       const Nsec dt,
+                                       const double max_expected_jerk,
+                                       const Eigen::Vector3d& gravity_world) {
+  if (stats.imu_count <= 1) {
+    std::cerr << "[WARNING] " << stats.imu_count
+              << " IMU message(s) in interval between two lidar scans. Cannot compute "
+                 "acceleration statistics for orientation regularisation. Please check your data and its "
+                 "timestamping as likely there should not be so few IMU measurements between two LiDAR scans.\n";
+    return {std::nullopt, prev};
+  }
+
+  const Eigen::Vector3d avg_imu_accel = stats.imu_acceleration_sum / stats.imu_count;
+  const double accel_mag_variance = stats.welford_sum_of_squares / (stats.imu_count - 1);
+  const Eigen::Vector3d body_accel_measurement = avg_imu_accel + rotation_estimate.inverse() * gravity_world;
+
+  const double max_acceleration_change = max_expected_jerk * to_seconds(dt);
+  // assume [j, -j] range for uniform dist. on jerk. variance is (2j)^2 / 12 = j^2/3. multiply by dt^2 for accel
+  const Eigen::Matrix3d process_noise = square(max_acceleration_change) / 3 * Eigen::Matrix3d::Identity();
+  const Eigen::Matrix3d cov_pred = prev.covariance + process_noise;
+
+  // isotropic accel mag variance
+  const Eigen::Matrix3d measurement_noise = accel_mag_variance / 3 * Eigen::Matrix3d::Identity();
+  const Eigen::Matrix3d S = cov_pred + measurement_noise;
+  const Eigen::Matrix3d kalman_gain = cov_pred * S.inverse();
+
+  const Eigen::Vector3d new_mean = prev.mean + kalman_gain * (body_accel_measurement - prev.mean);
+  const Eigen::Matrix3d new_cov = cov_pred - kalman_gain * cov_pred;
+
+  const Eigen::Vector3d local_gravity_estimate = avg_imu_accel - new_mean; // points upwards
+  return {AccelInfo{.accel_mag_variance = accel_mag_variance,
+                    .local_gravity_estimate = local_gravity_estimate,
+                    .gravity_world = gravity_world},
+          BodyAccelKF{new_mean, new_cov}};
+}
+
+template <typename Functor>
+  requires requires(Functor f, Nsec stamp) {
+    { f(stamp) } -> std::same_as<Sophus::SE3d>;
+  }
+Vector3dVector deskew_scan(const Vector3dVector& frame,
+                           const TimestampVector& timestamps,
+                           const Nsec end_time,
+                           const Functor& relative_pose_at_time) {
+  const Sophus::SE3d scan_to_scan_motion_inverse = relative_pose_at_time(end_time).inverse();
+  Vector3dVector deskewed(frame.size());
+  // Each point is computed on its own and written to its own slot, so the output does not
+  // depend on how the points are split across threads.
+  tbb::parallel_for(tbb::blocked_range<std::size_t>{0, frame.size()}, [&](const tbb::blocked_range<std::size_t>& r) {
+    for (std::size_t i = r.begin(); i != r.end(); ++i) {
+      deskewed[i] = (scan_to_scan_motion_inverse * relative_pose_at_time(timestamps[i])) * frame[i];
+    }
+  });
+  return deskewed;
+}
+
+// Re-runs the same deskew formula and range-clip predicate used by preprocess_scan /
+// deskew_scan above, keeping per-point intensity index-aligned to the output points.
+// preprocess_scan()/deskew_scan() have no intensity channel, so this is the simplest way
+// to get a points+intensities pair index-aligned to filtered_frame without touching them.
+template <typename Functor>
+  requires requires(Functor f, Nsec stamp) {
+    { f(stamp) } -> std::same_as<Sophus::SE3d>;
+  }
+std::pair<Vector3dVector, std::vector<float>> deskew_and_clip_with_intensity(
+    const Vector3dVector& scan,
+    const TimestampVector& timestamps,
+    const std::vector<float>& intensities,
+    const Nsec end_time,
+    const Functor& relative_pose_at_time,
+    const LIO::Config& config) {
+  Vector3dVector points_out;
+  std::vector<float> intensities_out;
+  points_out.reserve(scan.size());
+  intensities_out.reserve(scan.size());
+  if (config.deskew) {
+    const Sophus::SE3d scan_to_scan_motion_inverse = relative_pose_at_time(end_time).inverse();
+    for (std::size_t i = 0; i < scan.size(); ++i) {
+      const Sophus::SE3d pose = scan_to_scan_motion_inverse * relative_pose_at_time(timestamps[i]);
+      const Eigen::Vector3d point = pose * scan[i];
+      const double range = point.norm();
+      if (range > config.min_range && range < config.max_range) {
+        points_out.push_back(point);
+        intensities_out.push_back(intensities[i]);
+      }
+    }
+  } else {
+    for (std::size_t i = 0; i < scan.size(); ++i) {
+      const double range = scan[i].norm();
+      if (range > config.min_range && range < config.max_range) {
+        points_out.push_back(scan[i]);
+        intensities_out.push_back(intensities[i]);
+      }
+    }
+  }
+  return {points_out, intensities_out};
+}
+
+using LinearSystem = std::tuple<Eigen::Matrix6d, Eigen::Vector6d, double>;
+
+// Per-build diagnostics of the localizability weighting (see
+// localizability_weighting.hpp): how many correspondences existed and how many
+// received a boosted (> 1) weight from an axis-observing map normal.
+struct IcpWeightingStats {
+  int correspondences = 0;
+  int boosted = 0;
+};
+
+LinearSystem build_icp_linear_system(const Sophus::SE3d& current_pose,
+                                     const rko_lio::core::Vector3dVector& frame,
+                                     const rko_lio::core::VoxelHashMap& voxel_map,
+                                     const double& max_correspondence_distance,
+                                     const int voxel_search_radius = 1,
+                                     const std::optional<Eigen::Vector3d>& localizability_axis = std::nullopt,
+                                     const double localizability_boost = 0.0,
+                                     IcpWeightingStats* weighting_stats = nullptr,
+                                     std::vector<VoxelHashMap::NeighborhoodCache>* neighborhoods = nullptr,
+                                     const bool localizability_normal_only = false) {
+  // H, b, chi, weight sum, correspondence count. The weight sum replaces the correspondence
+  // count in the H/b normalization; with weighting disabled every weight is exactly 1
+  // and the result is bit-identical to the historical count-normalized system.
+  using WeightedSystem = std::tuple<Eigen::Matrix6d, Eigen::Vector6d, double, double, int>;
+  struct SystemSum {
+    Eigen::Matrix6d H = Eigen::Matrix6d::Zero();
+    Eigen::Vector6d b = Eigen::Vector6d::Zero();
+    double chi = 0.0;
+    double weight = 0.0;
+    int correspondences = 0;
+    void add(const Eigen::Matrix6d& H_add,
+             const Eigen::Vector6d& b_add,
+             const double chi_add,
+             const double weight_add,
+             const int correspondences_add) {
+      H += H_add;
+      b += b_add;
+      chi += chi_add;
+      weight += weight_add;
+      correspondences += correspondences_add;
+    }
+  };
+
+  const bool weighting_enabled = localizability_axis.has_value() && localizability_boost > 0.0;
+  std::atomic<int> boosted_counter = 0;
+
+  auto linear_system_for_one_point = [&](const Eigen::Vector3d& source, const Eigen::Vector3d& target) {
+    Eigen::Matrix3_6d J_r;
+    J_r.block<3, 3>(0, 0) = Eigen::Matrix3d::Identity();
+    J_r.block<3, 3>(0, 3) = -1.0 * Sophus::SO3d::hat(source);
+    const Eigen::Vector3d residual = source - target;
+    double weight = 1.0;
+    std::optional<Eigen::Vector3d> normal;
+    if (weighting_enabled) {
+      normal = voxel_map.voxel_normal(target);
+      weight = localizability_weight(normal, *localizability_axis, localizability_boost);
+      if (weight > 1.0) {
+        boosted_counter++;
+      }
+    }
+    if (localizability_normal_only && weight > 1.0) {
+      // Only the residual along the map normal is boosted (normal_only_information). The weight
+      // sum counts the mean added information, trace(W) / 3.
+      const Eigen::Matrix3d W = normal_only_information(normal, weight);
+      return WeightedSystem(J_r.transpose() * W * J_r, J_r.transpose() * W * residual, residual.dot(W * residual),
+                            1.0 + (weight - 1.0) / 3.0, 1);
+    }
+    return WeightedSystem(weight * J_r.transpose() * J_r,      // JTJ
+                          weight * J_r.transpose() * residual, // JTr
+                          weight * residual.squaredNorm(),     // chi
+                          weight, 1);
+  };
+
+  // The only parallel part. The deterministic reduce sums the per-point systems in the
+  // same order on every run; tbb::parallel_reduce's order depends on thread timing, and a
+  // registration that is barely constrained turns those rounding differences into
+  // different trajectories.
+  // The correspondences are counted in the reduction too: a shared atomic counter made every
+  // thread contend for one cache line on every correspondence.
+  // The sums are kept in place instead of being passed around as tuples, which copied the 6x6
+  // system at every leaf and join of the tree. The tree does not change: with grain size 1 every
+  // leaf is a single point, whose system is added to zeros, and every join adds the right sum to
+  // the left one, as before. A point without a correspondence adds nothing; its zeros never
+  // changed a sum either.
+  using points_iterator = std::vector<Eigen::Vector3d>::const_iterator;
+  auto add_point_system = [&](const Eigen::Vector3d& point, SystemSum& sum) {
+    // Compute data association and linear system
+    const Eigen::Vector3d transformed_point = current_pose * point;
+    // neighborhoods holds one cache per point of frame, indexed like frame.
+    const auto& [closest_neighbor, distance] =
+        neighborhoods != nullptr
+            ? voxel_map.get_closest_neighbor(transformed_point, (*neighborhoods)[&point - frame.data()])
+            : voxel_map.get_closest_neighbor(transformed_point, voxel_search_radius);
+    if (distance < max_correspondence_distance) {
+      const auto& [H, b, chi, weight, correspondences] =
+          linear_system_for_one_point(transformed_point, closest_neighbor);
+      sum.add(H, b, chi, weight, correspondences);
+    }
+  };
+  // The reduction splits ranges of up to kLeafPoints points no further and sums each of them
+  // serially with the very tree it used to build with tasks down to single points (grain size 1):
+  // split in the middle as tbb::blocked_range does, the left half summed into the sum, the right
+  // half into a zero sum that is then added to it. Every body is still zero when its range is
+  // run, as before, so every point's system is added to zeros and every sum is formed in the same
+  // order as with one task per point, without the cost of those tasks.
+  constexpr std::size_t kLeafPoints = 64;
+  struct SystemSumBody {
+    decltype(add_point_system)& add_point;
+    SystemSum sum;
+    explicit SystemSumBody(decltype(add_point_system)& add_point_) : add_point(add_point_) {}
+    SystemSumBody(SystemSumBody& other, tbb::split) : add_point(other.add_point) {}
+    void sum_tree(const points_iterator first, const points_iterator last, SystemSum& tree_sum) {
+      if (last - first == 1) {
+        add_point(*first, tree_sum);
+        return;
+      }
+      const points_iterator middle = first + (last - first) / 2;
+      sum_tree(first, middle, tree_sum);
+      SystemSum right;
+      sum_tree(middle, last, right);
+      tree_sum.add(right.H, right.b, right.chi, right.weight, right.correspondences);
+    }
+    void operator()(const tbb::blocked_range<points_iterator>& r) { sum_tree(r.begin(), r.end(), sum); }
+    void join(SystemSumBody& rhs) {
+      sum.add(rhs.sum.H, rhs.sum.b, rhs.sum.chi, rhs.sum.weight, rhs.sum.correspondences);
+    }
+  };
+  SystemSumBody body(add_point_system);
+  tbb::parallel_deterministic_reduce(
+      tbb::blocked_range<points_iterator>{frame.cbegin(), frame.cend(), kLeafPoints}, body);
+  const auto& [H_icp, b_icp, chi_icp, weight_sum, correspondences] = body.sum;
+
+  if (correspondences == 0) {
+    throw std::runtime_error("Number of correspondences are 0.");
+  }
+  if (weighting_stats != nullptr) {
+    weighting_stats->correspondences = correspondences;
+    weighting_stats->boosted = boosted_counter;
+  }
+
+  return {H_icp / weight_sum, b_icp / weight_sum, 0.5 * chi_icp};
+}
+
+LinearSystem build_orientation_linear_system(const Sophus::SE3d& current_pose,
+                                             const Eigen::Vector3d& local_gravity_estimate,
+                                             const Eigen::Vector3d& gravity_world) {
+  const Sophus::SO3d& current_rotation = current_pose.so3();
+  const Eigen::Vector3d predicted_gravity =
+      current_rotation.inverse() * (-1 * gravity_world); // points upwards, same as local_gravity_estimate
+  const auto constraint = robust_gravity_direction(predicted_gravity, local_gravity_estimate);
+  const Eigen::Vector3d& residual = constraint.residual;
+
+  Eigen::Matrix3_6d J_ori = Eigen::Matrix3_6d::Zero();
+  J_ori.block<3, 3>(0, 3) = current_rotation.inverse().matrix() * Sophus::SO3d::hat(-1 * gravity_world).matrix();
+
+  const auto& loss = constraint.loss;
+  return LinearSystem{loss.weight * (J_ori.transpose() * J_ori),
+                      loss.weight * (J_ori.transpose() * residual), loss.cost};
+}
+
+// [v0.8 Phase 1, diagnostic-only] icp()'s full result: the optimized pose
+// (bit-for-bit the same value this function has always returned/applied to
+// the pose estimate) plus the final iteration's Gauss-Newton linear system
+// (H, b). H/b are exposed purely so callers can thread them into
+// State::icp_diagnostics for downstream conditioning diagnostics -- they are
+// never read back into the solve, so this struct changes nothing about how
+// `pose` is computed.
+struct IcpResult {
+  Sophus::SE3d pose;
+  Eigen::Matrix6d H = Eigen::Matrix6d::Zero();
+  Eigen::Vector6d b = Eigen::Vector6d::Zero();
+  std::size_t degeneracy_intervention_count = 0;
+  std::size_t visual_fused_directions = 0;
+  std::size_t visual_unobservable_directions = 0;
+  std::array<double, 6> visual_directional_information_ratios{};
+  std::size_t visual_directional_information_ratio_count = 0;
+  // Final-iteration localizability weighting stats (zeros when disabled).
+  IcpWeightingStats weighting_stats;
+  // Photometric patches used in the final iteration (0 when disabled).
+  int photometric_patches = 0;
+};
+
+// Bump image registration replacing the point-to-point system (see bump_image_map.hpp).
+struct BumpTerms {
+  const BumpImageMap* map = nullptr;
+  const Vector3dVector* points = nullptr;
+  double huber_delta = 0.1;
+  /** Weight of the point-to-point system added to the bump system (0: bump terms alone). */
+  double point_to_point_weight = 0.0;
+};
+
+// Photometric terms added to every ICP iteration (see photometric_features.hpp).
+struct PhotometricTerms {
+  const std::vector<PhotometricFeature>* features = nullptr;
+  const PhotometricFrame* frame = nullptr;
+  const LidarImageModel* model = nullptr;
+  const PhotometricFeatureConfig* config = nullptr;
+  Sophus::SE3d base_from_cloud;
+  double scale = 0.0;
+  /** World-frame translation directions the ICP information is removed along (may be empty). */
+  std::vector<Eigen::Vector3d> free_axes_world;
+};
+
+IcpResult icp(const Vector3dVector& frame,
+             const VoxelHashMap& voxel_map,
+             const Sophus::SE3d& initial_guess,
+             const LIO::Config& config,
+             const std::optional<AccelInfo>& optional_accel_info,
+             const int voxel_search_radius = 1,
+             const PersistentWeakDirectionState& persistent_direction = {},
+             const bool start_with_extended_iteration_budget = false,
+             const std::optional<VisualPosePrior>& visual_pose_prior = std::nullopt,
+             const std::optional<Sophus::SE3d>& degeneracy_prior_pose = std::nullopt,
+             const std::optional<Eigen::Vector3d>& localizability_axis = std::nullopt,
+             const double localizability_boost = 0.0,
+             const PhotometricTerms* photometric = nullptr,
+             const BumpTerms* bump = nullptr) {
+  // in case config disables it, or we don't have valid IMU information for this icp loop, beta is -1
+  const double beta = (config.min_beta > 0 && optional_accel_info.has_value())
+                          ? (config.min_beta * (1 + optional_accel_info->accel_mag_variance))
+                          : -1;
+
+  Sophus::SE3d current_pose = initial_guess;
+  // [v0.8 Phase 1, diagnostic-only] last iteration's linear system, kept
+  // around purely to hand back to the caller alongside the pose.
+  Eigen::Matrix6d last_H = Eigen::Matrix6d::Zero();
+  Eigen::Vector6d last_b = Eigen::Vector6d::Zero();
+  std::size_t degeneracy_intervention_count = 0;
+
+  std::size_t iteration_budget =
+      start_with_extended_iteration_budget
+          ? std::max(config.max_iterations, config.degeneracy_adaptive_max_iterations)
+          : config.max_iterations;
+  IcpWeightingStats weighting_stats;
+  int photometric_patches = 0;
+  double lm_lambda = -1.0;
+  // voxel_map does not change during this loop, so the voxel lookups of every keypoint can be
+  // kept between iterations. Only the 3x3x3 search (radius 1) has such a cache.
+  std::vector<VoxelHashMap::NeighborhoodCache> neighborhoods(voxel_search_radius <= 1 ? frame.size() : 0);
+  for (size_t i = 0; i < iteration_budget; ++i) {
+    // The system at a pose; Levenberg-Marquardt also evaluates candidate steps with it.
+    auto build_system = [&](const Sophus::SE3d& evaluation_pose) -> LinearSystem {
+      const Sophus::SE3d& current_pose = evaluation_pose;
+      LinearSystem geometric;
+      bool bump_used = false;
+      if (bump != nullptr) {
+        // Averaged over residuals like the point-to-point system, so the photometric
+        // weighting below applies unchanged.
+        const BumpImageSystem system =
+            build_bump_image_system(*bump->map, *bump->points, current_pose, bump->huber_delta);
+        if (system.residuals > 0) {
+          const double n = static_cast<double>(system.residuals);
+          geometric = {system.H / n, system.b / n, system.chi / n};
+          weighting_stats = IcpWeightingStats{system.residuals, 0};
+          bump_used = true;
+          if (bump->point_to_point_weight > 0.0) {
+            // The keypoints' point-to-point system (averaged over its correspondences) added
+            // with this weight; its statistics stay apart, so the photometric weighting below
+            // still counts the bump residuals.
+            IcpWeightingStats point_to_point_stats;
+            const auto [H_p2p, b_p2p, chi_p2p] = build_icp_linear_system(
+                current_pose, frame, voxel_map, config.max_correspondence_distance, voxel_search_radius,
+                localizability_axis, localizability_boost, &point_to_point_stats,
+                voxel_search_radius <= 1 ? &neighborhoods : nullptr, config.localizability_normal_only);
+            if (point_to_point_stats.correspondences > 0) {
+              auto& [H_geo, b_geo, chi_geo] = geometric;
+              H_geo += bump->point_to_point_weight * H_p2p;
+              b_geo += bump->point_to_point_weight * b_p2p;
+              chi_geo += bump->point_to_point_weight * chi_p2p;
+            }
+          }
+        }
+      }
+      if (!bump_used) {
+        geometric = build_icp_linear_system(current_pose, frame, voxel_map, config.max_correspondence_distance,
+                                            voxel_search_radius, localizability_axis, localizability_boost,
+                                            &weighting_stats, voxel_search_radius <= 1 ? &neighborhoods : nullptr,
+                                            config.localizability_normal_only);
+      }
+      auto [H_icp, b_icp, chi_icp] = geometric;
+      if (photometric != nullptr && weighting_stats.correspondences > 0) {
+        // The ICP system is averaged over correspondences; weight the summed photometric
+        // terms so one photometric residual counts photometric->scale times one ICP residual.
+        const PhotometricSystem photo = build_photometric_system(*photometric->features, *photometric->frame,
+                                                                 *photometric->model, *photometric->config,
+                                                                 current_pose, photometric->base_from_cloud);
+        photometric_patches = photo.patches;
+        if (photo.patches > 0 && !photometric->free_axes_world.empty()) {
+          // ICP information along the weak axes is removed: P = diag(I - sum w w^T, I).
+          Eigen::Matrix6d P = Eigen::Matrix6d::Identity();
+          for (const Eigen::Vector3d& axis : photometric->free_axes_world) {
+            P.topLeftCorner<3, 3>() -= axis * axis.transpose();
+          }
+          H_icp = P.transpose() * H_icp * P;
+          b_icp = P.transpose() * b_icp;
+        }
+        if (photo.patches > 0) {
+          const double weight = square(photometric->scale) / weighting_stats.correspondences;
+          H_icp += weight * photo.H;
+          b_icp += weight * photo.b;
+          chi_icp += 0.5 * weight * photo.chi;
+        }
+      }
+      if (beta >= 0) {
+        const auto& [H_ori, b_ori, chi_ori] =
+            build_orientation_linear_system(current_pose, optional_accel_info->local_gravity_estimate,
+                                            optional_accel_info->gravity_world);
+        return {H_icp + H_ori / beta, b_icp + b_ori / beta, chi_icp + chi_ori / beta};
+      }
+      return {H_icp, b_icp, chi_icp};
+    };
+    const auto [H, b, chi] = build_system(current_pose);
+    last_H = H;
+    last_b = b;
+    if (config.degeneracy_adaptive_iteration_budget &&
+        has_weak_information_direction(H, config.degeneracy_adaptive_iteration_ratio)) {
+      iteration_budget = std::max(iteration_budget, config.degeneracy_adaptive_max_iterations);
+    }
+
+    Eigen::Vector6d dx;
+    if (config.degeneracy_aware_solve) {
+      // Ordinarily the geometric/IMU initial guess doubles as the degeneracy
+      // prior. A radar velocity prior (see LIO::register_scan) replaces only
+      // this prior pose; the ICP iterate above (current_pose) still starts
+      // from and is regularized around `initial_guess` as before.
+      const Sophus::SE3d& prior_pose = degeneracy_prior_pose.has_value() ? *degeneracy_prior_pose : initial_guess;
+      const Eigen::Vector6d prior_update = (prior_pose * current_pose.inverse()).log();
+      DegeneracyAwareSolveConfig solve_config;
+      solve_config.well_conditioned_ratio = config.degeneracy_well_conditioned_ratio;
+      solve_config.multiplicity_relative_gap = config.degeneracy_multiplicity_relative_gap;
+      solve_config.degenerate_prior_weight = config.degeneracy_prior_weight;
+      solve_config.require_persistent_direction = config.degeneracy_persistence_gate;
+      solve_config.persistent_direction_min_absolute_cosine =
+          config.degeneracy_persistence_min_absolute_cosine;
+      solve_config.persistent_direction = persistent_direction;
+      const DegeneracyAwareSolveResult solve_result = solve_degeneracy_aware(H, b, prior_update, solve_config);
+      if (!solve_result.valid) {
+        throw std::runtime_error("Degeneracy-aware ICP solve failed.");
+      }
+      dx = solve_result.update;
+      degeneracy_intervention_count += solve_result.intervention_applied ? 1U : 0U;
+    } else if (config.icp_levenberg_marquardt) {
+      // The system is in the left perturbation exp(x) T, whose rotation turns about the
+      // world origin; damp in body coordinates T exp(y) instead, with x = Ad(T) y.
+      const Eigen::Matrix6d Ad = current_pose.Adj();
+      const Eigen::Matrix6d H_body = Ad.transpose() * H * Ad;
+      const Eigen::Vector6d b_body = Ad.transpose() * b;
+      if (lm_lambda < 0.0) {
+        lm_lambda = config.icp_lm_initial_lambda_factor * H_body.diagonal().cwiseAbs().maxCoeff();
+      }
+      double nu = 2.0;
+      dx.setZero();
+      for (int attempt = 0; attempt < config.icp_lm_max_attempts; ++attempt) {
+        const Eigen::Vector6d step_body =
+            (H_body + lm_lambda * Eigen::Matrix6d::Identity()).ldlt().solve(-b_body);
+        const Eigen::Vector6d step = Ad * step_body;
+        const double candidate_chi = std::get<2>(build_system(Sophus::SE3d::exp(step) * current_pose));
+        // Decrease predicted by the damped quadratic model (chi is half the squared residuals).
+        const double predicted = 0.5 * step_body.dot(lm_lambda * step_body - b_body);
+        const double rho = predicted > 0.0 ? (chi - candidate_chi) / predicted : -1.0;
+        if (rho < 0.0) {
+          if (step.norm() < config.convergence_criterion) {
+            break;
+          }
+          lm_lambda *= nu;
+          nu *= 2.0;
+          continue;
+        }
+        dx = step;
+        lm_lambda *= std::max(1.0 / 3.0, 1.0 - std::pow(2.0 * rho - 1.0, 3));
+        break;
+      }
+    } else {
+      dx = H.ldlt().solve(-b);
+    }
+    current_pose = Sophus::SE3d::exp(dx) * current_pose;
+
+    if (dx.norm() < config.convergence_criterion || i == (iteration_budget - 1)) {
+      // TODO: proper debug logging
+      // std::cout << "iter " << i << ", beta: " << beta << ", chi: " << chi << ", num_assoc: " <<
+      // correspondences.size() << "\n";
+      break;
+    }
+  }
+  std::size_t visual_fused_directions = 0;
+  std::size_t visual_unobservable_directions = 0;
+  std::array<double, 6> visual_directional_information_ratios{};
+  std::size_t visual_directional_information_ratio_count = 0;
+  if (visual_pose_prior.has_value()) {
+    const Eigen::Vector6d visual_update = (visual_pose_prior->pose * current_pose.inverse()).log();
+    const auto fused =
+        fuse_visual_in_weak_directions(last_H, last_b, visual_update, visual_pose_prior->confidence, config.visual_fusion);
+    visual_unobservable_directions = fused.visual_unobservable_directions;
+    visual_directional_information_ratios = fused.visual_directional_information_ratios;
+    visual_directional_information_ratio_count = fused.visual_directional_information_ratio_count;
+    if (fused.accepted) {
+      const Eigen::Vector6d dx = fused.H.ldlt().solve(-fused.b);
+      if (!dx.allFinite()) {
+        throw std::runtime_error("Selective visual fusion solve failed.");
+      }
+      current_pose = Sophus::SE3d::exp(dx) * current_pose;
+      last_H = fused.H;
+      last_b = fused.b;
+      visual_fused_directions = fused.fused_directions;
+    }
+  }
+  return {current_pose, last_H, last_b, degeneracy_intervention_count,
+          visual_fused_directions, visual_unobservable_directions,
+          visual_directional_information_ratios,
+          visual_directional_information_ratio_count, weighting_stats, photometric_patches};
+}
+
+struct AlignmentStats {
+  int correspondences = 0;
+  double inlier_ratio = 0.0;
+  double mean_error = std::numeric_limits<double>::max();
+};
+
+AlignmentStats evaluate_alignment(const Sophus::SE3d& pose,
+                                  const Vector3dVector& frame,
+                                  const VoxelHashMap& voxel_map,
+                                  const double max_correspondence_distance,
+                                  const int voxel_search_radius) {
+  if (frame.empty()) {
+    return {};
+  }
+  int correspondences = 0;
+  double error_sum = 0.0;
+  for (const Eigen::Vector3d& point : frame) {
+    const Eigen::Vector3d transformed_point = pose * point;
+    const auto& [closest_neighbor, distance] = voxel_map.get_closest_neighbor(transformed_point, voxel_search_radius);
+    (void)closest_neighbor;
+    if (distance < max_correspondence_distance) {
+      ++correspondences;
+      error_sum += distance;
+    }
+  }
+  if (correspondences == 0) {
+    return {};
+  }
+  return {
+      .correspondences = correspondences,
+      .inlier_ratio = static_cast<double>(correspondences) / static_cast<double>(frame.size()),
+      .mean_error = error_sum / static_cast<double>(correspondences),
+  };
+}
+
+int voxel_search_radius_for_distance(const VoxelHashMap& voxel_map, const double max_correspondence_distance) {
+  const double voxel_size = std::max(1e-6, voxel_map.voxel_size_);
+  return std::max(1, static_cast<int>(std::ceil(max_correspondence_distance / voxel_size)) + 1);
+}
+
+Sophus::SO3d yaw_rotation(const double yaw_rad) {
+  return Sophus::SO3d::exp(Eigen::Vector3d(0.0, 0.0, yaw_rad));
+}
+
+inline Sophus::SO3d align_accel_to_z_world(const Eigen::Vector3d& accel) {
+  //  unobservable in the gravity direction, and the z in R.log() will always be 0
+  const Eigen::Vector3d z_world = {0.0, 0.0, 1.0};
+  const Eigen::Quaterniond quat_accel = Eigen::Quaterniond::FromTwoVectors(accel, z_world);
+  return Sophus::SO3d(quat_accel);
+}
+
+Eigen::Vector3d centroid_of(const Vector3dVector& points) {
+  Eigen::Vector3d sum = Eigen::Vector3d::Zero();
+  for (const auto& point : points) {
+    sum += point;
+  }
+  return points.empty() ? sum : Eigen::Vector3d(sum / static_cast<double>(points.size()));
+}
+} // namespace
+
+// ==========================
+//   actual LIO class stuff
+// ==========================
+
+namespace rko_lio::core {
+
+LIO::LIO(const Config& config_)
+    : config(config_),
+      map(config_.voxel_size, config_.max_range, config_.max_points_per_voxel),
+      bump_map(config_.bump_image_map),
+      relocalization_map(config_.voxel_size, config_.max_range, config_.max_points_per_voxel),
+      _photometric_features(config_.photometric_features) {
+  _output_filter = OutputPositionFilter({config.output_filter_position_sigma, config.output_filter_acceleration_noise,
+                                         config.output_filter_bias_noise});
+  // Per-voxel normals are only maintained when the localizability weighting can
+  // consume them; the default path pays nothing.
+  map.set_compact_points(config.local_map_compact_points);
+  map.set_maintain_normals(config.localizability_weighting ||
+                           (config.close_scene_max_median_range > 0.0 && config.close_scene_localizability_boost > 0.0));
+  if (config.gait_speed_prior) {
+    GaitSpeedEstimator::Config gait_config;
+    gait_config.window_sec = config.gait_window_sec;
+    gait_config.min_peak_fraction = config.gait_min_peak_fraction;
+    gait_config.min_magnitude_std = config.gait_min_magnitude_std;
+    gait_config.min_step_length = config.gait_min_step_length;
+    gait_config.max_step_length = config.gait_max_step_length;
+    _gait = GaitSpeedEstimator(gait_config);
+  }
+  if (config.inertial_window) {
+    InertialWindow::Config window_config;
+    window_config.length_sec = config.inertial_window_sec;
+    window_config.min_intervals = static_cast<std::size_t>(std::max(1, config.inertial_window_min_intervals));
+    window_config.rotation_weight = config.inertial_window_rotation_weight;
+    window_config.velocity_weight = config.inertial_window_velocity_weight;
+    window_config.position_weight = config.inertial_window_position_weight;
+    window_config.accelerometer_bias_prior_weight = config.inertial_window_accelerometer_bias_prior_weight;
+    window_config.gyroscope_bias_prior_weight = config.inertial_window_gyroscope_bias_prior_weight;
+    _inertial_window = InertialWindow(window_config);
+  }
+  // Pin TBB's worker pool to config.max_num_threads (0 = leave at TBB default).
+  [[maybe_unused]] static const auto tbb_thread_limit = [&] {
+    const int threads = config.max_num_threads > 0 ? config.max_num_threads : tbb::this_task_arena::max_concurrency();
+    return tbb::global_control(tbb::global_control::max_allowed_parallelism, static_cast<size_t>(threads));
+  }();
+}
+
+// ==========================
+//          private
+// ==========================
+
+void LIO::initialize(const Nsec lidar_time) {
+  gyro_deskew_history.clear();
+  if (interval_stats.imu_count == 0) {
+    std::cerr << "[WARNING] Cannot initialize. No imu measurements received.\n";
+    // lidar_state.time has the time from the previous lidar, which we didn't log if init_phase was on
+    poses_with_timestamps.emplace_back(lidar_state.time, lidar_state.pose);
+    record_output_pose(false);
+    _initialized = true;
+    return;
+  }
+
+  const Eigen::Vector3d avg_accel = interval_stats.imu_acceleration_sum / interval_stats.imu_count;
+  const Eigen::Vector3d avg_gyro = interval_stats.angular_velocity_sum / interval_stats.imu_count;
+
+  const Sophus::SO3d initial_rotation = align_accel_to_z_world(avg_accel);
+  lidar_state.pose.so3() = initial_rotation;
+  imu_state = lidar_state;
+
+  // lidar_state.time has the time from the previous lidar, which we didn't log if init_phase was on
+  poses_with_timestamps.emplace_back(lidar_state.time, lidar_state.pose);
+  record_output_pose(false);
+
+  // the pose for the current time gets logged at the end of register_scan in the typical fashion
+  lidar_state.time = lidar_time;
+  imu_state.time = lidar_time;
+
+  const Eigen::Vector3d local_gravity = imu_state.pose.so3().inverse() * _gravity_world;
+  imu_bias.accelerometer = avg_accel + local_gravity;
+  imu_bias.gyroscope = avg_gyro;
+  if (config.initialization_max_gyro_rad_s > 0.0 && avg_gyro.norm() > config.initialization_max_gyro_rad_s) {
+    // Not a static start (a vehicle already driving): the averages are motion, not biases.
+    imu_bias.accelerometer.setZero();
+    imu_bias.gyroscope.setZero();
+    std::cout << "[INFO] Moving start (gyro " << avg_gyro.norm() << " rad/s): IMU biases left at zero.\n";
+    _output_filter_held = true;
+    _moving_start = true;
+    if (config.moving_start_gravity_window_sec > 0.0) {
+      _moving_start_time = to_seconds(lidar_time);
+    }
+  }
+
+  if (!_moving_start && config.gyro_bias_start_sec > 0.0) {
+    _gyro_bias_start_until = to_seconds(lidar_time) + config.gyro_bias_start_sec;
+  }
+  _initialized = true;
+  std::cout << "[INFO] Odometry map frame initialized using " << interval_stats.imu_count
+            << " IMU measurements. Estimated initial rotation [se(3)] is " << imu_state.pose.so3().log().transpose()
+            << "\n";
+  std::cout << "[INFO] Estimated accel bias: " << imu_bias.accelerometer.transpose()
+            << ", gyro bias: " << imu_bias.gyroscope.transpose() << "\n";
+}
+
+Vector3dVector LIO::bootstrap_first_scan(const Vector3dVector& scan, const Nsec current_lidar_time) {
+  lidar_state.time = current_lidar_time;
+  imu_state = lidar_state;
+  // Initialization needs the next IMU interval before this pose has a valid
+  // world orientation. Do not publish a cloud/odometry pair in a provisional frame.
+  if (config.initialization_phase) {
+    return {};
+  }
+  auto preproc = preprocess_scan(scan, config);
+  update_maps(config.double_downsample ? preproc.map_frame : preproc.keypoints, lidar_state.pose,
+              &preproc.filtered_frame);
+  poses_with_timestamps.emplace_back(lidar_state.time, lidar_state.pose);
+  record_output_pose(false);
+  std::cout << "[INFO] Odometry map frame initialized with first lidar scan.\n";
+  return std::move(preproc.filtered_frame);
+}
+
+std::pair<Eigen::Vector3d, Eigen::Vector3d> LIO::motion_priors_from_imu(const Nsec current_lidar_time) {
+  if (config.initialization_phase && !_initialized) {
+    // assume static and
+    initialize(current_lidar_time);
+    return {Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero()};
+  }
+  if (interval_stats.imu_count == 0) {
+    std::cerr << "[WARNING] No Imu measurements in interval to average. Assuming constant velocity motion.\n";
+    return {Eigen::Vector3d::Zero(), lidar_state.angular_velocity};
+  }
+  const Eigen::Vector3d avg_body_accel = interval_stats.body_acceleration_sum / interval_stats.imu_count;
+  const Eigen::Vector3d avg_ang_vel = interval_stats.angular_velocity_sum / interval_stats.imu_count;
+  if (avg_body_accel.norm() > 50.0) {
+    std::cerr << "[WARNING] Erratic body acceleration computed, norm > 50 m/s2. Either IMU data is corrupted, or you "
+                 "should report an issue.";
+  }
+  return {avg_body_accel, avg_ang_vel};
+}
+
+void LIO::update_maps(const Vector3dVector& map_update_frame,
+                      const Sophus::SE3d& pose,
+                      const Vector3dVector* full_frame) {
+  map.update(map_update_frame, pose);
+  // Diagnostic only, never read back (RKO_LIO_MAP_DIAG=<file>): every 50th map update, the local
+  // map's sizes (VoxelHashMap::memory_summary).
+  if (static const char* const map_diag_path = std::getenv("RKO_LIO_MAP_DIAG"); map_diag_path != nullptr) {
+    static std::ofstream map_diag(map_diag_path);
+    static std::size_t map_updates = 0;
+    if (map_updates++ % 50 == 0) map_diag << map.memory_summary() << '\n' << std::flush;
+  }
+  if (config.bump_image_registration && full_frame != nullptr) {
+    Vector3dVector world_points(full_frame->size());
+    std::vector<double> ranges(full_frame->size());
+    for (std::size_t i = 0; i < full_frame->size(); ++i) {
+      world_points[i] = pose * (*full_frame)[i];
+      ranges[i] = (*full_frame)[i].norm();
+    }
+    bump_map.integrate(world_points, ranges);
+  }
+
+  // The unpruned global map exists only for the opt-in kidnap recovery path.
+  // Avoid transforming, copying, and retaining every map point when recovery
+  // is disabled (the normal SLAM-only configuration).
+  if (config.enable_kidnap_relocalization) {
+    Vector3dVector points_transformed(map_update_frame.size());
+    std::transform(map_update_frame.cbegin(), map_update_frame.cend(), points_transformed.begin(),
+                   [&](const auto& point) { return pose * point; });
+    relocalization_map.add_points(points_transformed);
+  }
+}
+
+void LIO::relevel_local_frame(const Sophus::SO3d& correction, const Eigen::Vector3d& pivot) {
+  const Sophus::SE3d transform(correction, pivot - correction * pivot);
+  lidar_state.pose = transform * lidar_state.pose;
+  map.transform(transform);
+  _inertial_window.reset();
+  for (auto& [_, world_accel] : _gravity_alignment_window) {
+    world_accel = correction * world_accel;
+  }
+}
+
+void LIO::record_output_pose(const bool registered) {
+  if (!(config.output_filter_position_sigma > 0.0)) return;
+  const auto& [time, pose] = poses_with_timestamps.back();
+  if (registered && _output_filter.initialized() && !_output_filter_held) {
+    const Eigen::Vector3d position = _output_filter.update(to_seconds(time), pose.translation());
+    output_poses_with_timestamps.emplace_back(time, Sophus::SE3d(pose.so3(), position));
+    return;
+  }
+  _output_filter.reset(to_seconds(time), pose.translation(), pose.so3() * lidar_state.velocity);
+  output_poses_with_timestamps.push_back(poses_with_timestamps.back());
+  if (_output_filter_resume) {
+    // the filter starts here, propagated from now on with the gravity just estimated
+    _output_filter_held = false;
+    _output_filter_resume = false;
+  }
+}
+
+void LIO::update_moving_start_gravity(const Nsec& current_lidar_time, const Sophus::SO3d& current_rotation) {
+  // The registration settles over the first scans after a moving start (its velocity starts at zero).
+  constexpr double settle_sec = 1.0;
+  constexpr double half_span = 0.5;
+  const double begin = *_moving_start_time + settle_sec;
+  const double end = begin + config.moving_start_gravity_window_sec;
+  const double start = to_seconds(lidar_state.time);
+  const double stop = to_seconds(current_lidar_time);
+  if (stop > start && interval_stats.imu_count > 0) {
+    // The interval's mean sample is rotated with the attitude halfway through the interval.
+    const Sophus::SO3d& previous = lidar_state.pose.so3();
+    const Sophus::SO3d middle = previous * Sophus::SO3d::exp(0.5 * (previous.inverse() * current_rotation).log());
+    _moving_start_intervals.push_back(
+        {0.5 * (start + stop), stop - start, middle * (interval_stats.imu_acceleration_sum / interval_stats.imu_count)});
+  }
+  // The positions up to end + half_span must be registered (the current scan's pose is stored later).
+  if (poses_with_timestamps.empty() || to_seconds(poses_with_timestamps.back().first) < end + half_span) {
+    return;
+  }
+  const auto position_at = [this](const double time) -> Eigen::Vector3d {
+    const auto after = std::lower_bound(poses_with_timestamps.cbegin(), poses_with_timestamps.cend(), time,
+                                        [](const auto& entry, const double t) { return to_seconds(entry.first) < t; });
+    if (after == poses_with_timestamps.cbegin()) return after->second.translation();
+    if (after == poses_with_timestamps.cend()) return std::prev(after)->second.translation();
+    const auto before = std::prev(after);
+    const double t0 = to_seconds(before->first);
+    const double t1 = to_seconds(after->first);
+    const double f = t1 > t0 ? (time - t0) / (t1 - t0) : 0.0;
+    return (1.0 - f) * before->second.translation() + f * after->second.translation();
+  };
+  const std::optional<Eigen::Vector3d> up =
+      estimate_world_up_while_moving(_moving_start_intervals, position_at, begin, end, half_span);
+  _moving_start_time.reset();
+  _moving_start_intervals.clear();
+  if (!up.has_value() || std::abs(up->norm() - GRAVITY_MAG) > 0.05 * GRAVITY_MAG) {
+    std::cout << "[WARNING] Moving start: the gravity window gave "
+              << (up.has_value() ? std::to_string(up->norm()) + " m/s2" : std::string("no estimate"))
+              << "; the initial gravity is kept.\n";
+    return;
+  }
+  const Eigen::Vector3d gravity_estimate = -GRAVITY_MAG * up->normalized();
+  if (config.moving_start_gravity_output_only) {
+    _output_filter_gravity_correction = gravity_estimate - _gravity_world;
+  } else {
+    _gravity_world = gravity_estimate;
+  }
+  _output_filter_resume = true;
+  moving_start_gravity_tilt_deg = std::acos(std::clamp(up->normalized().z(), -1.0, 1.0)) * 180.0 / M_PI;
+  std::cout << "[INFO] Moving start: gravity estimated again from " << config.moving_start_gravity_window_sec
+            << " s of motion, " << moving_start_gravity_tilt_deg << " deg from the initial world z.\n";
+}
+
+Vector3dVector LIO::recover_with_scan(const Vector3dVector& filtered_frame,
+                                      const Vector3dVector& map_update_frame,
+                                      const Nsec& current_lidar_time,
+                                      const Sophus::SE3d& recovery_pose,
+                                      const std::string& reason) {
+  map.clear();
+  bump_map.clear();
+  _inertial_window.reset();
+  lidar_state.pose = recovery_pose;
+  lidar_state.time = current_lidar_time;
+  lidar_state.velocity.setZero();
+  lidar_state.angular_velocity.setZero();
+  lidar_state.linear_acceleration.setZero();
+  // [v0.8 Phase 1, diagnostic-only] the local map was just cleared and
+  // `recovery_pose` did not come from a normal incremental ICP solve against
+  // it, so any previously-recorded H/b would describe a now-irrelevant map.
+  lidar_state.icp_diagnostics = std::nullopt;
+  _persistent_weak_direction_tracker.reset();
+  _previous_intensity_profile.reset();
+  _kinematic_blend_anchor_time.reset();
+  _kinematic_blend_propagated_velocity_world.reset();
+  _kinematic_blend_turning_streak = 0;
+  _kinematic_blend_speeding_streak = 0;
+  _kinematic_blend_scene_last_rejected_time_sec = -1.0;
+  _kinematic_blend_speed_last_rejected_time_sec = -1.0;
+  imu_state = lidar_state;
+  interval_stats.reset();
+  reset_inertial_window_interval();
+  gyro_deskew_history.clear();
+  update_maps(map_update_frame, lidar_state.pose, &filtered_frame);
+  poses_with_timestamps.emplace_back(lidar_state.time, lidar_state.pose);
+  record_output_pose(false);
+  _consecutive_registration_failures = 0;
+  std::cout << "[INFO] Kidnap recovery accepted scan at " << to_seconds(current_lidar_time) << "s via " << reason
+            << ".\n";
+  return filtered_frame;
+}
+
+Vector3dVector LIO::drop_failed_scan(const Nsec& current_lidar_time, const std::string& reason) {
+  lidar_state.time = current_lidar_time;
+  _inertial_window.reset();
+  // [v0.8 Phase 1, diagnostic-only] no ICP solve happened for the dropped scan.
+  lidar_state.icp_diagnostics = std::nullopt;
+  _persistent_weak_direction_tracker.reset();
+  _previous_intensity_profile.reset();
+  _kinematic_blend_anchor_time.reset();
+  _kinematic_blend_propagated_velocity_world.reset();
+  _kinematic_blend_turning_streak = 0;
+  _kinematic_blend_speeding_streak = 0;
+  _kinematic_blend_scene_last_rejected_time_sec = -1.0;
+  _kinematic_blend_speed_last_rejected_time_sec = -1.0;
+  imu_state = lidar_state;
+  interval_stats.reset();
+  reset_inertial_window_interval();
+  gyro_deskew_history.clear();
+  std::cerr << "[WARNING] Dropping scan during kidnap recovery: " << reason << "\n";
+  return {};
+}
+
+std::optional<Sophus::SE3d> LIO::try_global_relocalization(const Vector3dVector& keypoints) const {
+  if (!config.enable_kidnap_relocalization || relocalization_map.empty() || keypoints.empty()) {
+    return std::nullopt;
+  }
+  const int usable_pose_count =
+      static_cast<int>(poses_with_timestamps.size()) - std::max(0, config.relocalization_min_pose_separation);
+  if (usable_pose_count <= 0) {
+    return std::nullopt;
+  }
+
+  LIO::Config relocalization_config = config;
+  relocalization_config.max_iterations = static_cast<size_t>(std::max(1, config.relocalization_max_iterations));
+  relocalization_config.max_correspondence_distance = config.relocalization_max_correspondence_distance;
+  relocalization_config.min_beta = -1.0;
+  const int pose_stride = std::max(1, config.relocalization_pose_stride);
+  const int yaw_samples = std::max(1, config.relocalization_yaw_samples);
+  const int voxel_search_radius =
+      voxel_search_radius_for_distance(relocalization_map, relocalization_config.max_correspondence_distance);
+  const double pi = std::acos(-1.0);
+
+  bool found = false;
+  Sophus::SE3d best_pose;
+  AlignmentStats best_stats;
+  for (int pose_index = 0; pose_index < usable_pose_count; pose_index += pose_stride) {
+    const Sophus::SE3d& historical_pose = poses_with_timestamps[static_cast<size_t>(pose_index)].second;
+    for (int yaw_index = 0; yaw_index < yaw_samples; ++yaw_index) {
+      const double yaw = (2.0 * pi * static_cast<double>(yaw_index)) / static_cast<double>(yaw_samples);
+      const Sophus::SE3d initial_guess(yaw_rotation(yaw) * historical_pose.so3(), historical_pose.translation());
+      Sophus::SE3d optimized_pose;
+      try {
+        // [v0.8 Phase 1] icp() now returns IcpResult; relocalization only
+        // needs the pose, so the diagnostic H/b are discarded here (a fresh
+        // local map is about to replace the current one, see
+        // LIO::recover_with_scan, which invalidates any prior diagnostics
+        // anyway).
+        optimized_pose =
+            icp(keypoints, relocalization_map, initial_guess, relocalization_config, std::nullopt, voxel_search_radius)
+                .pose;
+      } catch (const std::exception&) {
+        continue;
+      }
+      const AlignmentStats stats = evaluate_alignment(optimized_pose, keypoints, relocalization_map,
+                                                       relocalization_config.max_correspondence_distance,
+                                                       voxel_search_radius);
+      if (stats.correspondences < config.relocalization_min_correspondences ||
+          stats.inlier_ratio < config.relocalization_min_inlier_ratio ||
+          stats.mean_error > config.relocalization_max_mean_error) {
+        continue;
+      }
+      if (!found || stats.mean_error < best_stats.mean_error ||
+          (std::abs(stats.mean_error - best_stats.mean_error) < 1e-6 &&
+           stats.correspondences > best_stats.correspondences)) {
+        found = true;
+        best_pose = optimized_pose;
+        best_stats = stats;
+      }
+    }
+  }
+
+  if (!found) {
+    return std::nullopt;
+  }
+  std::cout << "[INFO] Kidnap relocalization matched " << best_stats.correspondences << "/" << keypoints.size()
+            << " keypoints, mean error " << best_stats.mean_error << " m.\n";
+  return best_pose;
+}
+
+// ==========================
+//          public
+// ==========================
+
+// ============================ imu ===============================
+
+void LIO::add_imu_measurement(const ImuControl& base_imu) {
+  if (lidar_state.time < EPSILON_TIME) {
+    static bool warning_skip_till_first_lidar = false;
+    if (!warning_skip_till_first_lidar) {
+      std::cerr << "[WARNING - ONCE] Skipping IMU, waiting for first LiDAR message.\n";
+      warning_skip_till_first_lidar = true;
+    }
+    _last_real_imu_time = base_imu.time;
+    _last_real_base_imu_ang_vel = base_imu.angular_velocity;
+    return;
+  }
+
+  if (imu_state.time < EPSILON_TIME) {
+    imu_state = lidar_state;
+  }
+
+  const double dt = to_seconds(base_imu.time - imu_state.time);
+
+  if (dt < 0.0) {
+    // messages are out of sync. thats a problem, since we integrate gyro from last lidar time onwards
+    std::cerr << "[WARNING] Received IMU message from the past. Can result in errors.\n";
+    // maybe skip this imu reading?
+  }
+
+  const Eigen::Vector3d unbiased_ang_vel = base_imu.angular_velocity - imu_bias.gyroscope;
+  const Eigen::Vector3d unbiased_accel = base_imu.acceleration - imu_bias.accelerometer;
+
+  const Eigen::Vector3d local_gravity = imu_state.pose.so3().inverse() * _gravity_world;
+  const Eigen::Vector3d compensated_accel = unbiased_accel + local_gravity;
+  if (_output_filter.initialized()) {
+    const Eigen::Vector3d world_acceleration =
+        imu_state.pose.so3() * compensated_accel + _output_filter_gravity_correction;
+    _output_filter.propagate(to_seconds(base_imu.time), world_acceleration);
+  }
+
+  gyro_deskew_history.add(imu_state.time, base_imu.time, unbiased_ang_vel);
+
+  // imu state update
+  Eigen::Vector6d tau;
+  tau.head<3>() = imu_state.velocity * dt + compensated_accel * square(dt) / 2;
+  tau.tail<3>() = unbiased_ang_vel * dt;
+  imu_state.pose = imu_state.pose * Sophus::SE3d::exp(tau);
+  imu_state.velocity += compensated_accel * dt;
+  imu_state.angular_velocity = unbiased_ang_vel;
+  imu_state.time = base_imu.time;
+
+  interval_stats.update(unbiased_ang_vel, unbiased_accel, compensated_accel);
+  if (config.gait_speed_prior) {
+    _gait.add_imu(to_seconds(base_imu.time), base_imu.acceleration);
+    if (dt > 0.0) {
+      _gait_velocity_change += (imu_state.pose.so3() * compensated_accel) * dt;
+    }
+  }
+  if (config.inertial_window && dt > 0.0) {
+    if (_window_preintegration.dt <= 0.0) {
+      _window_preintegration.accelerometer_bias = imu_bias.accelerometer;
+      _window_preintegration.gyroscope_bias = imu_bias.gyroscope;
+    }
+    _window_preintegration.add(unbiased_ang_vel, unbiased_accel, dt);
+    _window_last_angular_velocity = unbiased_ang_vel;
+    _window_last_specific_force = unbiased_accel;
+  }
+
+  _last_real_imu_time = base_imu.time;
+  _last_real_base_imu_ang_vel = base_imu.angular_velocity;
+}
+
+void LIO::add_imu_measurement(const Sophus::SE3d& extrinsic_imu2base, const ImuControl& raw_imu) {
+  if (extrinsic_imu2base.log().norm() < EPSILON) {
+    add_imu_measurement(raw_imu);
+    return;
+  }
+
+  if (_last_real_imu_time < EPSILON_TIME) {
+    // skip IMU message as we need a previous imu time for extrinsic compensation
+    _last_real_imu_time = raw_imu.time;
+    return;
+  }
+
+  // accounting for the transport-rate
+  ImuControl base_imu = raw_imu;
+  const Sophus::SO3d& extrinsic_rotation = extrinsic_imu2base.so3();
+  base_imu.angular_velocity = extrinsic_rotation * raw_imu.angular_velocity;
+
+  const Eigen::Vector3d& lever_arm = -1 * extrinsic_imu2base.translation();
+  const Nsec dt = raw_imu.time - _last_real_imu_time;
+
+  const Eigen::Vector3d angular_acceleration = std::invoke([&]() -> Eigen::Vector3d {
+    if (std::chrono::abs(dt) < std::chrono::microseconds(200)) {
+      // if dt is less than the equivalent of a 5000 Hz imu, assuming zero ang accel,
+      // causes numerical issues otherwise
+      static bool warning_imu_too_close = false;
+      if (!warning_imu_too_close) {
+        std::cerr << "[WARNING - ONCE] Received IMU message with a very short delta to previous IMU message. Ignoring "
+                     "all such messages.\n";
+        warning_imu_too_close = true;
+      }
+      return Eigen::Vector3d::Zero();
+    } else {
+      const Eigen::Vector3d angular_acceleration =
+          (base_imu.angular_velocity - _last_real_base_imu_ang_vel) / to_seconds(dt);
+      return angular_acceleration;
+    }
+  });
+
+  base_imu.acceleration = extrinsic_rotation * raw_imu.acceleration + angular_acceleration.cross(lever_arm) +
+                          base_imu.angular_velocity.cross(base_imu.angular_velocity.cross(lever_arm));
+
+  this->add_imu_measurement(base_imu);
+}
+
+Sophus::SE3d LIO::predict_pose_at(const Nsec& time) const {
+  const double dt = to_seconds(time - lidar_state.time);
+  Eigen::Vector3d average_acceleration = Eigen::Vector3d::Zero();
+  Eigen::Vector3d average_angular_velocity = Eigen::Vector3d::Zero();
+  if (config.initialization_phase && !_initialized) {
+    // The registration path assumes zero motion while collecting its
+    // initialization window.
+  } else if (interval_stats.imu_count > 0) {
+    average_acceleration = interval_stats.body_acceleration_sum / interval_stats.imu_count;
+    average_angular_velocity = interval_stats.angular_velocity_sum / interval_stats.imu_count;
+  } else {
+    average_angular_velocity = lidar_state.angular_velocity;
+  }
+  Eigen::Vector6d motion = Eigen::Vector6d::Zero();
+  motion.head<3>() = lidar_state.velocity * dt + average_acceleration * square(dt) / 2.0;
+  motion.tail<3>() = average_angular_velocity * dt;
+  return lidar_state.pose * Sophus::SE3d::exp(motion);
+}
+
+// ============================ lidar ===============================
+
+Vector3dVector LIO::register_scan(const Vector3dVector& scan,
+                                  const TimestampVector& timestamps,
+                                  const std::vector<float>* intensities) {
+  if (timestamps.empty()) {
+    throw std::invalid_argument("LIO::register_scan: timestamps must not be empty.");
+  }
+  // TODO: redundant max compute as its available after process_timestamps
+  const Nsec current_lidar_time = *std::max_element(timestamps.cbegin(), timestamps.cend());
+
+  if (lidar_state.time < EPSILON_TIME) {
+    return bootstrap_first_scan(scan, current_lidar_time);
+  }
+
+  if (to_seconds(std::chrono::abs(current_lidar_time - lidar_state.time)) > config.max_scan_delta_sec) {
+    const double diff_seconds = to_seconds(current_lidar_time - lidar_state.time);
+    // Re-anchor instead of throwing: a throw leaves lidar_state.time behind,
+    // so every later scan also exceeds the delta and the pipeline never
+    // recovers from a single dropout. Dropping this scan while advancing the
+    // internal clock lets the next scan register normally, and the failure
+    // count lets relocalize_after_scan_gap trigger when enabled.
+    // When the IMU kept streaming through the gap, re-anchor at the pose it propagated:
+    // re-anchoring at the pre-gap pose loses the motion made during the gap, and the
+    // next scans then register from a stale heading and position.
+    if (interval_stats.imu_count > 0) {
+      lidar_state.pose = imu_state.pose;
+    }
+    ++_consecutive_registration_failures;
+    return drop_failed_scan(current_lidar_time,
+                            "LiDAR scan gap of " + std::to_string(diff_seconds) +
+                                " seconds exceeds max_scan_delta_sec; re-anchoring at the new timestamp.");
+  }
+
+  const bool initializing = config.initialization_phase && !_initialized;
+  const auto [avg_body_accel, avg_ang_vel] = motion_priors_from_imu(current_lidar_time);
+  _standstill_this_scan = false;
+  if (!_first_scan_time.has_value()) {
+    _first_scan_time = current_lidar_time;
+  }
+  if (config.start_standstill_radius > 0.0 && !initializing && !_left_start && interval_stats.imu_count > 1 &&
+      (_moving_start || !config.start_standstill_moving_start_only)) {
+    if (lidar_state.pose.translation().norm() > config.start_standstill_radius ||
+        to_seconds(current_lidar_time - *_first_scan_time) > config.start_standstill_max_sec) {
+      _left_start = true;
+    } else {
+      // The interval statistics are bias-corrected; add the current biases back.
+      const double n = static_cast<double>(interval_stats.imu_count);
+      const Eigen::Vector3d mean_gyro = interval_stats.angular_velocity_sum / n + imu_bias.gyroscope;
+      const double accel_std = std::sqrt(interval_stats.welford_sum_of_squares / (n - 1.0));
+      const double max_gyro = config.start_standstill_max_gyro_rad_s > 0.0 ? config.start_standstill_max_gyro_rad_s
+                                                                            : config.initialization_max_gyro_rad_s;
+      if (mean_gyro.norm() < max_gyro &&
+          accel_std < config.start_standstill_max_accel_std) {
+        const Eigen::Vector3d mean_accel = interval_stats.imu_acceleration_sum / n + imu_bias.accelerometer;
+        const double interval = to_seconds(current_lidar_time - lidar_state.time);
+        const bool update_bias = config.start_standstill_bias != "none";
+        if (config.start_standstill_bias == "average" && update_bias) {
+          _standstill_duration += interval;
+          _standstill_gyro_sum += interval * mean_gyro;
+          imu_bias.gyroscope = _standstill_gyro_sum / _standstill_duration;
+        } else if (update_bias) {
+          imu_bias.gyroscope = mean_gyro;
+        }
+        if (config.start_standstill_bias == "average" && update_bias) {
+          _standstill_accel_duration += interval;
+          _standstill_accel_bias_sum += interval * (mean_accel + lidar_state.pose.so3().inverse() * _gravity_world);
+          imu_bias.accelerometer = _standstill_accel_bias_sum / _standstill_accel_duration;
+        } else if (update_bias) {
+          imu_bias.accelerometer = mean_accel + lidar_state.pose.so3().inverse() * _gravity_world;
+        }
+        lidar_state.velocity.setZero();
+        _standstill_this_scan = true;
+        ++start_standstill_count;
+        if (!_standstill_anchor.has_value()) {
+          _standstill_anchor = lidar_state.pose.translation();
+        }
+      } else {
+        _standstill_anchor.reset();
+      }
+    }
+  }
+
+  const Nsec earliest = std::min(lidar_state.time, *std::min_element(timestamps.begin(), timestamps.end()));
+  const bool samplewise_rotation = config.samplewise_gyro_deskew &&
+                                   gyro_deskew_history.finish_scan(current_lidar_time) &&
+                                   gyro_deskew_history.covers(earliest, current_lidar_time);
+  const Sophus::SO3d rotation_origin = samplewise_rotation
+      ? gyro_deskew_history.at(lidar_state.time).value() : Sophus::SO3d();
+
+  // Keep the existing translation curve and prediction; replace only deskew rotation.
+  // The structured bindings are copied in explicitly: capturing them by reference needs a
+  // C++20 compiler that implements P1091 (clang 16+), and the WebAssembly build uses clang 15.
+  auto relative_pose_at_time = [&, avg_body_accel = avg_body_accel,
+                                avg_ang_vel = avg_ang_vel](const Nsec time) -> Sophus::SE3d {
+    const double dt = to_seconds(time - lidar_state.time);
+    Eigen::Vector6d tau;
+    tau.head<3>() = lidar_state.velocity * dt + (avg_body_accel * square(dt) / 2);
+    tau.tail<3>() = avg_ang_vel * dt;
+    Sophus::SE3d pose = Sophus::SE3d::exp(tau);
+    if (samplewise_rotation) pose.so3() = rotation_origin.inverse() * gyro_deskew_history.at(time).value();
+    return pose;
+  };
+
+  const Sophus::SE3d initial_guess = predict_pose_at(current_lidar_time);
+
+  // Photometric frame: the organized scan as a filtered intensity image, with the deskew
+  // transform of every point so a deskewed point maps back to the pixel it was captured at.
+  std::optional<PhotometricFrame> photometric_frame;
+  const LidarImageModel& image_model = config.photometric_model;
+  if (config.photometric && intensities != nullptr && intensities->size() == scan.size() && image_model.valid() &&
+      scan.size() == static_cast<std::size_t>(image_model.rows) * image_model.cols) {
+    const Sophus::SE3d& base_from_cloud = _photometric_base_from_cloud;
+    const Sophus::SE3d cloud_from_base = base_from_cloud.inverse();
+    Vector3dVector cloud_points(scan.size());
+    std::transform(scan.cbegin(), scan.cend(), cloud_points.begin(),
+                   [&](const Eigen::Vector3d& point) { return cloud_from_base * point; });
+    std::vector<int> capture_slot(scan.size(), 0);
+    std::vector<Sophus::SE3d> end_from_capture{Sophus::SE3d()};
+    if (config.deskew) {
+      end_from_capture.clear();
+      const Sophus::SE3d end_inverse = relative_pose_at_time(current_lidar_time).inverse();
+      std::unordered_map<Nsec::rep, int> slot_of_time;
+      for (std::size_t i = 0; i < scan.size(); ++i) {
+        const auto [it, inserted] =
+            slot_of_time.try_emplace(timestamps[i].count(), static_cast<int>(end_from_capture.size()));
+        if (inserted) {
+          end_from_capture.push_back(cloud_from_base * end_inverse * relative_pose_at_time(timestamps[i]) *
+                                     base_from_cloud);
+        }
+        capture_slot[i] = it->second;
+      }
+    }
+    photometric_frame = build_photometric_frame(image_model, config.photometric_image, cloud_points, *intensities,
+                                                capture_slot, end_from_capture);
+    if (photometric_frame->valid()) {
+      ++photometric_frame_count;
+    } else {
+      photometric_frame.reset();
+    }
+  }
+
+  std::optional<VisualPosePrior> visual_pose_prior;
+  if (_visual_pose_prior.has_value() && config.visual_fusion.enabled &&
+      std::abs(to_seconds(_visual_pose_prior->time - current_lidar_time)) <= config.visual_prior_max_time_offset_sec) {
+    visual_pose_prior = _visual_pose_prior;
+  }
+  // A camera measurement is single-use even when stale or rejected. This
+  // prevents one visual edge from being silently applied to multiple scans.
+  _visual_pose_prior.reset();
+
+  // Radar-informed degeneracy prior: initial_guess with translation replaced
+  // by integrating the radar ego-velocity estimate instead of the IMU/geometric
+  // one. Only ever consumed inside solve_degeneracy_aware's prior blend (see
+  // icp() above); the ICP initial guess itself is untouched.
+  std::optional<Sophus::SE3d> radar_prior_pose;
+  std::optional<Eigen::Vector3d> radar_velocity_base;
+  std::optional<Eigen::Matrix3d> radar_info_base;
+  if (_radar_velocity_prior.has_value() &&
+      std::abs(to_seconds(_radar_velocity_prior->time - current_lidar_time)) <= config.radar_prior_max_time_offset_sec &&
+      _radar_velocity_prior->velocity_base.norm() >= config.radar_min_speed) {
+    radar_velocity_base = _radar_velocity_prior->velocity_base;
+    radar_info_base = _radar_velocity_prior->info_base;
+    if (config.radar_velocity_fusion && config.degeneracy_aware_solve) {
+      const double radar_dt = to_seconds(current_lidar_time - lidar_state.time);
+      const Eigen::Vector3d predicted_translation =
+          lidar_state.pose.translation() + initial_guess.so3() * (_radar_velocity_prior->velocity_base * radar_dt);
+      radar_prior_pose = Sophus::SE3d(initial_guess.so3(), predicted_translation);
+    }
+  }
+  // A radar measurement is single-use even when stale or rejected, mirroring the visual prior.
+  _radar_velocity_prior.reset();
+
+  // Reflectivity/intensity constraint: scan-to-scan cross-correlation of a 1D reflectivity
+  // profile along the confirmed persistent weak-direction axis, used to recover translation
+  // ICP under-observes in self-similar environments (e.g. a straight tunnel). Points+
+  // intensities are deskewed/clipped together once here; the same pair is reused after ICP
+  // below to store this scan's own profile for the *next* scan. Radar has priority when both
+  // are active: it directly measures velocity, a stronger signal than a correlation peak.
+  std::optional<Sophus::SE3d> intensity_prior_pose;
+  Vector3dVector intensity_aligned_points;
+  std::vector<float> intensity_aligned_values;
+  const bool intensity_alignment_available =
+      config.intensity_constraint && intensities != nullptr && intensities->size() == scan.size();
+  // The Hessian-gate-free velocity-disagreement gate (applied after ICP, below) reuses this
+  // exact same deskewed points+intensities pair; compute it once up front if either feature
+  // needs it, so enabling only intensity_disagreement_gate still gets it without duplicating
+  // the deskew_and_clip_with_intensity call.
+  const bool intensity_disagreement_alignment_available =
+      config.intensity_disagreement_gate && intensities != nullptr && intensities->size() == scan.size();
+  if (intensity_alignment_available || intensity_disagreement_alignment_available) {
+    std::tie(intensity_aligned_points, intensity_aligned_values) = deskew_and_clip_with_intensity(
+        scan, timestamps, *intensities, current_lidar_time, relative_pose_at_time, config);
+  }
+  if (intensity_alignment_available) {
+    const PersistentWeakDirectionState& incoming_direction = _persistent_weak_direction_tracker.state();
+    if (!radar_prior_pose.has_value() && incoming_direction.confirmed && _previous_intensity_profile.has_value() &&
+        !intensity_aligned_points.empty()) {
+      ++intensity_prior_attempt_count;
+      IntensityProfileConfig profile_config;
+      profile_config.bin_size_m = config.intensity_bin_size_m;
+      profile_config.half_length_m = config.intensity_profile_half_length_m;
+      profile_config.max_shift_m = config.intensity_max_shift_m;
+      profile_config.min_correlation = config.intensity_min_correlation;
+      profile_config.min_peak_margin = config.intensity_min_peak_margin;
+      profile_config.peak_exclusion_radius_bins =
+          config.intensity_peak_exclusion_radius_bins;
+      profile_config.min_filled_bins = config.intensity_min_filled_bins;
+      // Built at the initial guess (not yet ICP-corrected), against the same origin/axis as
+      // the stored reference: the correlation peak then directly measures the translation-
+      // along-axis error in the initial guess (see intensity_profile.hpp's doc comment).
+      Vector3dVector current_world_points(intensity_aligned_points.size());
+      std::transform(intensity_aligned_points.cbegin(), intensity_aligned_points.cend(), current_world_points.begin(),
+                     [&](const auto& point) { return initial_guess * point; });
+      const IntensityProfile current_profile =
+          build_intensity_profile(current_world_points, intensity_aligned_values, _previous_intensity_profile->axis,
+                                  _previous_intensity_profile->origin, profile_config);
+      const ProfileShiftResult shift =
+          estimate_profile_shift(_previous_intensity_profile->profile, current_profile, profile_config);
+      const bool base_qualified =
+          shift.overlap_bins >= profile_config.min_filled_bins &&
+          shift.correlation >= profile_config.min_correlation;
+      intensity_peak_diagnostics.push_back(
+          {current_lidar_time,
+           IntensityPeakSource::persistent_prior,
+           shift.correlation,
+           shift.second_best_correlation,
+           shift.peak_margin,
+           shift.shift_m,
+           0.0,
+           shift.overlap_bins,
+           base_qualified,
+           shift.has_competing_peak,
+           shift.ambiguous,
+           shift.valid});
+      if (base_qualified) {
+        ++intensity_peak_margin_sample_count;
+        intensity_peak_margin_sum += shift.peak_margin;
+        intensity_peak_margin_min =
+            std::min(intensity_peak_margin_min, shift.peak_margin);
+      }
+      if (shift.ambiguous) {
+        ++intensity_ambiguous_shift_count;
+      }
+      if (shift.valid) {
+        const Eigen::Vector3d predicted_translation =
+            initial_guess.translation() + shift.shift_m * _previous_intensity_profile->axis;
+        intensity_prior_pose = Sophus::SE3d(initial_guess.so3(), predicted_translation);
+        ++intensity_prior_applied_count;
+      }
+    }
+  }
+
+  // body acceleration filter
+  const auto kf_step = step_body_accel_filter({mean_body_acceleration, body_acceleration_covariance}, interval_stats,
+                                              initial_guess.so3(), current_lidar_time - lidar_state.time,
+                                              config.max_expected_jerk, _gravity_world);
+  mean_body_acceleration = kf_step.updated.mean;
+  body_acceleration_covariance = kf_step.updated.covariance;
+
+  auto preproc_result =
+      config.deskew ? preprocess_scan(deskew_scan(scan, timestamps, current_lidar_time, relative_pose_at_time), config)
+                    : preprocess_scan(scan, config);
+
+  if (config.keypoint_shortfall_voxel_multiplier > 0.0 &&
+      preproc_result.keypoints.size() < std::max<size_t>(1, config.min_icp_keypoints)) {
+    Vector3dVector finer = refine_keypoints(preproc_result, config, config.keypoint_shortfall_voxel_multiplier);
+    if (finer.size() > preproc_result.keypoints.size()) {
+      preproc_result.keypoints = std::move(finer);
+      ++keypoint_shortfall_scan_count;
+    }
+  }
+
+  if (preproc_result.keypoints.size() < std::max<size_t>(1, config.min_icp_keypoints)) {
+    const std::string error_msg =
+        "Keypoints for ICP registration = " + std::to_string(preproc_result.keypoints.size()) +
+        ", this is too little for ICP and likely unintended. Input scan size = " + std::to_string(scan.size()) +
+        ". Config voxel size = " + std::to_string(config.voxel_size) +
+        ". Either the input scan is corrupt (empty) or the downsampling is too aggressive.";
+    ++_consecutive_registration_failures;
+    _persistent_weak_direction_tracker.reset();
+    _previous_intensity_profile.reset();
+    if (config.reset_on_registration_failure &&
+        _consecutive_registration_failures >= std::max(1, config.recovery_min_failures)) {
+      return drop_failed_scan(current_lidar_time, error_msg);
+    }
+    throw std::invalid_argument(error_msg);
+  }
+
+  const Vector3dVector& map_input = config.double_downsample ? preproc_result.map_frame : preproc_result.keypoints;
+
+  if (config.enable_kidnap_relocalization && config.relocalize_after_scan_gap &&
+      _consecutive_registration_failures >= std::max(1, config.recovery_min_failures)) {
+    if (const auto relocalized_pose = try_global_relocalization(preproc_result.keypoints)) {
+      return recover_with_scan(preproc_result.filtered_frame, map_input, current_lidar_time, relocalized_pose.value(),
+                               "global relocalization after scan gap");
+    }
+  }
+
+  // [v0.8 Phase 1, diagnostic-only] reset before attempting a fresh ICP
+  // solve; overwritten below on success. Every early-return path above this
+  // point (drop_failed_scan / recover_with_scan) already resets this field
+  // itself, so this covers the remaining "about to attempt icp()" case.
+  lidar_state.icp_diagnostics = std::nullopt;
+
+  // Whether the kinematic velocity gate corrected this scan's pose; consumed by
+  // the map-update skip at the end of this function.
+  bool kinematic_gate_corrected_this_scan = false;
+  bool kinematic_blend_suppress_map_update_this_scan = false;
+  bool registration_skipped_this_scan = false;
+  bool standstill_clamped_this_scan = false;
+  bool inertial_window_added = false;
+  double kinematic_blend_map_update_fraction_this_scan = 1.0;
+
+  if (!map.empty()) {
+    SCOPED_PROFILER("ICP");
+    Sophus::SE3d optimized_pose;
+    // [v0.8 Phase 1, diagnostic-only] final ICP linear system, threaded into
+    // lidar_state.icp_diagnostics below on success.
+    Eigen::Matrix6d icp_H = Eigen::Matrix6d::Zero();
+    Eigen::Vector6d icp_b = Eigen::Vector6d::Zero();
+    std::size_t degeneracy_intervention_count = 0;
+    std::size_t visual_fused_directions = 0;
+    std::size_t visual_unobservable_directions = 0;
+    std::array<double, 6> visual_directional_information_ratios{};
+    std::size_t visual_directional_information_ratio_count = 0;
+    // Radar has priority over the intensity constraint when both are active (see the
+    // intensity-prior construction above for why); at most one ever reaches icp()'s shared
+    // degeneracy_prior_pose slot.
+    const std::optional<Sophus::SE3d>& degeneracy_prior_pose =
+        radar_prior_pose.has_value() ? radar_prior_pose : intensity_prior_pose;
+    // Close-scene settings (close_scene_max_median_range): the registration of a scan whose
+    // keypoints' median range is below the limit uses the configuration with the close_scene_*
+    // keys applied; every other scan uses the configuration as it is.
+    bool close_scene = false;
+    if (config.close_scene_max_median_range > 0.0 && !preproc_result.keypoints.empty()) {
+      std::vector<double> ranges(preproc_result.keypoints.size());
+      std::transform(preproc_result.keypoints.cbegin(), preproc_result.keypoints.cend(), ranges.begin(),
+                     [](const Eigen::Vector3d& point) { return point.norm(); });
+      const auto middle = ranges.begin() + static_cast<std::ptrdiff_t>(ranges.size() / 2);
+      std::nth_element(ranges.begin(), middle, ranges.end());
+      close_scene = *middle < config.close_scene_max_median_range;
+    }
+    if (close_scene && !_close_scene_config.has_value()) {
+      _close_scene_config = config;
+      if (config.close_scene_max_correspondence_distance > 0.0) {
+        _close_scene_config->max_correspondence_distance = config.close_scene_max_correspondence_distance;
+      }
+      if (config.close_scene_localizability_boost > 0.0) {
+        _close_scene_config->localizability_weighting = true;
+        _close_scene_config->localizability_boost = config.close_scene_localizability_boost;
+        _close_scene_config->localizability_normal_only = config.close_scene_localizability_normal_only;
+      }
+    }
+    const Config& scan_config = close_scene ? *_close_scene_config : config;
+    // Localizability weighting axis: the predicted motion direction for this
+    // scan (initial guess vs. previous pose), same convention as the intensity
+    // disagreement gate's correlation axis. No Hessian gating on purpose --
+    // soft degeneracy is precisely the regime the eigenvalue gates miss.
+    std::optional<Eigen::Vector3d> localizability_axis;
+    if (scan_config.localizability_weighting) {
+      localizability_axis = unit_axis_from_step(initial_guess.translation() - lidar_state.pose.translation(),
+                                                config.localizability_min_step_m);
+      if (localizability_axis.has_value()) {
+        ++localizability_attempt_count;
+      }
+    }
+    PhotometricTerms photometric_terms;
+    const bool use_photometric =
+        photometric_frame.has_value() && !_photometric_features.features().empty() &&
+        to_seconds(current_lidar_time - lidar_state.time) <= config.photometric_max_scan_interval_sec;
+    if (photometric_frame.has_value() && !use_photometric && !_photometric_features.features().empty()) {
+      ++photometric_gap_skip_count;
+    }
+    if (use_photometric) {
+      photometric_terms.features = &_photometric_features.features();
+      photometric_terms.frame = &*photometric_frame;
+      photometric_terms.model = &image_model;
+      photometric_terms.config = &config.photometric_features;
+      photometric_terms.base_from_cloud = _photometric_base_from_cloud;
+      photometric_terms.scale = config.photometric_scale;
+      if (config.photometric_free_weak_axis) {
+        const std::vector<Eigen::Vector3d> normals = sample_surface_normals(
+            *photometric_frame, config.photometric_normal_row_step, config.photometric_normal_col_step);
+        const Eigen::Matrix3d world_from_cloud_rotation =
+            initial_guess.so3().matrix() * _photometric_base_from_cloud.so3().matrix();
+        for (const Eigen::Vector3d& axis :
+             find_weak_translation_directions(normals, config.photometric_weak_direction_min_contribution)) {
+          photometric_terms.free_axes_world.push_back((world_from_cloud_rotation * axis).normalized());
+        }
+      }
+    }
+    int photometric_patches = 0;
+    try {
+      Vector3dVector bump_points;
+      BumpTerms bump_terms;
+      const bool use_bump = config.bump_image_registration && !bump_map.empty();
+      if (use_bump) {
+        bump_points = sample_informed_points(
+            bump_map, voxel_down_sample(preproc_result.filtered_frame, config.bump_image_source_voxel_size),
+            initial_guess, static_cast<std::size_t>(std::max(0, config.bump_image_informed_voxels)));
+        double point_to_point_weight = config.bump_image_point_to_point_weight;
+        if (config.bump_image_point_to_point_start_distance > 0.0 && !_bump_point_to_point_started) {
+          if (!poses_with_timestamps.empty() &&
+              (lidar_state.pose.translation() - poses_with_timestamps.front().second.translation()).norm() >=
+                  config.bump_image_point_to_point_start_distance) {
+            _bump_point_to_point_started = true;
+          } else {
+            point_to_point_weight = 0.0;
+          }
+        }
+        bump_terms = BumpTerms{&bump_map, &bump_points, config.bump_image_huber_delta, point_to_point_weight};
+      }
+      const bool standstill_held =
+          config.start_standstill_hold && _standstill_this_scan && !(config.start_standstill_hold_radius > 0.0);
+      standstill_clamped_this_scan =
+          config.start_standstill_hold && _standstill_this_scan && config.start_standstill_hold_radius > 0.0;
+      registration_skipped_this_scan = (config.skip_registration_after_gap_sec > 0.0 &&
+                                        to_seconds(current_lidar_time - lidar_state.time) >
+                                            config.skip_registration_after_gap_sec) ||
+                                       standstill_held;
+      if (close_scene && !registration_skipped_this_scan) {
+        ++close_scene_scan_count;
+      }
+      // A held scan keeps the position (the robot stands; with a frame still tilted by a moving
+      // start the IMU-predicted translation would carry the tilt's gravity), and turns with the gyro.
+      IcpResult icp_result =
+          registration_skipped_this_scan
+              ? IcpResult{standstill_held ? Sophus::SE3d(initial_guess.so3(), lidar_state.pose.translation())
+                                          : initial_guess}
+              : icp(preproc_result.keypoints, map, initial_guess, scan_config, kf_step.info, 1,
+                    _persistent_weak_direction_tracker.state(),
+                    config.degeneracy_adaptive_iteration_budget && _adaptive_iteration_hold_remaining > 0,
+                    visual_pose_prior, degeneracy_prior_pose, localizability_axis, scan_config.localizability_boost,
+                    use_photometric ? &photometric_terms : nullptr, use_bump ? &bump_terms : nullptr);
+      // A close scan that the close-scene settings do not explain well (too few keypoints within
+      // their correspondence cap, e.g. a large initial error the tight cap cannot capture) is
+      // registered again: coarse with the base settings, then fine with the close-scene settings.
+      if (close_scene && !registration_skipped_this_scan && config.close_scene_min_inlier_fraction > 0.0 &&
+          !preproc_result.keypoints.empty()) {
+        const Vector3dVector& keypoints = preproc_result.keypoints;
+        std::vector<std::uint8_t> inlier(keypoints.size(), 0);
+        tbb::parallel_for(tbb::blocked_range<std::size_t>{0, keypoints.size()},
+                          [&](const tbb::blocked_range<std::size_t>& range) {
+                            for (std::size_t i = range.begin(); i != range.end(); ++i) {
+                              const auto [neighbor, distance] = map.get_closest_neighbor(icp_result.pose * keypoints[i]);
+                              inlier[i] = distance < scan_config.max_correspondence_distance ? 1 : 0;
+                            }
+                          });
+        const double fraction = static_cast<double>(std::accumulate(inlier.begin(), inlier.end(), std::size_t{0})) /
+                                static_cast<double>(keypoints.size());
+        if (fraction < config.close_scene_min_inlier_fraction) {
+          // Coarse with the base settings, then fine with the close-scene settings from there.
+          ++close_scene_fallback_count;
+          const IcpResult coarse =
+              icp(preproc_result.keypoints, map, initial_guess, config, kf_step.info, 1,
+                  _persistent_weak_direction_tracker.state(),
+                  config.degeneracy_adaptive_iteration_budget && _adaptive_iteration_hold_remaining > 0,
+                  visual_pose_prior, degeneracy_prior_pose,
+                  config.localizability_weighting ? localizability_axis : std::nullopt, config.localizability_boost,
+                  use_photometric ? &photometric_terms : nullptr, use_bump ? &bump_terms : nullptr);
+          icp_result = icp(preproc_result.keypoints, map, coarse.pose, scan_config, kf_step.info, 1,
+                           _persistent_weak_direction_tracker.state(),
+                           config.degeneracy_adaptive_iteration_budget && _adaptive_iteration_hold_remaining > 0,
+                           visual_pose_prior, degeneracy_prior_pose, localizability_axis,
+                           scan_config.localizability_boost, use_photometric ? &photometric_terms : nullptr,
+                           use_bump ? &bump_terms : nullptr);
+        }
+      }
+      if (use_bump && !registration_skipped_this_scan && config.bump_image_max_rotation_correction_deg > 0.0) {
+        const double rotation_deg =
+            (icp_result.pose.so3() * initial_guess.so3().inverse()).log().norm() * 180.0 / M_PI;
+        bump_rotation_corrections.emplace_back(to_seconds(current_lidar_time), rotation_deg);
+        if (!_bump_rotation_gate) {
+          _bump_rotation_gate.emplace(config.bump_image_max_rotation_correction_deg,
+                                      config.bump_image_rotation_fallback_window,
+                                      config.bump_image_rotation_fallback_min_count,
+                                      config.bump_image_rotation_hard_limit_deg);
+        }
+        if (_bump_rotation_gate->fall_back(rotation_deg)) {
+          icp_result = icp(preproc_result.keypoints, map, initial_guess, scan_config, kf_step.info, 1,
+                           _persistent_weak_direction_tracker.state(),
+                           config.degeneracy_adaptive_iteration_budget && _adaptive_iteration_hold_remaining > 0,
+                           visual_pose_prior, degeneracy_prior_pose, localizability_axis,
+                           scan_config.localizability_boost, use_photometric ? &photometric_terms : nullptr, nullptr);
+          ++bump_rotation_fallback_count;
+        }
+      }
+      photometric_patches = icp_result.photometric_patches;
+      if (icp_result.weighting_stats.boosted > 0) {
+        ++localizability_weighted_scan_count;
+        localizability_boosted_fraction_sum += static_cast<double>(icp_result.weighting_stats.boosted) /
+                                               std::max(1, icp_result.weighting_stats.correspondences);
+      }
+      optimized_pose = icp_result.pose;
+      if (standstill_clamped_this_scan && _standstill_anchor.has_value()) {
+        optimized_pose.translation() =
+            clamp_to_radius(optimized_pose.translation(), *_standstill_anchor, config.start_standstill_hold_radius);
+      }
+      icp_H = icp_result.H;
+      icp_b = icp_result.b;
+      degeneracy_intervention_count = icp_result.degeneracy_intervention_count;
+      visual_fused_directions = icp_result.visual_fused_directions;
+      visual_unobservable_directions = icp_result.visual_unobservable_directions;
+      visual_directional_information_ratios = icp_result.visual_directional_information_ratios;
+      visual_directional_information_ratio_count = icp_result.visual_directional_information_ratio_count;
+    } catch (const std::exception&) {
+      ++_consecutive_registration_failures;
+      _persistent_weak_direction_tracker.reset();
+      _previous_intensity_profile.reset();
+      _photometric_features.clear();
+      _adaptive_iteration_hold_remaining = 0;
+      if (_consecutive_registration_failures < std::max(1, config.recovery_min_failures)) {
+        throw;
+      }
+      if (const auto relocalized_pose = try_global_relocalization(preproc_result.keypoints)) {
+        return recover_with_scan(preproc_result.filtered_frame, map_input, current_lidar_time,
+                                 relocalized_pose.value(), "global relocalization");
+      }
+      if (config.reset_on_registration_failure) {
+        return recover_with_scan(preproc_result.filtered_frame, map_input, current_lidar_time, lidar_state.pose,
+                                 "local reset");
+      }
+      throw;
+    }
+
+    // Continuous, information-weighted radar/ICP velocity fusion (see Config::
+    // radar_velocity_continuous_fusion doc comment and radar_ego_velocity.hpp's
+    // blend_icp_radar_velocity for the pure math). Runs on every scan with a fresh radar prior,
+    // no streak/threshold gate, and blends all three world-frame translation axes at once
+    // (weighted by relative confidence), instead of radar_disagreement_gate's single-axis,
+    // 10-scan-streak, post-hoc correction below. When enabled it subsumes that gate entirely
+    // (see the `!config.radar_velocity_continuous_fusion` guard on the gate below) rather than
+    // letting both paths correct the same scan.
+    bool radar_continuous_fused_this_scan = false;
+    if (config.radar_velocity_continuous_fusion && radar_velocity_base.has_value() && radar_info_base.has_value()) {
+      const double radar_dt = to_seconds(current_lidar_time - lidar_state.time);
+      if (radar_dt > 1.0e-6) {
+        ++radar_continuous_attempt_count;
+        const Eigen::Vector3d icp_velocity_world =
+            (optimized_pose.translation() - lidar_state.pose.translation()) / radar_dt;
+        // icp_H's translation block is world-frame: build_icp_linear_system's Jacobian sets
+        // J_r.block(0,0) = I against a residual computed as (current_pose * point) - target,
+        // i.e. directly in the map/world frame, with no further rotation applied. H is already
+        // averaged over correspondences, so H_tt / dt^2 is only a proxy for a translation-rate
+        // information matrix; radar_fusion_icp_information_scale lets the two sensors' relative
+        // trust be tuned empirically.
+        const Eigen::Matrix3d icp_information_world =
+            config.radar_fusion_icp_information_scale * (icp_H.block<3, 3>(0, 0) / square(radar_dt));
+        const Eigen::Vector3d radar_velocity_world = optimized_pose.so3() * (*radar_velocity_base);
+        const Eigen::Matrix3d R_wb = optimized_pose.so3().matrix();
+        const Eigen::Matrix3d radar_information_world = R_wb * (*radar_info_base) * R_wb.transpose();
+        const RadarIcpVelocityBlendResult blend = blend_icp_radar_velocity(
+            icp_velocity_world, icp_information_world, radar_velocity_world, radar_information_world);
+        if (blend.valid) {
+          const Eigen::Vector3d correction = (blend.velocity - icp_velocity_world) * radar_dt;
+          optimized_pose.translation() += correction;
+          ++radar_continuous_fused_scan_count;
+          radar_continuous_correction_magnitude_sum += correction.norm();
+          radar_continuous_fused_this_scan = true;
+        }
+      }
+    }
+    (void)radar_continuous_fused_this_scan; // reserved for future gating of downstream features
+
+    // Radar-vs-ICP velocity disagreement gate: ICP locked onto clutter that
+    // travels with the sensor (fog) yields a confident near-zero motion that
+    // the eigenvalue gates cannot flag. After a persistent disagreement,
+    // blend the translation toward the radar-observed displacement, but only
+    // along the radar velocity direction. Skipped entirely when
+    // radar_velocity_continuous_fusion is on -- that feature already corrects every axis on
+    // every scan with a fresh radar prior, so this gate would either double-correct or fight the
+    // continuous blend's own numbers with its own separate streak/threshold logic.
+    bool radar_disagreement_corrected_this_scan = false;
+    if (config.radar_disagreement_gate && !config.radar_velocity_continuous_fusion &&
+        radar_velocity_base.has_value()) {
+      const double radar_dt = to_seconds(current_lidar_time - lidar_state.time);
+      if (radar_dt > 1.0e-6) {
+        const Eigen::Vector3d icp_velocity_world =
+            (optimized_pose.translation() - lidar_state.pose.translation()) / radar_dt;
+        const Eigen::Vector3d radar_velocity_world = optimized_pose.so3() * (*radar_velocity_base);
+        const Eigen::Vector3d velocity_gap = radar_velocity_world - icp_velocity_world;
+        if (velocity_gap.norm() >= config.radar_disagreement_min_mps) {
+          ++_radar_disagreement_streak;
+        } else {
+          _radar_disagreement_streak = 0;
+        }
+        constexpr double kMinRadarSpeed = 1.0e-3;
+        if (_radar_disagreement_streak >= config.radar_disagreement_min_scans &&
+            radar_velocity_world.norm() > kMinRadarSpeed) {
+          const Eigen::Vector3d direction = radar_velocity_world.normalized();
+          const double weight = std::max(0.0, std::min(1.0, config.radar_disagreement_weight));
+          const double correction = weight * velocity_gap.dot(direction) * radar_dt;
+          optimized_pose.translation() += correction * direction;
+          ++radar_disagreement_corrected_scan_count;
+          radar_disagreement_corrected_this_scan = true;
+        }
+      }
+    } else if (config.radar_disagreement_gate && !config.radar_velocity_continuous_fusion) {
+      _radar_disagreement_streak = 0;
+    }
+
+    // Intensity-vs-ICP velocity disagreement gate: same lesson as the radar gate just above
+    // (gate on sensor-vs-ICP consistency, not the Hessian spectrum), but derives its own
+    // "sensor" velocity from scan-to-scan reflectivity-texture correlation instead of Doppler,
+    // so it also helps radar-less rigs. Unlike intensity_constraint (which only engages once
+    // degeneracy_persistence_gate confirms a weak direction, missing "soft" degeneracy in
+    // between confirmations), this gate tracks the scan's own ICP motion axis every scan.
+    // Radar has priority: skip entirely on scans the radar gate already corrected.
+    if (config.intensity_disagreement_gate && !radar_disagreement_corrected_this_scan &&
+        intensity_disagreement_alignment_available && !intensity_aligned_points.empty()) {
+      // Step 1 (see intensity_profile.hpp's unit_axis_from_step doc comment): this scan's own
+      // motion direction, without any Hessian gating. lidar_state.pose is still the *previous*
+      // scan's pose here (the state update happens further below), so this is exactly
+      // optimized_pose.translation() - prev_translation.
+      constexpr double kMinStepM = 0.01; // 1 cm: below this there's no reliable along-track signal.
+      std::optional<Eigen::Vector3d> motion_axis =
+          unit_axis_from_step(optimized_pose.translation() - lidar_state.pose.translation(), kMinStepM);
+      if (!motion_axis.has_value()) {
+        // ICP step too small to trust; fall back to the initial guess's own displacement.
+        motion_axis = unit_axis_from_step(initial_guess.translation() - lidar_state.pose.translation(), kMinStepM);
+      }
+      if (!motion_axis.has_value()) {
+        // Stationary rig: no along-track signal either way.
+        _intensity_disagreement_streak = 0;
+      } else {
+        IntensityProfileConfig profile_config;
+        profile_config.bin_size_m = config.intensity_bin_size_m;
+        profile_config.half_length_m = config.intensity_profile_half_length_m;
+        profile_config.max_shift_m = config.intensity_max_shift_m;
+        profile_config.min_correlation = config.intensity_min_correlation;
+        profile_config.min_peak_margin = config.intensity_min_peak_margin;
+        profile_config.peak_exclusion_radius_bins =
+            config.intensity_peak_exclusion_radius_bins;
+        profile_config.min_filled_bins = config.intensity_min_filled_bins;
+        OrientedIntensityGridConfig grid_config;
+        grid_config.bin_size_m = config.intensity_bin_size_m;
+        grid_config.half_length_m =
+            config.intensity_profile_half_length_m;
+        grid_config.half_width_m = config.intensity_grid_half_width_m;
+        grid_config.max_longitudinal_shift_m =
+            config.intensity_max_shift_m;
+        grid_config.max_lateral_shift_m =
+            config.intensity_grid_max_lateral_shift_m;
+        grid_config.height_weight =
+            config.intensity_grid_height_weight;
+        grid_config.min_correlation =
+            config.intensity_min_correlation;
+        grid_config.min_peak_margin =
+            config.intensity_min_peak_margin;
+        grid_config.peak_exclusion_radius_bins =
+            config.intensity_peak_exclusion_radius_bins;
+        grid_config.min_filled_cells =
+            config.intensity_min_filled_bins;
+        // Step 2/3: correlate against the previous scan's stored profile, along *that* stored
+        // profile's own axis/origin (not this scan's freshly chosen motion_axis) -- the shift
+        // and the profiles it's built from must all describe the same fixed direction for the
+        // correlation to have a clean physical meaning. motion_axis only decides what gets
+        // stored below for the *next* scan's correlation, mirroring how the persistence-gated
+        // intensity_constraint feature above lets the current scan's own axis take over only
+        // once it becomes the new stored reference.
+        bool disagreement_measured = false;
+        std::optional<std::size_t> disagreement_diagnostic_index;
+        Eigen::Vector3d intensity_velocity_world =
+            Eigen::Vector3d::Zero();
+        Eigen::Vector3d icp_velocity_world =
+            Eigen::Vector3d::Zero();
+        const double motion_dt = to_seconds(current_lidar_time - lidar_state.time);
+        if (config.intensity_oriented_grid &&
+            _previous_intensity_velocity_grid.has_value() &&
+            motion_dt > 1.0e-6) {
+          ++intensity_disagreement_attempt_count;
+          const auto& stored = *_previous_intensity_velocity_grid;
+          Vector3dVector initial_guess_world_points(intensity_aligned_points.size());
+          std::transform(intensity_aligned_points.cbegin(), intensity_aligned_points.cend(),
+                         initial_guess_world_points.begin(), [&](const auto& point) { return initial_guess * point; });
+          const OrientedIntensityGrid current_grid =
+              build_oriented_intensity_grid(
+                  initial_guess_world_points,
+                  intensity_aligned_values,
+                  stored.longitudinal_axis,
+                  stored.lateral_axis,
+                  stored.origin,
+                  grid_config);
+          const OrientedGridShiftResult shift =
+              estimate_oriented_grid_shift(
+                  stored.grid, current_grid, grid_config);
+          const bool base_qualified =
+              shift.overlap_cells >= grid_config.min_filled_cells &&
+              shift.correlation >= grid_config.min_correlation;
+          disagreement_diagnostic_index =
+              intensity_peak_diagnostics.size();
+          intensity_peak_diagnostics.push_back(
+              {current_lidar_time,
+               IntensityPeakSource::oriented_grid,
+               shift.correlation,
+               shift.second_best_correlation,
+               shift.peak_margin,
+               shift.longitudinal_shift_m,
+               shift.lateral_shift_m,
+               shift.overlap_cells,
+               base_qualified,
+               shift.has_competing_peak,
+               shift.ambiguous,
+               shift.valid});
+          intensity_peak_diagnostics.back()
+              .intensity_channel_correlation =
+              shift.intensity_correlation;
+          intensity_peak_diagnostics.back()
+              .height_channel_correlation =
+              shift.height_correlation;
+          if (base_qualified) {
+            ++intensity_peak_margin_sample_count;
+            intensity_peak_margin_sum += shift.peak_margin;
+            intensity_peak_margin_min =
+                std::min(intensity_peak_margin_min, shift.peak_margin);
+          }
+          if (shift.ambiguous) {
+            ++intensity_ambiguous_shift_count;
+          }
+          // Reject shifts pinned at the search boundary: the true peak may lie beyond
+          // the configured window, so the correlation result there is unreliable.
+          const double saturation_margin =
+              0.5 * grid_config.bin_size_m;
+          if (shift.valid &&
+              std::abs(shift.longitudinal_shift_m) <
+                  grid_config.max_longitudinal_shift_m -
+                      saturation_margin &&
+              std::abs(shift.lateral_shift_m) <
+                  grid_config.max_lateral_shift_m -
+                      saturation_margin) {
+            ++intensity_disagreement_valid_shift_count;
+            const Eigen::Vector3d texture_position =
+                initial_guess.translation() +
+                shift.longitudinal_shift_m *
+                    stored.longitudinal_axis +
+                shift.lateral_shift_m * stored.lateral_axis;
+            const Eigen::Vector3d implied_velocity =
+                (texture_position - stored.origin) / motion_dt;
+            intensity_velocity_world =
+                stored.longitudinal_axis *
+                    stored.longitudinal_axis.dot(implied_velocity) +
+                stored.lateral_axis *
+                    stored.lateral_axis.dot(implied_velocity);
+            const Eigen::Vector3d icp_velocity =
+                (optimized_pose.translation() -
+                 lidar_state.pose.translation()) /
+                motion_dt;
+            icp_velocity_world =
+                stored.longitudinal_axis *
+                    stored.longitudinal_axis.dot(icp_velocity) +
+                stored.lateral_axis *
+                    stored.lateral_axis.dot(icp_velocity);
+            auto& diagnostic = intensity_peak_diagnostics.at(
+                *disagreement_diagnostic_index);
+            diagnostic.motion_dt_s = motion_dt;
+            diagnostic.intensity_velocity_longitudinal_mps =
+                stored.longitudinal_axis.dot(intensity_velocity_world);
+            diagnostic.intensity_velocity_lateral_mps =
+                stored.lateral_axis.dot(intensity_velocity_world);
+            diagnostic.icp_velocity_longitudinal_mps =
+                stored.longitudinal_axis.dot(icp_velocity_world);
+            diagnostic.icp_velocity_lateral_mps =
+                stored.lateral_axis.dot(icp_velocity_world);
+            disagreement_measured = true;
+          }
+        } else if (!config.intensity_oriented_grid &&
+                   _previous_intensity_velocity_profile.has_value() &&
+                   motion_dt > 1.0e-6) {
+          ++intensity_disagreement_attempt_count;
+          const Eigen::Vector3d corr_axis =
+              _previous_intensity_velocity_profile->axis;
+          const Eigen::Vector3d corr_origin =
+              _previous_intensity_velocity_profile->origin;
+          Vector3dVector initial_guess_world_points(
+              intensity_aligned_points.size());
+          std::transform(
+              intensity_aligned_points.cbegin(),
+              intensity_aligned_points.cend(),
+              initial_guess_world_points.begin(),
+              [&](const auto& point) { return initial_guess * point; });
+          const IntensityProfile current_profile =
+              build_intensity_profile(
+                  initial_guess_world_points,
+                  intensity_aligned_values,
+                  corr_axis,
+                  corr_origin,
+                  profile_config);
+          const ProfileShiftResult shift = estimate_profile_shift(
+              _previous_intensity_velocity_profile->profile,
+              current_profile,
+              profile_config);
+          const bool base_qualified =
+              shift.overlap_bins >= profile_config.min_filled_bins &&
+              shift.correlation >= profile_config.min_correlation;
+          disagreement_diagnostic_index =
+              intensity_peak_diagnostics.size();
+          intensity_peak_diagnostics.push_back(
+              {current_lidar_time,
+               IntensityPeakSource::disagreement_gate,
+               shift.correlation,
+               shift.second_best_correlation,
+               shift.peak_margin,
+               shift.shift_m,
+               0.0,
+               shift.overlap_bins,
+               base_qualified,
+               shift.has_competing_peak,
+               shift.ambiguous,
+               shift.valid});
+          if (base_qualified) {
+            ++intensity_peak_margin_sample_count;
+            intensity_peak_margin_sum += shift.peak_margin;
+            intensity_peak_margin_min =
+                std::min(
+                    intensity_peak_margin_min,
+                    shift.peak_margin);
+          }
+          if (shift.ambiguous) {
+            ++intensity_ambiguous_shift_count;
+          }
+          const double saturation_margin =
+              0.5 * profile_config.bin_size_m;
+          if (shift.valid &&
+              std::abs(shift.shift_m) <
+                  config.intensity_max_shift_m -
+                      saturation_margin) {
+            ++intensity_disagreement_valid_shift_count;
+            const double intensity_velocity_along_axis =
+                intensity_implied_velocity_along_axis(
+                    corr_axis,
+                    initial_guess.translation(),
+                    corr_origin,
+                    shift.shift_m,
+                    motion_dt);
+            const double icp_velocity_along_axis =
+                corr_axis.dot(
+                    optimized_pose.translation() -
+                    lidar_state.pose.translation()) /
+                motion_dt;
+            intensity_velocity_world =
+                intensity_velocity_along_axis * corr_axis;
+            icp_velocity_world =
+                icp_velocity_along_axis * corr_axis;
+            auto& diagnostic = intensity_peak_diagnostics.at(
+                *disagreement_diagnostic_index);
+            diagnostic.motion_dt_s = motion_dt;
+            diagnostic.intensity_velocity_longitudinal_mps =
+                intensity_velocity_along_axis;
+            diagnostic.icp_velocity_longitudinal_mps =
+                icp_velocity_along_axis;
+            disagreement_measured = true;
+          }
+        }
+        if (disagreement_measured) {
+          const double gap =
+              (intensity_velocity_world - icp_velocity_world).norm();
+          if (gap >= config.intensity_disagreement_min_mps) {
+            ++_intensity_disagreement_streak;
+            ++intensity_disagreement_exceeded_threshold_count;
+          } else {
+            _intensity_disagreement_streak = 0;
+          }
+          auto& diagnostic = intensity_peak_diagnostics.at(
+              *disagreement_diagnostic_index);
+          diagnostic.velocity_disagreement_mps = gap;
+          diagnostic.disagreement_streak =
+              _intensity_disagreement_streak;
+          diagnostic.disagreement_measured = true;
+          const double weight = std::max(
+              0.0,
+              std::min(1.0, config.intensity_disagreement_weight));
+          diagnostic.candidate_correction_m =
+              weight * gap * motion_dt;
+          if (_intensity_disagreement_streak >= config.intensity_disagreement_min_scans) {
+            const Eigen::Vector3d correction =
+                weight *
+                (intensity_velocity_world - icp_velocity_world) *
+                motion_dt;
+            optimized_pose.translation() += correction;
+            diagnostic.applied_correction_longitudinal_m =
+                weight *
+                (diagnostic.intensity_velocity_longitudinal_mps -
+                 diagnostic.icp_velocity_longitudinal_mps) *
+                motion_dt;
+            diagnostic.applied_correction_lateral_m =
+                weight *
+                (diagnostic.intensity_velocity_lateral_mps -
+                 diagnostic.icp_velocity_lateral_mps) *
+                motion_dt;
+            diagnostic.applied_correction_m = correction.norm();
+            diagnostic.correction_applied = true;
+            ++intensity_disagreement_corrected_scan_count;
+          }
+        }
+        // No `else` here: when this scan produced no trustworthy shift (insufficient
+        // texture/correlation -- the common case, unlike radar's near-every-scan Doppler
+        // prior), that is an absence of evidence, not evidence of ICP agreement. Unlike the
+        // radar gate's unconditional per-scan reset, the streak is deliberately left untouched
+        // rather than zeroed; it only resets on a measured agreement (gap below threshold,
+        // above) or a genuinely stationary rig (motion_axis missing, below).
+        // Store this scan's own profile (world-anchored at its just-optimized pose, along its
+        // own fresh motion_axis) for the *next* scan's correlation, mirroring
+        // intensity_constraint's store block below but without any persistence gating.
+        Vector3dVector store_world_points(intensity_aligned_points.size());
+        std::transform(intensity_aligned_points.cbegin(), intensity_aligned_points.cend(), store_world_points.begin(),
+                       [&](const auto& point) { return optimized_pose * point; });
+        const Eigen::Vector3d lateral_axis =
+            Eigen::Vector3d::UnitZ().cross(*motion_axis);
+        if (config.intensity_oriented_grid &&
+            lateral_axis.squaredNorm() > 1.0e-12) {
+          const OrientedIntensityGrid store_grid =
+              build_oriented_intensity_grid(
+                  store_world_points,
+                  intensity_aligned_values,
+                  *motion_axis,
+                  lateral_axis.normalized(),
+                  optimized_pose.translation(),
+                  grid_config);
+          if (store_grid.valid) {
+            _previous_intensity_velocity_grid =
+                StoredOrientedIntensityGrid{
+                    store_grid,
+                    optimized_pose.translation(),
+                    *motion_axis,
+                    lateral_axis.normalized()};
+          } else {
+            _previous_intensity_velocity_grid.reset();
+          }
+          _previous_intensity_velocity_profile.reset();
+        } else {
+          const IntensityProfile store_profile =
+              build_intensity_profile(
+                  store_world_points,
+                  intensity_aligned_values,
+                  *motion_axis,
+                  optimized_pose.translation(),
+                  profile_config);
+          if (store_profile.valid) {
+            _previous_intensity_velocity_profile =
+                StoredIntensityProfile{
+                    store_profile,
+                    optimized_pose.translation(),
+                    *motion_axis};
+          } else {
+            _previous_intensity_velocity_profile.reset();
+          }
+          _previous_intensity_velocity_grid.reset();
+        }
+      }
+    } else if (config.intensity_disagreement_gate) {
+      _intensity_disagreement_streak = 0;
+    }
+
+    // Soft inertial velocity bridge (see kinematic_velocity_blend.hpp). ICP agreement
+    // refreshes a trusted anchor. On disagreement, a propagation-speed prior aligned with
+    // the current motion axis decays with time since that anchor. This prevents
+    // both the tunnel zero-motion attractor and the indefinite hard-clamp runaway.
+    //
+    // This newer blend takes precedence if both it and the legacy hard gate are enabled.
+    if (config.kinematic_velocity_blend && interval_stats.imu_count > 0) {
+      const Eigen::Vector3d previous_velocity_world = lidar_state.pose.so3() * lidar_state.velocity;
+      const bool previous_speed_supports_axis =
+          previous_velocity_world.norm() >= config.kinematic_blend_min_speed;
+      bool scene_rejected = false;
+      if (config.kinematic_blend_range_scene_gate) {
+        ++kinematic_blend_scene_evaluation_count;
+        const KinematicSceneRangeSupport scene =
+            evaluate_kinematic_scene_range_support(
+                preproc_result.filtered_frame, config.min_range, config.max_range,
+                config.kinematic_blend_scene_near_range_m,
+                config.kinematic_blend_scene_max_near_fraction,
+                config.kinematic_blend_scene_far_range_m,
+                config.kinematic_blend_scene_min_far_fraction,
+                config.kinematic_blend_scene_min_valid_points);
+        if (scene.valid) {
+          ++kinematic_blend_scene_valid_count;
+          kinematic_blend_scene_near_fraction_sum += scene.near_fraction;
+          kinematic_blend_scene_far_fraction_sum += scene.far_fraction;
+        }
+        const KinematicSceneReenableGate scene_gate =
+            update_kinematic_scene_reenable_gate(
+                scene.trusted, to_seconds(current_lidar_time),
+                config.kinematic_blend_scene_reenable_delay_sec,
+                _kinematic_blend_scene_last_rejected_time_sec);
+        _kinematic_blend_scene_last_rejected_time_sec =
+            scene_gate.last_rejected_time_sec;
+        scene_rejected = scene_gate.rejected;
+        kinematic_blend_scene_rejected_scan_count += !scene.trusted ? 1U : 0U;
+        kinematic_blend_scene_cooldown_rejected_scan_count +=
+            scene_gate.cooldown_active ? 1U : 0U;
+      }
+      const KinematicPersistentSpeedGate speed_gate =
+          update_kinematic_persistent_speed_gate(
+              previous_velocity_world.norm(),
+              config.kinematic_blend_max_activation_speed_mps,
+              config.kinematic_blend_speed_gate_min_scans,
+              _kinematic_blend_speeding_streak);
+      _kinematic_blend_speeding_streak = speed_gate.streak;
+      const KinematicSceneReenableGate speed_reenable_gate =
+          update_kinematic_speed_reenable_gate(
+              !speed_gate.rejected, to_seconds(current_lidar_time),
+              config.kinematic_blend_speed_reenable_delay_sec,
+              _kinematic_blend_speed_last_rejected_time_sec);
+      _kinematic_blend_speed_last_rejected_time_sec =
+          speed_reenable_gate.last_rejected_time_sec;
+      const bool speed_too_high = speed_reenable_gate.rejected;
+      kinematic_blend_speed_rejected_scan_count += speed_gate.rejected ? 1U : 0U;
+      kinematic_blend_speed_cooldown_rejected_scan_count +=
+          speed_reenable_gate.cooldown_active ? 1U : 0U;
+      const Eigen::Vector3d interval_mean_body_accel =
+          interval_stats.body_acceleration_sum / interval_stats.imu_count;
+      const Eigen::Vector3d interval_mean_angular_velocity_world =
+          lidar_state.pose.so3() *
+          (interval_stats.angular_velocity_sum / interval_stats.imu_count);
+      const bool yaw_rate_exceeded =
+          config.kinematic_blend_max_yaw_rate_rad_s > 0.0 &&
+          std::abs(interval_mean_angular_velocity_world.z()) >
+              config.kinematic_blend_max_yaw_rate_rad_s;
+      if (yaw_rate_exceeded) {
+        ++_kinematic_blend_turning_streak;
+      } else {
+        _kinematic_blend_turning_streak = 0;
+      }
+      const bool turning_too_fast =
+          _kinematic_blend_turning_streak >=
+          std::max<std::size_t>(1, config.kinematic_blend_yaw_gate_min_scans);
+      const double accel_magnitude_variance =
+          interval_stats.imu_count > 1
+              ? interval_stats.welford_sum_of_squares /
+                    static_cast<double>(interval_stats.imu_count - 1)
+              : 0.0;
+      const KinematicInactivityGate inactivity_gate =
+          update_kinematic_inactivity_gate(
+              accel_magnitude_variance,
+              config.kinematic_blend_min_accel_magnitude_variance,
+              config.kinematic_blend_inactivity_gate_min_scans,
+              _kinematic_blend_inactive_streak);
+      _kinematic_blend_inactive_streak = inactivity_gate.streak;
+      kinematic_blend_inactivity_rejected_scan_count +=
+          inactivity_gate.rejected ? 1U : 0U;
+      const bool bridge_active_low_speed =
+          should_bridge_low_speed_with_inertial_activity(
+              previous_velocity_world.norm(),
+              config.kinematic_blend_min_speed,
+              accel_magnitude_variance,
+              config.kinematic_blend_min_accel_magnitude_variance,
+              _kinematic_blend_anchor_time.has_value(),
+              _kinematic_blend_propagated_velocity_world.has_value());
+      const bool speed_too_low =
+          !previous_speed_supports_axis &&
+          !bridge_active_low_speed;
+      kinematic_blend_low_speed_rejected_scan_count += speed_too_low ? 1U : 0U;
+      kinematic_blend_activity_retained_low_speed_scan_count +=
+          bridge_active_low_speed ? 1U : 0U;
+      kinematic_blend_yaw_rejected_scan_count += turning_too_fast ? 1U : 0U;
+      if (speed_too_high || scene_rejected || speed_too_low ||
+          inactivity_gate.rejected) {
+        _kinematic_blend_anchor_time.reset();
+        _kinematic_blend_propagated_velocity_world.reset();
+      } else if (turning_too_fast) {
+        // Suspend translation correction during the turn, but rotate the
+        // independent velocity prior by the observed orientation change. This
+        // preserves its speed for the next straight segment without applying a
+        // stale pre-turn world direction.
+        if (_kinematic_blend_propagated_velocity_world.has_value()) {
+          const Sophus::SO3d world_rotation_delta =
+              optimized_pose.so3() * lidar_state.pose.so3().inverse();
+          _kinematic_blend_propagated_velocity_world =
+              rotate_kinematic_velocity_prior(
+                  world_rotation_delta.matrix(),
+                  _kinematic_blend_propagated_velocity_world.value());
+        }
+      } else {
+        ++kinematic_blend_attempt_count;
+        const double blend_dt = to_seconds(current_lidar_time - lidar_state.time);
+        double anchor_age_sec =
+            _kinematic_blend_anchor_time.has_value()
+                ? to_seconds(current_lidar_time - _kinematic_blend_anchor_time.value())
+                : -1.0;
+        // Once the prior has decayed to exp(-5), discard it completely. The next
+        // ICP/propagation agreement can then establish a clean anchor instead of
+        // comparing forever against a long-drifted inertial state.
+        if (anchor_age_sec > 5.0 * config.kinematic_blend_decay_time_sec) {
+          _kinematic_blend_anchor_time.reset();
+          _kinematic_blend_propagated_velocity_world.reset();
+          anchor_age_sec = -1.0;
+          ++kinematic_blend_anchor_expiration_count;
+        }
+        const Eigen::Vector3d propagation_seed_world =
+            _kinematic_blend_propagated_velocity_world.value_or(previous_velocity_world);
+        const Eigen::Vector3d measured_accel_world = lidar_state.pose.so3() * interval_mean_body_accel;
+        Eigen::Vector3d propagated_velocity_world =
+            propagation_seed_world + measured_accel_world * blend_dt;
+        if (config.kinematic_blend_max_propagated_speed_mps > 0.0 &&
+            propagated_velocity_world.norm() > config.kinematic_blend_max_propagated_speed_mps) {
+          propagated_velocity_world *=
+              config.kinematic_blend_max_propagated_speed_mps / propagated_velocity_world.norm();
+          ++kinematic_blend_propagated_speed_clamp_count;
+        }
+        const Eigen::Vector3d motion_axis_world =
+            bridge_active_low_speed
+                ? _kinematic_blend_propagated_velocity_world.value()
+                : previous_velocity_world;
+        const KinematicVelocityBlend blend = blend_icp_with_propagated_velocity(
+            motion_axis_world, optimized_pose.translation() - lidar_state.pose.translation(), blend_dt,
+            propagated_velocity_world, anchor_age_sec,
+            config.kinematic_blend_icp_information_scale,
+            config.kinematic_blend_propagation_information_scale,
+            config.kinematic_blend_decay_time_sec, config.kinematic_blend_anchor_agreement_mps,
+            config.kinematic_blend_max_icp_innovation_mps, config.kinematic_blend_min_speed);
+        if (blend.valid) {
+          kinematic_blend_max_disagreement_mps =
+              std::max(kinematic_blend_max_disagreement_mps, blend.disagreement_mps);
+        } else {
+          ++kinematic_blend_invalid_result_count;
+        }
+        if (blend.valid && blend.anchor_agrees) {
+          const bool establishing_first_anchor = !_kinematic_blend_anchor_time.has_value();
+          _kinematic_blend_anchor_time = current_lidar_time;
+          // Seed from ICP once, but never let later agreement refreshes feed ICP
+          // velocity back into the independent prior. Repeated small (< agreement
+          // threshold) ICP increments could otherwise accumulate into an arbitrarily
+          // fast self-confirming map trajectory while every individual scan appeared
+          // to agree.
+          _kinematic_blend_propagated_velocity_world =
+              establishing_first_anchor
+                  ? (optimized_pose.translation() - lidar_state.pose.translation()) / blend_dt
+                  : propagated_velocity_world;
+          ++kinematic_blend_anchor_refresh_count;
+          kinematic_blend_last_anchor_refresh_time_sec =
+              to_seconds(current_lidar_time);
+        } else if (_kinematic_blend_anchor_time.has_value() && blend.propagation_weight > 0.0) {
+          _kinematic_blend_propagated_velocity_world = propagated_velocity_world;
+          optimized_pose.translation() += blend.correction;
+          ++kinematic_blend_corrected_scan_count;
+          kinematic_blend_correction_m_sum += blend.correction.norm();
+          kinematic_blend_max_correction_m =
+              std::max(kinematic_blend_max_correction_m, blend.correction.norm());
+          const double correction_time_sec = to_seconds(current_lidar_time);
+          if (kinematic_blend_first_correction_time_sec < 0.0) {
+            kinematic_blend_first_correction_time_sec = correction_time_sec;
+          }
+          kinematic_blend_last_correction_time_sec = correction_time_sec;
+          kinematic_blend_propagation_weight_sum += blend.propagation_weight;
+          kinematic_blend_max_propagation_weight =
+              std::max(kinematic_blend_max_propagation_weight, blend.propagation_weight);
+          kinematic_blend_max_anchor_age_sec =
+              std::max(kinematic_blend_max_anchor_age_sec, anchor_age_sec);
+          kinematic_blend_suppress_map_update_this_scan =
+              blend.propagation_weight > config.kinematic_blend_map_update_max_propagation_weight;
+          kinematic_blend_map_update_fraction_this_scan =
+              std::max(std::clamp(config.kinematic_blend_map_update_min_fraction, 0.0, 1.0),
+                       1.0 - blend.propagation_weight);
+        }
+      }
+    }
+
+    // Accelerometer-consistency velocity gate (see kinematic_velocity_gate.hpp): clamp the
+    // per-scan velocity change along the previous motion direction to what the measured body
+    // acceleration allows. Breaks the geometric zero-motion attractor (an ICP freeze implies
+    // a deceleration the accelerometer flatly contradicts) while letting genuine braking
+    // through, since braking raises the measured acceleration and with it the allowed change.
+    // Applied after the radar/intensity gates so their corrections are part of the checked
+    // translation, and before the velocity estimation below so the state update sees the
+    // clamped pose.
+    else if (config.kinematic_velocity_gate && interval_stats.imu_count > 0) {
+      ++kinematic_gate_attempt_count;
+      const Eigen::Vector3d interval_mean_body_accel =
+          interval_stats.body_acceleration_sum / interval_stats.imu_count;
+      const double gate_dt = to_seconds(current_lidar_time - lidar_state.time);
+      const KinematicVelocityClamp clamp = clamp_velocity_change_to_accel(
+          lidar_state.pose.so3() * lidar_state.velocity,
+          optimized_pose.translation() - lidar_state.pose.translation(), gate_dt,
+          lidar_state.pose.so3() * interval_mean_body_accel, config.kinematic_gate_accel_margin,
+          config.kinematic_gate_min_speed, config.kinematic_gate_weight);
+      if (clamp.corrected) {
+        optimized_pose.translation() += clamp.correction;
+        kinematic_gate_corrected_this_scan = true;
+        ++kinematic_gate_corrected_scan_count;
+        kinematic_gate_correction_m_sum += clamp.correction.norm();
+      }
+    }
+
+    if (config.vehicle_stall_guard && interval_stats.imu_count > 0) {
+      const double guard_dt = to_seconds(current_lidar_time - lidar_state.time);
+      const Eigen::Vector3d previous_velocity_world = lidar_state.pose.so3() * lidar_state.velocity;
+      const double previous_speed = previous_velocity_world.norm();
+      if (guard_dt > 0.0 && previous_speed > 0.0) {
+        const Eigen::Vector3d axis = previous_velocity_world / previous_speed;
+        const double registered_speed =
+            axis.dot(optimized_pose.translation() - lidar_state.pose.translation()) / guard_dt;
+        const double accel_along =
+            axis.dot(lidar_state.pose.so3() * interval_stats.body_acceleration_sum) / interval_stats.imu_count;
+        const double speed = stall_guard.update(to_seconds(current_lidar_time), guard_dt, registered_speed,
+                                                accel_along, previous_speed, config.stall_guard);
+        optimized_pose.translation() += (speed - registered_speed) * guard_dt * axis;
+      }
+    }
+
+    // Sliding-window absolute gravity alignment (see gravity_alignment.hpp for why the
+    // min_beta regularization above cannot correct slow pitch/roll drift on its own). The
+    // window collects each scan interval's raw (gravity-inclusive) accelerometer mean rotated
+    // by that scan's optimized orientation; its long-window mean must point world-up, and the
+    // residual tilt is fed back as a small, capped, roll/pitch-only left-multiplicative
+    // correction. Applied before the velocity/acceleration estimation below so the state
+    // update sees the corrected orientation.
+    // Diagnostic only, never read back (RKO_LIO_TILT_DIAG=<file>): per scan, the registration's
+    // attitude correction of the mean-rate prediction and of the sample-wise gyro integral, and
+    // the rotation information of the final ICP system with the translation marginalized out
+    // (the Schur complement, independent of the pivot), all in the world frame.
+    if (static const char* const tilt_diag_path = std::getenv("RKO_LIO_TILT_DIAG");
+        tilt_diag_path != nullptr && icp_H.allFinite() && icp_H.trace() > 0.0) {
+      static std::ofstream tilt_diag(tilt_diag_path);
+      const Eigen::Vector3d correction_mean = (optimized_pose.so3() * initial_guess.so3().inverse()).log();
+      Eigen::Vector3d correction_sw = Eigen::Vector3d::Constant(std::numeric_limits<double>::quiet_NaN());
+      if (samplewise_rotation) {
+        if (const auto end_rotation = gyro_deskew_history.at(current_lidar_time)) {
+          const Sophus::SO3d predicted_sw = lidar_state.pose.so3() * rotation_origin.inverse() * *end_rotation;
+          correction_sw = (optimized_pose.so3() * predicted_sw.inverse()).log();
+        }
+      }
+      const Eigen::Matrix3d Htt = icp_H.block<3, 3>(0, 0);
+      const Eigen::Matrix3d S =
+          icp_H.block<3, 3>(3, 3) - icp_H.block<3, 3>(3, 0) * Htt.ldlt().solve(icp_H.block<3, 3>(0, 3));
+      const double rate =
+          interval_stats.imu_count > 0
+              ? (interval_stats.angular_velocity_sum / interval_stats.imu_count).norm()
+              : std::numeric_limits<double>::quiet_NaN();
+      tilt_diag << std::fixed << std::setprecision(6) << to_seconds(current_lidar_time) << std::defaultfloat;
+      for (const double v : {correction_mean.x(), correction_mean.y(), correction_mean.z(), correction_sw.x(),
+                             correction_sw.y(), correction_sw.z(), S(0, 0), S(1, 1), S(2, 2), S(0, 1), S(0, 2),
+                             S(1, 2), Htt(0, 0), Htt(1, 1), Htt(2, 2), rate}) {
+        tilt_diag << ' ' << v;
+      }
+      tilt_diag << '\n';
+    }
+    if (config.max_tilt_correction_deg > 0.0) {
+      // Keep roll and pitch from the gyro: limit the registration's correction of the
+      // predicted attitude about horizontal axes. Yaw stays free, and the absolute tilt is
+      // left to the gravity window alignment.
+      bool limited = false;
+      double tilt_limit = config.max_tilt_correction_deg * M_PI / 180.0;
+      if (config.max_tilt_correction_median_factor > 0.0) {
+        // The rig's routine correction: the median over every scan so far, before the limit.
+        const Eigen::Vector3d correction = (optimized_pose.so3() * initial_guess.so3().inverse()).log();
+        const double tilt_deg = std::hypot(correction.x(), correction.y()) * 180.0 / M_PI;
+        if (std::isfinite(tilt_deg)) {
+          const auto bin = static_cast<std::size_t>(std::min(tilt_deg * 1000.0, 1000.0));
+          ++_tilt_correction_histogram[bin];
+          ++_tilt_correction_count;
+        }
+        if (_tilt_correction_count >= static_cast<std::size_t>(std::max(1, config.max_tilt_correction_median_min_scans))) {
+          std::size_t below = 0;
+          std::size_t bin = 0;
+          while (bin < _tilt_correction_histogram.size() - 1 &&
+                 2 * (below + _tilt_correction_histogram[bin]) < _tilt_correction_count) {
+            below += _tilt_correction_histogram[bin++];
+          }
+          const double median_deg = (static_cast<double>(bin) + 0.5) / 1000.0;
+          tilt_limit = std::max(tilt_limit, config.max_tilt_correction_median_factor * median_deg * M_PI / 180.0);
+        }
+      }
+      tilt_correction_last_limit_rad = tilt_limit;
+      optimized_pose.so3() = limit_tilt_correction(initial_guess.so3(), optimized_pose.so3(), tilt_limit, &limited);
+      if (limited) ++tilt_correction_limited_count;
+    }
+    if (config.max_yaw_correction_deg > 0.0) {
+      bool limited = false;
+      optimized_pose.so3() = limit_yaw_correction(initial_guess.so3(), optimized_pose.so3(),
+                                                  config.max_yaw_correction_deg * M_PI / 180.0, &limited);
+      if (limited) ++yaw_correction_limited_count;
+    }
+    if (config.gyro_bias_time_constant_sec > 0.0) {
+      // The kept correction of the gyro-predicted attitude, in the body frame, is the bias error
+      // integrated over the interval (see gyro_bias_time_constant_sec).
+      const Eigen::Vector3d delta = (initial_guess.so3().inverse() * optimized_pose.so3()).log();
+      // Every scan, unless a start window or a standstill gate is set: then every scan inside the
+      // window after a static start, and outside it only standing scans (none without the gate).
+      bool standing = true;
+      const bool gated = config.gyro_bias_standstill_max_speed > 0.0 || config.gyro_bias_start_sec > 0.0;
+      if (gated && to_seconds(current_lidar_time) > _gyro_bias_start_until) {
+        standing = config.gyro_bias_standstill_max_speed > 0.0;
+      }
+      if (gated && standing && to_seconds(current_lidar_time) > _gyro_bias_start_until) {
+        const double scan_dt = to_seconds(current_lidar_time - lidar_state.time);
+        standing = scan_dt > 0.0 && (optimized_pose.translation() - lidar_state.pose.translation()).norm() <=
+                                        config.gyro_bias_standstill_max_speed * scan_dt;
+        if (standing && config.gyro_bias_standstill_max_rate_rad_s > 0.0) {
+          standing = interval_stats.imu_count > 0 &&
+                     (interval_stats.angular_velocity_sum / interval_stats.imu_count).norm() <=
+                         config.gyro_bias_standstill_max_rate_rad_s;
+        }
+      }
+      if (standing && delta.allFinite() && delta.norm() <= config.gyro_bias_max_correction_deg * M_PI / 180.0) {
+        imu_bias.gyroscope -= delta / config.gyro_bias_time_constant_sec;
+        ++gyro_bias_update_count;
+      }
+    }
+    if (config.gravity_window_alignment && interval_stats.imu_count > 0) {
+      const Eigen::Vector3d interval_mean_accel = interval_stats.imu_acceleration_sum / interval_stats.imu_count;
+      const Eigen::Vector3d interval_mean_ang_vel_world =
+          optimized_pose.so3() * (interval_stats.angular_velocity_sum / interval_stats.imu_count);
+      // Sustained turning (world-frame yaw rate) adds centripetal acceleration that does not
+      // average out over the window; skip such intervals instead of poisoning the mean.
+      if (std::abs(interval_mean_ang_vel_world.z()) <= config.gravity_alignment_max_yaw_rate_rad_s) {
+        _gravity_alignment_window.emplace_back(current_lidar_time, optimized_pose.so3() * interval_mean_accel);
+      }
+      while (!_gravity_alignment_window.empty() &&
+             to_seconds(current_lidar_time - _gravity_alignment_window.front().first) > config.gravity_window_sec) {
+        _gravity_alignment_window.pop_front();
+      }
+      const double window_span =
+          _gravity_alignment_window.empty()
+              ? 0.0
+              : to_seconds(current_lidar_time - _gravity_alignment_window.front().first);
+      // Only act on a mostly-full window: a short window has not yet averaged out the body
+      // acceleration and would inject transient tilt as a false correction.
+      if (window_span >= 0.5 * config.gravity_window_sec && _gravity_alignment_window.size() >= 10) {
+        ++gravity_alignment_attempt_count;
+        Eigen::Vector3d mean_world_accel = Eigen::Vector3d::Zero();
+        for (const auto& [_, world_accel] : _gravity_alignment_window) {
+          mean_world_accel += world_accel;
+        }
+        mean_world_accel /= static_cast<double>(_gravity_alignment_window.size());
+        const bool relevel = config.gravity_alignment_relevel_map;
+        const GravityAlignmentCorrection alignment = compute_gravity_alignment_correction(
+            mean_world_accel, GRAVITY_MAG, config.gravity_alignment_max_magnitude_deviation,
+            relevel ? 1.0 : config.gravity_alignment_gain,
+            relevel ? config.gravity_alignment_max_plausible_tilt_rad : config.gravity_alignment_max_correction_rad,
+            config.gravity_alignment_max_plausible_tilt_rad);
+        if (alignment.valid && (!relevel || alignment.tilt_rad >= config.gravity_alignment_relevel_min_tilt_rad)) {
+          ++gravity_alignment_applied_count;
+          gravity_alignment_last_tilt_rad = alignment.tilt_rad;
+          gravity_alignment_correction_rad_sum += alignment.correction.log().norm();
+          if (relevel) {
+            relevel_local_frame(alignment.correction, optimized_pose.translation());
+          }
+          optimized_pose.so3() = alignment.correction * optimized_pose.so3();
+        }
+      }
+    }
+
+    // The correction limit guards a registration that cannot see the travel (a tunnel's axis);
+    // where it sees every direction of translation (a stairwell), its correction stands.
+    bool limit_correction = true;
+    if (config.gait_correction_weak_ratio > 0.0) {
+      const double share = weakest_translation_share(icp_H);
+      if (std::isfinite(share)) {
+        limit_correction = share < config.gait_correction_weak_ratio;
+      }
+    }
+    if (config.gait_speed_prior && config.gait_max_correction_m > 0.0 && _gait_prediction_active &&
+        _gait_direction_body && limit_correction) {
+      const Eigen::Vector3d u = optimized_pose.so3() * *_gait_direction_body;
+      const double correction = (optimized_pose.translation() - initial_guess.translation()).dot(u);
+      if (std::abs(correction) > config.gait_max_correction_m) {
+        optimized_pose.translation() -=
+            (correction - std::copysign(config.gait_max_correction_m, correction)) * u;
+        ++gait_correction_limited_count;
+      }
+    }
+    // estimate velocities and accelerations from the new pose
+    const double dt = to_seconds(current_lidar_time - lidar_state.time);
+    const Sophus::SE3d motion = lidar_state.pose.inverse() * optimized_pose;
+    const Eigen::Vector6d local_velocity = motion.log() / dt;
+    const Eigen::Vector3d local_linear_acceleration =
+        (local_velocity.head<3>() - motion.so3().inverse() * lidar_state.velocity) / dt;
+
+    if (_moving_start_time.has_value()) {
+      update_moving_start_gravity(current_lidar_time, optimized_pose.so3());
+    }
+    // update
+    lidar_state.pose = optimized_pose;
+    lidar_state.velocity = local_velocity.head<3>();
+    if (config.velocity_window_sec > 0.0 && !poses_with_timestamps.empty()) {
+      auto past = poses_with_timestamps.rbegin();
+      while (std::next(past) != poses_with_timestamps.rend() &&
+             to_seconds(current_lidar_time - past->first) < config.velocity_window_sec) {
+        ++past;
+      }
+      const double span = to_seconds(current_lidar_time - past->first);
+      if (span > 0.0) {
+        // Body-frame velocity, like the per-scan estimate above.
+        lidar_state.velocity =
+            optimized_pose.so3().inverse() * ((optimized_pose.translation() - past->second.translation()) / span);
+      }
+    }
+    if (config.gait_speed_prior) {
+      bool applied = false;
+      const double now = to_seconds(current_lidar_time);
+      const Eigen::Vector3d scan_velocity_change = _gait_velocity_change;
+      _gait_velocity_change.setZero();
+      if (const auto cadence = _gait.cadence()) {
+        if (config.gait_reversal_lookback_sec > 0.0 && _gait_direction_body && _gait_prediction_active &&
+            !_gait_velocity_history.empty()) {
+          // Velocity now from the IMU alone, starting from the velocity a lookback ago.
+          auto it = _gait_velocity_history.begin();
+          while (std::next(it) != _gait_velocity_history.end() &&
+                 now - std::get<0>(*std::next(it)) >= config.gait_reversal_lookback_sec) {
+            ++it;
+          }
+          if (now - std::get<0>(*it) >= 0.5 * config.gait_reversal_lookback_sec &&
+              now - _gait_last_reversal_time > 3.0 * config.gait_reversal_lookback_sec) {
+            // Remove the mean acceleration of the whole history first: with the gravity term
+            // off the attitude tilts slowly, and the leaked gravity integrates into a false
+            // reversal within seconds. A real reversal changes the velocity within a few.
+            const double history_span = now - std::get<0>(_gait_velocity_history.front());
+            Eigen::Vector3d mean_acceleration = Eigen::Vector3d::Zero();
+            if (history_span > 0.0) {
+              for (const auto& entry : _gait_velocity_history) mean_acceleration += std::get<2>(entry);
+              mean_acceleration = (mean_acceleration + scan_velocity_change) / history_span;
+            }
+            Eigen::Vector3d velocity = std::get<1>(*it);
+            for (auto jt = std::next(it); jt != _gait_velocity_history.end(); ++jt) velocity += std::get<2>(*jt);
+            velocity += scan_velocity_change - mean_acceleration * (now - std::get<0>(*it));
+            const Eigen::Vector3d u_world = lidar_state.pose.so3() * *_gait_direction_body;
+            // A walker turning with the sensor keeps the body direction; only a reversal the
+            // sensor did not turn with needs the flip. Skip while the sensor turned recently.
+            bool sensor_turned = false;
+            for (const auto& entry : _gait_velocity_history) {
+              if (now - std::get<0>(entry) <= 3.0 * config.gait_reversal_lookback_sec &&
+                  (std::get<3>(entry).inverse() * lidar_state.pose.so3()).log().norm() > M_PI / 6.0) {
+                sensor_turned = true;
+                break;
+              }
+            }
+            if (!sensor_turned && velocity.dot(u_world) < -config.gait_min_direction_speed) {
+              _gait_direction_body = -*_gait_direction_body;
+              ++gait_reversal_count;
+              _gait_last_reversal_time = now;
+            }
+          }
+        }
+        const double registered_speed = lidar_state.velocity.norm();
+        _gait.observe(registered_speed, *cadence);
+        if (registered_speed > config.gait_min_direction_speed) {
+          const Eigen::Vector3d registered_direction = lidar_state.velocity / registered_speed;
+          if (!_gait_direction_body || !_gait.step_length()) {
+            // Free until the step is learned; afterwards only the blend below and the IMU
+            // reversal check may turn it (a registration released from the gait for one scan
+            // snaps back and would point the walk backwards).
+            _gait_direction_body = registered_direction;
+          } else if (registered_direction.dot(*_gait_direction_body) > std::cos(M_PI / 4.0)) {
+            // While the gait drives the prediction, follow the registration only slowly and
+            // only near the current direction: a turn of the sensor mid-stride or a slipping
+            // registration would otherwise point the walk backwards. Reversals without a
+            // turn of the sensor are the IMU's to detect (above).
+            _gait_direction_body = (0.9 * *_gait_direction_body + 0.1 * registered_direction).normalized();
+          }
+        }
+        // Until the step is learned, step in only where the registration is implausible
+        // (stalled or running away), with the default step.
+        std::optional<double> step_length = _gait.step_length();
+        if (!step_length && config.gait_default_step_length > 0.0 &&
+            !_gait.plausible_step(registered_speed / *cadence)) {
+          step_length = config.gait_default_step_length;
+        }
+        if (step_length && _gait_direction_body) {
+          lidar_state.velocity = apply_gait_speed(lidar_state.velocity, *_gait_direction_body,
+                                                  *cadence * *step_length, config.gait_sets_speed);
+          if (_gait.step_length()) _gait_last_speed = *cadence * *step_length;
+          ++gait_speed_applied_count;
+          applied = true;
+        }
+      } else if (config.gait_hold_without_cadence && _gait.step_length() && _gait_direction_body &&
+                 _gait_last_speed && lidar_state.velocity.norm() > *_gait_last_speed) {
+        // The cadence dropped out (the window holds a turn or a stop) and the registration
+        // runs faster than the last pace. Keep the walker's bounds, and the correction limit,
+        // until it is back. A registration slower than the last pace is left alone: a slow
+        // turn barely shakes the sensor, so the standing test alone would stop it.
+        const bool standing = _gait.magnitude_std(1.0) < config.gait_standing_accel_std;
+        lidar_state.velocity = hold_gait_speed(lidar_state.velocity, *_gait_direction_body, *_gait_last_speed,
+                                               standing, config.gait_sets_speed);
+        ++gait_hold_count;
+        if (standing) ++gait_standing_count;
+        applied = true;
+      }
+      _gait_prediction_active = applied;
+      _gait_velocity_history.emplace_back(now, lidar_state.pose.so3() * lidar_state.velocity, scan_velocity_change,
+                                          lidar_state.pose.so3());
+      while (!_gait_velocity_history.empty() &&
+             now - std::get<0>(_gait_velocity_history.front()) > std::max(30.0, 2.0 * config.gait_reversal_lookback_sec)) {
+        _gait_velocity_history.pop_front();
+      }
+    }
+    lidar_state.angular_velocity = local_velocity.tail<3>();
+    lidar_state.linear_acceleration = local_linear_acceleration;
+
+    // [v0.8 Phase 1, diagnostic-only] expose the final ICP linear system and
+    // its eigen-summary. Purely additive: nothing above this line (the pose/
+    // velocity/acceleration estimate) depends on this field.
+    PersistentWeakDirectionState persistent_direction;
+    if (config.degeneracy_adaptive_iteration_budget) {
+      if (has_weak_information_direction(icp_H, config.degeneracy_adaptive_iteration_ratio)) {
+        _adaptive_iteration_hold_remaining = config.degeneracy_adaptive_hold_scans;
+      } else if (_adaptive_iteration_hold_remaining > 0) {
+        --_adaptive_iteration_hold_remaining;
+      }
+    } else {
+      _adaptive_iteration_hold_remaining = 0;
+    }
+    if (config.degeneracy_persistence_gate) {
+      PersistentWeakDirectionConfig persistence_config;
+      persistence_config.min_consecutive_scans = config.degeneracy_persistence_min_scans;
+      persistence_config.min_absolute_cosine = config.degeneracy_persistence_min_absolute_cosine;
+      persistence_config.min_translation_fraction = config.degeneracy_persistence_min_translation_fraction;
+      persistence_config.require_multiscan_observability = config.degeneracy_multiscan_observability_gate;
+      persistence_config.observability_window_scans = config.degeneracy_observability_window_scans;
+      persistence_config.observability_min_scans = config.degeneracy_observability_min_scans;
+      persistence_config.max_aggregate_directional_information_ratio =
+          config.degeneracy_observability_max_directional_ratio;
+      persistent_direction = _persistent_weak_direction_tracker.observe(
+          icp_H, config.degeneracy_persistence_tracking_ratio, config.degeneracy_multiplicity_relative_gap,
+          persistence_config);
+    } else {
+      _persistent_weak_direction_tracker.reset();
+    }
+    // Store this scan's own reflectivity profile (world-anchored via the just-optimized
+    // pose) for the next scan's correlation. Kept alive as long as the persistence tracker
+    // still has a candidate axis, even before it's confirmed, so a profile is already
+    // available the moment confirmation fires. Dropped whenever the candidate direction is
+    // lost (e.g. the Hessian became well-conditioned again): a stale axis/profile from an
+    // unrelated degenerate direction must not be reused.
+    if (intensity_alignment_available && persistent_direction.candidate_available) {
+      Vector3dVector world_points(intensity_aligned_points.size());
+      std::transform(intensity_aligned_points.cbegin(), intensity_aligned_points.cend(), world_points.begin(),
+                     [&](const auto& point) { return optimized_pose * point; });
+      IntensityProfileConfig profile_config;
+      profile_config.bin_size_m = config.intensity_bin_size_m;
+      profile_config.half_length_m = config.intensity_profile_half_length_m;
+      profile_config.max_shift_m = config.intensity_max_shift_m;
+      profile_config.min_correlation = config.intensity_min_correlation;
+      profile_config.min_peak_margin = config.intensity_min_peak_margin;
+      profile_config.peak_exclusion_radius_bins =
+          config.intensity_peak_exclusion_radius_bins;
+      profile_config.min_filled_bins = config.intensity_min_filled_bins;
+      const Eigen::Vector3d origin = centroid_of(world_points);
+      const Eigen::Vector3d axis = persistent_direction.axis.head<3>().normalized();
+      const IntensityProfile profile =
+          build_intensity_profile(world_points, intensity_aligned_values, axis, origin, profile_config);
+      if (profile.valid) {
+        _previous_intensity_profile = StoredIntensityProfile{profile, origin, axis};
+      } else {
+        _previous_intensity_profile.reset();
+      }
+    } else if (intensity_alignment_available) {
+      _previous_intensity_profile.reset();
+    }
+    if (visual_pose_prior.has_value()) {
+      ++visual_prior_attempt_count;
+      visual_fused_direction_count += visual_fused_directions;
+      visual_unobservable_direction_count += visual_unobservable_directions;
+      visual_observability_diagnostics.push_back(
+          {current_lidar_time, visual_directional_information_ratios, visual_directional_information_ratio_count});
+      visual_fused_scan_count += visual_fused_directions > 0 ? 1U : 0U;
+    }
+    if (radar_prior_pose.has_value()) {
+      ++radar_prior_attempt_count;
+      radar_fused_scan_count += degeneracy_intervention_count > 0 ? 1U : 0U;
+    }
+    if (photometric_frame.has_value()) {
+      if (photometric_patches > 0) {
+        ++photometric_scan_count;
+        photometric_patch_sum += static_cast<std::size_t>(photometric_patches);
+      }
+      const std::vector<Eigen::Vector3d> normals = sample_surface_normals(
+          *photometric_frame, config.photometric_normal_row_step, config.photometric_normal_col_step);
+      _photometric_features.update(*photometric_frame, image_model, lidar_state.pose * _photometric_base_from_cloud,
+                                   weak_translation_directions(normals, config.photometric_weak_direction_min_contribution));
+    }
+    lidar_state.icp_diagnostics = IcpDiagnostics{icp_H, icp_b, LocalizabilitySummary::from_hessian(icp_H),
+                                                 persistent_direction, degeneracy_intervention_count};
+    if (config.degeneracy_persistence_gate) {
+      degeneracy_persistence_diagnostics.push_back({current_lidar_time, persistent_direction, degeneracy_intervention_count});
+    }
+
+    if (config.inertial_window) {
+      // Close the IMU interval at the scan time (the last sample may fall short of it).
+      const double shortfall = to_seconds(current_lidar_time - imu_state.time);
+      if (_window_preintegration.dt > 0.0 && shortfall > 0.0) {
+        _window_preintegration.add(_window_last_angular_velocity, _window_last_specific_force, shortfall);
+      }
+      if (_inertial_window.states().empty() || _window_preintegration.dt <= 0.0) {
+        _inertial_window.reset();
+        _inertial_window.set_biases(imu_bias.accelerometer, imu_bias.gyroscope);
+      }
+      _inertial_window.add(to_seconds(current_lidar_time), lidar_state.pose,
+                           lidar_state.pose.so3() * lidar_state.velocity, _window_preintegration);
+      inertial_window_added = true;
+      if (_inertial_window.solve(_gravity_world)) {
+        ++inertial_window_solve_count;
+        lidar_state.velocity = lidar_state.pose.so3().inverse() * _inertial_window.latest_velocity();
+        imu_bias.accelerometer = _inertial_window.accelerometer_bias();
+        imu_bias.gyroscope = _inertial_window.gyroscope_bias();
+      }
+    }
+    imu_state = lidar_state; // correct the drift in imu integration
+  }
+  if (config.inertial_window && !inertial_window_added) {
+    // No registered pose for this scan: the chain of fixed poses is broken.
+    _inertial_window.reset();
+  }
+  // even if map is empty, time should still update
+  lidar_state.time = current_lidar_time;
+  // reset imu to last know lidar state (redundant with the ICP branch's `imu_state = lidar_state` above, but
+  // still needed on the initial map-still-empty scans before the local map has enough points for ICP to run).
+  imu_state = lidar_state;
+
+  // reset imu averages
+  interval_stats.reset();
+  reset_inertial_window_interval();
+
+  // Gate-corrected scans stay out of the map (see Config::kinematic_gate_skip_map_update):
+  // inserting a glided scan would let the next ICP anchor to its own correction.
+  if (!(kinematic_gate_corrected_this_scan && config.kinematic_gate_skip_map_update) &&
+      !kinematic_blend_suppress_map_update_this_scan && !registration_skipped_this_scan &&
+      !standstill_clamped_this_scan) {
+    if (kinematic_blend_map_update_fraction_this_scan >= 1.0) {
+      update_maps(map_input, lidar_state.pose, &preproc_result.filtered_frame);
+    } else {
+      // Uniform deterministic thinning keeps some fresh geometry available without
+      // letting a propagation-dominated pose fully rewrite the local map.
+      Vector3dVector thinned_map_input;
+      thinned_map_input.reserve(static_cast<std::size_t>(
+          std::ceil(kinematic_blend_map_update_fraction_this_scan * map_input.size())));
+      for (std::size_t i = 0; i < map_input.size(); ++i) {
+        const auto previous_count = static_cast<std::size_t>(
+            std::floor(kinematic_blend_map_update_fraction_this_scan * static_cast<double>(i)));
+        const auto next_count = static_cast<std::size_t>(
+            std::floor(kinematic_blend_map_update_fraction_this_scan * static_cast<double>(i + 1)));
+        if (next_count > previous_count) {
+          thinned_map_input.push_back(map_input[i]);
+        }
+      }
+      update_maps(thinned_map_input, lidar_state.pose, &preproc_result.filtered_frame);
+    }
+  }
+
+  poses_with_timestamps.emplace_back(lidar_state.time, lidar_state.pose);
+  record_output_pose(true);
+  _consecutive_registration_failures = 0;
+
+  return preproc_result.filtered_frame;
+}
+
+Vector3dVector LIO::register_scan(const Sophus::SE3d& extrinsic_lidar2base,
+                                  const Vector3dVector& scan,
+                                  const TimestampVector& timestamps,
+                                  const std::vector<float>* intensities) {
+  _photometric_base_from_cloud = extrinsic_lidar2base;
+  if (extrinsic_lidar2base.log().norm() < EPSILON) {
+    return register_scan(scan, timestamps, intensities);
+  }
+
+  Vector3dVector transformed_scan(scan.size());
+  transform_points(extrinsic_lidar2base, scan, transformed_scan);
+  Vector3dVector frame = register_scan(transformed_scan, timestamps, intensities);
+  transform_points(extrinsic_lidar2base.inverse(), frame);
+  return frame;
+}
+} // namespace rko_lio::core

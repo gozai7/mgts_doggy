@@ -1,0 +1,246 @@
+# lidarslam-ros2 release readiness profiles
+#
+# Each profile pins one dataset / reference combination to its own pass / target
+# threshold so the release gate does not collapse all datasets onto one APE
+# number. ``benchmark_summary.py --release-profile`` evaluates each profile
+# against the best matching run under ``--root`` and emits PASS / FAIL / WARN /
+# NO_DATA per profile.
+#
+# Track convention (also documented in docs/comparison.md):
+#   - As of v0.4 (decision 2026-06-07, docs/roadmap/v0.4.md), ALL profiles are
+#     release-track: a FAIL blocks the release. The three former research-track
+#     profiles (``ntu_viral_tnp_01``, ``mid360_vs_glim``,
+#     ``leo_drive_applanix_velodyne_cross``) graduated from ``report_only_until:
+#     v0.4`` to blocking at their current ``pass`` thresholds.
+#   - As of v0.5 (docs/roadmap/v0.5.md), the MID-360 evidence is real ground
+#     truth: the ``mid360_gt_rtkslam_construction_*`` total-station profiles
+#     graduated to blocking (all four RTK-SLAM sequences measured), and
+#     ``mid360_vs_glim`` was demoted to report-only per decision D-GT-2
+#     (cross-validation only measures agreement, not accuracy; it stays as a
+#     regression canary). ``leo_drive_applanix_velodyne_cross`` keeps the
+#     cross-val caveat (separate track).
+#   - ``report_only_until`` is the demotion/soak mechanism (FAIL -> WARN while
+#     set); new profiles introduced mid-cycle soak as report-only first.
+#   - As of v0.8 Phase 0 (docs/roadmap/v0.8.md §5), two HILTI 2022 rows
+#     (``hilti2022_exp01``, ``hilti2022_exp07``) are added as
+#     ``report_only_until: v0.8``. Unlike prior soak-then-graduate rows,
+#     these two are *frozen baselines*: ``pass`` is pinned to the exact
+#     measured raw-odometry RMSE (v0.7 Phase 4 evidence, reconfirmed in
+#     ``docs/research/hilti-degeneracy-baseline.md``), not a looser
+#     graduation target, so any drift shows as WARN without blocking. HILTI
+#     is CC BY-NC-SA / evaluation-only and fetched on demand
+#     (``scripts/download_hilti2022.sh``), so these rows only evaluate when
+#     a matching local run exists; "blocking" for this substrate is a
+#     manual pre-release checklist item, not a ``report_only_until`` flip
+#     (§6 of the roadmap).
+#
+# Fields:
+#   name: short identifier (snake_case)
+#   description: human-readable context (sensor / route / GT type)
+#   match: predicates that select which metrics.json runs feed this profile.
+#     - bag_name_contains: substring of basename(bag_path)
+#     - points_topic: exact match on /...
+#     - reference_kind: ground_truth | cross_validation | unknown
+#     - reference_source_contains: substring of reference.source
+#     - min_ape_pairs: minimum evo.ape.pairs to filter out partial/incomplete runs
+#     - require_clean_provenance: require SHA-256 input/software identities from
+#       a clean Git revision; every shipped release profile enables this
+#   metric:
+#     ape_rmse_gt_m            -> evo.ape.rmse, only when reference.kind == ground_truth
+#     ape_rmse_vs_reference_m  -> evo.ape.rmse against any reference (typically cross_validation)
+#   pass: hard threshold (release gate fails if best matching run exceeds this)
+#   target: roadmap target shown alongside (no enforcement; bonus TARGET_MET tag)
+#   report_only_until: optional release tag; while set, FAIL is downgraded to WARN
+#                       so the profile reports but does not block release
+
+release_profiles:
+  - name: newer_college_math_hard
+    description: Newer College Maths-Hard (~320m loop, Ouster OS0-128 + IMU, ICP-to-survey-map GT)
+    remediation: Follow docs/benchmarking.md#newer-college-maths-hard to acquire the form-gated official bag, ground-truth CSV, and collection calibration, then rerun the exact candidate commit.
+    match:
+      require_clean_provenance: true
+      bag_name_contains: math_hard
+      reference_kind: ground_truth
+    metric: ape_rmse_gt_m
+    pass: 0.10
+    target: 0.08
+
+  - name: ntu_viral_tnp_01
+    description: NTU VIRAL tnp_01 (~580s outdoor, Ouster OS1-16 + VN-100, Leica prism GT)
+    remediation: Run scripts/download_ntu_viral_tnp01.sh --dry-run, choose a large enough destination, then follow the canonical NTU command in docs/benchmarking.md and retain metrics.json under the benchmark root.
+    match:
+      require_clean_provenance: true
+      bag_name_contains: tnp_01
+      reference_kind: ground_truth
+      min_ape_pairs: 200
+    metric: ape_rmse_gt_m
+    pass: 1.00
+    target: 0.30
+
+  # Demoted to report-only in v0.5 (D-GT-2): superseded by the
+  # mid360_gt_rtkslam_* total-station profiles below. Cross-validation against
+  # another SLAM estimate measures agreement, not accuracy; kept as a
+  # regression canary on the same sensor.
+  - name: mid360_vs_glim
+    description: Livox MID-360 vs GLIM cross-validation (~277s indoor loop; report-only since v0.5)
+    match:
+      require_clean_provenance: true
+      points_topic: /livox/lidar
+      reference_kind: cross_validation
+      reference_source_contains: glim_mid360
+      min_ape_pairs: 400
+    metric: ape_rmse_vs_reference_m
+    pass: 4.00
+    target: 1.00
+    report_only_until: superseded-by-mid360-gt (D-GT-2)
+
+  # v0.5: the real total-station GT profile that supersedes mid360_vs_glim's
+  # cross-validation. Scored against the public RTK-SLAM dataset's surveyed
+  # checkpoints (arXiv:2604.07151, CC-BY 4.0). The checkpoints are sparse and
+  # land at survey-dwell points where the optimized submap graph is sparse, so
+  # the gate scores the *dense* trajectory (RKO-LIO odometry) -- the same dense
+  # form the dataset's own published baselines are scored in. Run with
+  # --match-tolerance 2.0 (the dataset's max_dt). Graduated to blocking in v0.5
+  # with all four RTK-SLAM sequences measured. Observed construction_seq2 raw
+  # RMSE 0.154 m (median 0.061), vs published fast_lio_sam 0.086 / okvis 0.075;
+  # 0.062 m (median 0.059) since the preset deskews with the Livox offset_time
+  # and initialises gravity (2026-11; 0.165 m without, same commit).
+  - name: mid360_gt_rtkslam_construction_seq2
+    description: Livox MID-360 vs total-station checkpoints, RTK-SLAM Construction Hall 2 (~600s, 16 chkpt, dense odometry)
+    remediation: Download construction_seq2 plus eval assets with scripts/download_rtk_slam_dataset.py and run scripts/run_rtk_slam_accuracy_suite.py for the exact candidate commit.
+    match:
+      require_clean_provenance: true
+      points_topic: /livox/points
+      reference_kind: ground_truth
+      reference_source_contains: rtk_slam_construction_seq2_gt
+      min_ape_pairs: 12
+    metric: ape_rmse_gt_m
+    pass: 0.30
+    target: 0.15
+
+  # Companion indoor sequence (Construction Hall 1) -- the hardest of the two
+  # halls (published baselines ~0.22 m, the highest). Our dense odometry pairs
+  # 16/16 at RMSE 0.403 m (median 0.263; 0.205 m, median 0.095, with the
+  # 2026-11 deskew + gravity-init preset), so the threshold is looser than
+  # construction_seq2 by design: per-sequence difficulty, like NTU vs Newer
+  # College. Graduated to blocking in v0.5 together with construction_seq2.
+  - name: mid360_gt_rtkslam_construction_seq1
+    description: Livox MID-360 vs total-station checkpoints, RTK-SLAM Construction Hall 1 (~741s, 16 chkpt, dense odometry)
+    remediation: Download construction_seq1 plus eval assets with scripts/download_rtk_slam_dataset.py and run scripts/run_rtk_slam_accuracy_suite.py for the exact candidate commit.
+    match:
+      require_clean_provenance: true
+      points_topic: /livox/points
+      reference_kind: ground_truth
+      reference_source_contains: rtk_slam_construction_seq1_gt
+      min_ape_pairs: 12
+    metric: ape_rmse_gt_m
+    pass: 0.55
+    target: 0.30
+
+  # Outdoor pair (Stadtgarten park) -- sequence 1 uses the shared modern dd-off
+  # preset; sequence 2 uses the measured compatibility preset
+  # (rko_lio_rtk_slam_mid360_stadtgarten_seq2.yaml: legacy voxel order,
+  # 105 m range, Livox offset_time deskew, static gravity init). The former shared
+  # dd-on preset drifts to 3.9 m here. These are
+  # honest capability-boundary numbers for LiDAR-inertial raw odometry without
+  # GNSS or loop closure (published GNSS-anchored baselines sit at ~0.07 m):
+  # stadtgarten_seq2 0.296 m (19 chkpt, 2026-11; 0.426 m before deskew), stadtgarten_seq1
+  # 0.838 m (median 0.511, 36 chkpt, 26 min / ~1 km loop). Soak as
+  # report-only with indoor-like headroom before graduating.
+  - name: mid360_gt_rtkslam_stadtgarten_seq2
+    description: Livox MID-360 vs total-station checkpoints, RTK-SLAM Stadtgarten 2 (~876s outdoor park, 19 chkpt, dense odometry)
+    match:
+      require_clean_provenance: true
+      points_topic: /livox/points
+      reference_kind: ground_truth
+      reference_source_contains: rtk_slam_stadtgarten_seq2_gt
+      min_ape_pairs: 12
+    metric: ape_rmse_gt_m
+    pass: 1.20
+    target: 0.90
+    report_only_until: v0.6
+
+  - name: mid360_gt_rtkslam_stadtgarten_seq1
+    description: Livox MID-360 vs total-station checkpoints, RTK-SLAM Stadtgarten 1 (~1603s outdoor park, 36 chkpt, dense odometry)
+    match:
+      require_clean_provenance: true
+      points_topic: /livox/points
+      reference_kind: ground_truth
+      reference_source_contains: rtk_slam_stadtgarten_seq1_gt
+      min_ape_pairs: 24
+    metric: ape_rmse_gt_m
+    pass: 2.20
+    target: 1.70
+    report_only_until: v0.6
+
+  # v0.8 Phase 0 (docs/roadmap/v0.8.md §5): HILTI 2022 raw-odometry baseline
+  # freeze, new wiring (no HILTI profile existed before this). exp01 is the
+  # feature-rich companion substrate (construction ground level, one-shot
+  # 904 m sweep, 13 control-point pairs, zero loop closures -- backend
+  # passthrough). pass is pinned to the exact frozen RMSE so this is a
+  # regression canary against the v0.8 baseline, not a graduation target;
+  # report_only_until: v0.8 keeps it WARN-only through the whole roadmap.
+  # Reproduce: docs/research/hilti-degeneracy-baseline.md.
+  - name: hilti2022_exp01
+    description: HILTI 2022 Hesai PandarXT-32 exp01 construction ground level vs mm total-station control points (feature-rich, dense raw odometry)
+    match:
+      require_clean_provenance: true
+      points_topic: /hesai/pandar
+      reference_kind: ground_truth
+      reference_source_contains: hilti2022_exp01_control_points_gt
+      min_ape_pairs: 10
+    metric: ape_rmse_gt_m
+    pass: 0.066
+    report_only_until: v0.8
+
+  # Companion degenerate substrate: 124 m long-corridor one-shot sweep, only
+  # 6 control-point pairs, zero loop closures. RMSE ~5x exp01 on the same
+  # sensor/pipeline -- the exact evidence v0.8 degeneracy-aware registration
+  # exists to address (docs/roadmap/v0.8.md §0). Frozen, not a threshold to
+  # tune against; do not lower `pass` on this row to celebrate a detector
+  # change before Phase 3 holdout validation says so.
+  - name: hilti2022_exp07
+    description: HILTI 2022 Hesai PandarXT-32 exp07 long corridor vs mm total-station control points (degenerate, dense raw odometry)
+    match:
+      require_clean_provenance: true
+      points_topic: /hesai/pandar
+      reference_kind: ground_truth
+      reference_source_contains: hilti2022_exp07_control_points_gt
+      min_ape_pairs: 4
+    metric: ape_rmse_gt_m
+    pass: 0.318
+    report_only_until: v0.8
+
+  # Third freeze substrate and designated Phase 3 holdout companion to exp01
+  # (docs/roadmap/v0.8.md §5, §6): 82 m construction-upper-level one-shot
+  # sweep, 7 control-point pairs, zero loop edges (the 82 m path never
+  # clears the 100 m distance_loop_closure gate, so the physical revisit in
+  # the GT is never eligible -- backend passthrough, corrected == raw to
+  # 0.0000 m). Frozen at the dense raw-odometry RMSE measured 2026-07-05
+  # (0.0715, rounded up to 3 dp so the frozen run itself evaluates PASS);
+  # docs/research/hilti-degeneracy-baseline.md §3. Holdout hygiene: do not
+  # tune against this row once Phase 2 threshold-tuning starts.
+  - name: hilti2022_exp04
+    description: HILTI 2022 Hesai PandarXT-32 exp04 construction upper level vs mm total-station control points (feature-rich, dense raw odometry)
+    match:
+      require_clean_provenance: true
+      points_topic: /hesai/pandar
+      reference_kind: ground_truth
+      reference_source_contains: hilti2022_exp04_control_points_gt
+      min_ape_pairs: 5
+    metric: ape_rmse_gt_m
+    pass: 0.072
+    report_only_until: v0.8
+
+  - name: leo_drive_applanix_velodyne_cross
+    description: Leo Drive applanix/velodyne open data vs Applanix GSOF49 cross-validation
+    remediation: Run the Leo Drive command in docs/benchmarking.md with --verify-map on the exact candidate commit and retain metrics.json under the benchmark root.
+    match:
+      require_clean_provenance: true
+      points_topic: /open_data/velodyne_points
+      reference_kind: cross_validation
+      reference_source_contains: applanix_gsof49
+      min_ape_pairs: 200
+    metric: ape_rmse_vs_reference_m
+    pass: 1.50
+    target: 0.50

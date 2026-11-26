@@ -1,0 +1,18 @@
+--- a/vendor/rko_fork/rko_lio/ros/base_node.hpp
++++ b/vendor/rko_fork/rko_lio/ros/base_node.hpp
+@@ -31,6 +31,7 @@
+ #include "rko_lio/driver/offline_driver.hpp"
+ // stl
+ #include <atomic>
++#include <rosbag2_cpp/writer.hpp>
+ #include <deque>
+ #include <filesystem>
+ #include <limits>
+@@ -119,6 +120,7 @@
+   std::string map_topic = "rko_lio/local_map";
+   std::string deskewed_scan_topic = "rko_lio/frame";
+ 
++  std::unique_ptr<rosbag2_cpp::Writer> competition_backend_writer;
+   bool dump_results = false;
+   std::string results_dir = "results";
+   std::string run_name = "rko_lio_run";

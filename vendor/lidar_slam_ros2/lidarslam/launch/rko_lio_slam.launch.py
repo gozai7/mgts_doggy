@@ -1,0 +1,527 @@
+"""Launch RKO-LIO offline_node with graph_based_slam loop closure."""
+
+# Copyright 2026 Sasaki
+# All rights reserved.
+#
+# Software License Agreement (BSD 2-Clause Simplified License)
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions
+# are met:
+#
+#  * Redistributions of source code must retain the above copyright
+#    notice, this list of conditions and the following disclaimer.
+#  * Redistributions in binary form must reproduce the above
+#    copyright notice, this list of conditions and the following
+#    disclaimer in the documentation and/or other materials provided
+#    with the distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+# "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+# LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
+# FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
+# COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+# INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+# BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+# LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+# LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
+# ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+# POSSIBILITY OF SUCH DAMAGE.
+
+import math
+import os
+import shlex
+
+from ament_index_python.packages import get_package_share_directory
+from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument, OpaqueFunction
+from launch.conditions import IfCondition
+from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
+from launch_ros.actions import Node
+import yaml
+
+
+def _parse_bool_arg(value):
+    """Parse a launch boolean override."""
+    return value.strip().lower() in ('true', '1', 'yes', 'on')
+
+
+def _add_optional_param_override(overrides, context, arg_name, parser):
+    """Append an override only when the launch argument is explicitly set."""
+    value = LaunchConfiguration(arg_name).perform(context)
+    if value == '':
+        return
+    overrides[arg_name] = parser(value)
+
+
+def load_rko_params(path):
+    """Read an RKO-LIO parameter file, flat or in the ros__parameters layout."""
+    with open(path, encoding='utf-8') as stream:
+        data = yaml.safe_load(stream) or {}
+    for value in data.values():
+        if isinstance(value, dict) and 'ros__parameters' in value:
+            return dict(value['ros__parameters'])
+    return dict(data)
+
+
+def create_rko_offline_node(context, *args, **kwargs):
+    """Create the RKO-LIO offline node with optional parameter injection."""
+    del args
+    del kwargs
+
+    parameters = []
+    parameters.append({
+        'bag_path': LaunchConfiguration('bag_path'),
+        'lidar_topic': LaunchConfiguration('lidar_topic'),
+        'imu_topic': LaunchConfiguration('imu_topic'),
+        'base_frame': LaunchConfiguration('base_frame'),
+        'odom_frame': LaunchConfiguration('odom_frame'),
+        'lidar_frame': LaunchConfiguration('lidar_frame'),
+        'imu_frame': LaunchConfiguration('imu_frame'),
+        'deskew': LaunchConfiguration('deskew'),
+        'voxel_size': LaunchConfiguration('voxel_size'),
+        'max_range': LaunchConfiguration('max_range'),
+        'min_range': LaunchConfiguration('min_range'),
+        'initialization_phase': LaunchConfiguration('initialization_phase'),
+        'skip_to_time': LaunchConfiguration('skip_to_time'),
+        'publish_deskewed_scan': True,
+        # Pass the bag's NavSatFix topic through to graph_based_slam (bag_gnss:=true);
+        # the offline node otherwise reads the bag on its own and no GNSS reaches the graph.
+        'gnss_topic': (
+            LaunchConfiguration('gnss_topic').perform(context)
+            if _parse_bool_arg(LaunchConfiguration('bag_gnss').perform(context)) else ''
+        ),
+        # The upstream-integrated rko_lio defaults to "rko_lio/odom"; the
+        # graph backend below (and the record_backend_input tooling) expect
+        # the fork's historical "/rko_lio/odometry".
+        'odom_topic': '/rko_lio/odometry',
+        # Official rko_lio 0.4.1 renamed the deskewed scan topic from
+        # "rko_lio/frame" to "rko_lio/deskewed_scan"; the backend's
+        # cloud_input remap and the backend-input tooling keep the former.
+        'deskewed_scan_topic': '/rko_lio/frame',
+        'dump_results': LaunchConfiguration('dump_results'),
+        'results_dir': LaunchConfiguration('results_dir'),
+        'run_name': LaunchConfiguration('run_name'),
+        # The offline node reads the bag faster than real time. With the node's
+        # default depth of 1, a scan or odometry message that the backend has not
+        # yet taken is overwritten by the next one (mostly while the static start
+        # runs fast), so the map starts a different number of scans late on each
+        # run. A preset can still set its own depth.
+        'publisher_queue_depth': 128,
+    })
+
+    # Let the optional YAML file override launch defaults such as
+    # initialization_phase and sensor extrinsics.
+    rko_param_file = LaunchConfiguration('rko_param_file').perform(context)
+    if rko_param_file:
+        parameters.append(rko_param_file)
+
+    prefix = []
+    wait_for_subscribers = _parse_bool_arg(
+        LaunchConfiguration('wait_for_output_subscribers').perform(context)
+    )
+    if _parse_bool_arg(LaunchConfiguration('wait_for_backend').perform(context)):
+        # graph_based_slam is always launched below. Scans published before it
+        # has subscribed are lost, so the map starts one or two scans late, by a
+        # different amount on every run (bench_report/REPORT.md, chapter 39).
+        # The offline node's own wait (polled every 10 ms) adds well under a
+        # second; the barrier script below adds about 10 s.
+        parameters[0].update({
+            'output_subscriber_timeout_sec': float(
+                LaunchConfiguration('subscriber_wait_timeout_sec').perform(context)
+            ),
+        })
+    if wait_for_subscribers:
+        barrier_script = os.path.join(
+            get_package_share_directory('lidarslam'),
+            'product',
+            'scripts',
+            'wait_for_offline_output_subscribers.sh',
+        )
+        min_odom_subscribers = int(
+            LaunchConfiguration('min_odom_subscribers').perform(context)
+        )
+        min_deskewed_subscribers = int(
+            LaunchConfiguration('min_deskewed_scan_subscribers').perform(context)
+        )
+        subscriber_wait_timeout_sec = float(
+            LaunchConfiguration('subscriber_wait_timeout_sec').perform(context)
+        )
+        subscriber_settle_polls = int(
+            LaunchConfiguration('subscriber_settle_polls').perform(context)
+        )
+        # The barrier below sees subscribers through a separate process. The
+        # offline node must also wait until its own publishers have matched them,
+        # or the first scans it publishes are lost and the map starts late.
+        parameters[0].update({
+            'output_subscriber_timeout_sec': subscriber_wait_timeout_sec,
+        })
+        prefix = shlex.join([
+            barrier_script,
+            '--odom-topic',
+            '/rko_lio/odometry',
+            '--deskewed-topic',
+            '/rko_lio/frame',
+            '--min-odom',
+            str(min_odom_subscribers),
+            '--min-deskewed',
+            str(min_deskewed_subscribers),
+            '--timeout-secs',
+            # The barrier takes whole seconds; the launch default is '30.0'.
+            str(max(1, math.ceil(subscriber_wait_timeout_sec))),
+            '--settle-polls',
+            str(subscriber_settle_polls),
+            '--',
+        ])
+
+    return [
+        Node(
+            package='rko_lio',
+            executable='offline_node',
+            name='rko_lio_offline_node',
+            parameters=parameters,
+            # None, not an empty prefix: a prefix set here overrides ros2 launch's
+            # --launch-prefix (e.g. a profiler around the offline node).
+            prefix=prefix or None,
+            output='screen',
+            emulate_tty=True,
+        ),
+    ]
+
+
+def create_graph_based_slam_node(context, *args, **kwargs):
+    """Create graph_based_slam without overriding custom YAML defaults."""
+    del args
+    del kwargs
+
+    parameters = [
+        LaunchConfiguration('main_param_dir'),
+        {
+            'global_frame_id': LaunchConfiguration('global_frame_id'),
+            'use_sim_time': LaunchConfiguration('use_sim_time'),
+            'use_odom_input': True,
+            'gnss_topic': LaunchConfiguration('gnss_topic'),
+            'map_save_dir': LaunchConfiguration('save_dir'),
+            'save_pose_graph_path': PathJoinSubstitution([
+                LaunchConfiguration('save_dir'),
+                'pose_graph.g2o',
+            ]),
+            'save_map_path': PathJoinSubstitution([
+                LaunchConfiguration('save_dir'),
+                'map.pcd',
+            ]),
+        },
+    ]
+
+    overrides = {}
+    _add_optional_param_override(
+        overrides, context, 'adjacent_edge_info_weight', float,
+    )
+    _add_optional_param_override(
+        overrides, context, 'use_scan_context', _parse_bool_arg,
+    )
+    _add_optional_param_override(
+        overrides, context, 'use_pcd_cache', _parse_bool_arg,
+    )
+    _add_optional_param_override(
+        overrides, context, 'threshold_loop_closure_score', float,
+    )
+    _add_optional_param_override(
+        overrides, context, 'distance_loop_closure', float,
+    )
+    # The fork and official RKO-LIO before 0.4.1 publish the deskewed scan
+    # (cloud_input) in the LiDAR frame but the odometry pose of the base frame,
+    # so the backend applies the same LiDAR-to-base extrinsic before that pose
+    # can place the scan. A scan stamped with the base frame (official 0.4.1
+    # and later) is used as it is.
+    rko_param_file = LaunchConfiguration('rko_param_file').perform(context)
+    if rko_param_file:
+        extrinsic = load_rko_params(rko_param_file).get('extrinsic_lidar2base_quat_xyzw_xyz')
+        if extrinsic is not None:
+            overrides['extrinsic_lidar2base_quat_xyzw_xyz'] = [float(v) for v in extrinsic]
+    # Benchmark-only no-map mode.  A ``--skip-map-save`` runner must also
+    # suppress loop-triggered map writes:
+    # the graph component otherwise calls ``doPoseAdjustment(..., true)`` for
+    # accepted loop edges, independently of the /map_save service.  Keep the
+    # ordinary launch/YAML defaults untouched unless the wrapper explicitly
+    # exports this opt-in environment marker.
+    # The offline node's bag GNSS pass-through (bag_gnss:=true) publishes reliably and
+    # much faster than real time; a best-effort reader can lose the first fixes.
+    if _parse_bool_arg(LaunchConfiguration('bag_gnss').perform(context)):
+        overrides['gnss_subscriber_qos_reliable'] = True
+    if os.environ.get('LIDARSLAM_BENCHMARK_NO_MAP_ARTIFACTS') == '1':
+        overrides['use_save_map_in_loop'] = False
+        # An empty path makes optimizePoseGraph retain no save target when
+        # do_save_map is false, so the benchmark cannot leak pose_graph.g2o.
+        overrides['save_pose_graph_path'] = ''
+    if overrides:
+        parameters.append(overrides)
+
+    return [
+        Node(
+            package='graph_based_slam',
+            executable='graph_based_slam_node',
+            parameters=parameters,
+            remappings=[
+                ('odom_input', '/rko_lio/odometry'),
+                ('cloud_input', '/rko_lio/frame'),
+            ],
+            output='screen',
+        ),
+    ]
+
+
+def generate_launch_description():
+    """Create the combined RKO-LIO + graph_based_slam launch description."""
+    pkg_share = get_package_share_directory('lidarslam')
+    main_param_dir_default = os.path.join(pkg_share, 'param', 'lidarslam.yaml')
+    rviz_config_default = os.path.join(pkg_share, 'rviz', 'mapping.rviz')
+
+    return LaunchDescription([
+        DeclareLaunchArgument(
+            'main_param_dir',
+            default_value=main_param_dir_default,
+            description=(
+                'Full path to the lidarslam parameter YAML '
+                '(graph_based_slam section).'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'use_sim_time',
+            default_value='false',
+            description='Use simulation time (/clock).',
+        ),
+        DeclareLaunchArgument(
+            'rko_param_file',
+            default_value='',
+            description=(
+                'Full path to an optional RKO-LIO parameter YAML '
+                '(extrinsics, initialization, etc.).'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'global_frame_id',
+            default_value='map',
+            description='Global frame id.',
+        ),
+        DeclareLaunchArgument(
+            'save_dir',
+            default_value='.',
+            description='Directory for graph_based_slam outputs (pose_graph.g2o / map.pcd).',
+        ),
+        DeclareLaunchArgument(
+            'bag_path',
+            default_value='',
+            description='Path to the rosbag to play (required for offline_node).',
+        ),
+        DeclareLaunchArgument(
+            'lidar_topic',
+            default_value='/os_cloud_node/points',
+            description='LiDAR point-cloud topic.',
+        ),
+        DeclareLaunchArgument(
+            'imu_topic',
+            default_value='/os_cloud_node/imu',
+            description='IMU topic.',
+        ),
+        DeclareLaunchArgument(
+            'gnss_topic',
+            default_value='/gnss/fix',
+            description='NavSatFix topic for graph_based_slam when use_gnss:=true.',
+        ),
+        DeclareLaunchArgument(
+            'bag_gnss',
+            default_value='false',
+            description=(
+                "Have the offline node publish the bag's gnss_topic NavSatFix messages "
+                'so graph_based_slam can anchor the map (set use_gnss: true in '
+                'main_param_dir). The offline node then also waits for the GNSS subscriber.'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'base_frame',
+            default_value='base_link',
+            description='Robot base frame (odometry is expressed in this frame).',
+        ),
+        DeclareLaunchArgument(
+            'odom_frame',
+            default_value='odom',
+            description='Odometry parent frame.',
+        ),
+        DeclareLaunchArgument(
+            'lidar_frame',
+            default_value='',
+            description='LiDAR frame id (empty = read from message header).',
+        ),
+        DeclareLaunchArgument(
+            'imu_frame',
+            default_value='',
+            description='IMU frame id (empty = read from message header).',
+        ),
+        DeclareLaunchArgument(
+            'deskew',
+            default_value='true',
+            description='Enable point-cloud deskewing.',
+        ),
+        DeclareLaunchArgument(
+            'voxel_size',
+            default_value='1.0',
+            description='Local-map voxel size (m).',
+        ),
+        DeclareLaunchArgument(
+            'max_range',
+            default_value='100.0',
+            description='Max valid LiDAR range (m).',
+        ),
+        DeclareLaunchArgument(
+            'min_range',
+            default_value='1.0',
+            description='Min valid LiDAR range (m).',
+        ),
+        DeclareLaunchArgument(
+            'initialization_phase',
+            default_value='false',
+            description='Use IMU data between first two frames to initialise bias/orientation.',
+        ),
+        DeclareLaunchArgument(
+            'skip_to_time',
+            default_value='0.0',
+            description='Skip to this timestamp in the bag (seconds).',
+        ),
+        DeclareLaunchArgument(
+            'wait_for_backend',
+            default_value='true',
+            description=(
+                'The offline node reads the bag only once its odometry and scan '
+                'outputs have subscribers (graph_based_slam), so no scan is lost '
+                'at the start (subscriber_wait_timeout_sec).'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'wait_for_output_subscribers',
+            default_value='false',
+            description='Wait for required output subscribers before reading the bag.',
+        ),
+        DeclareLaunchArgument(
+            'min_odom_subscribers',
+            default_value='1',
+            description='Required odometry subscriber count for the offline start barrier.',
+        ),
+        DeclareLaunchArgument(
+            'min_deskewed_scan_subscribers',
+            default_value='1',
+            description='Required deskewed-scan subscriber count for the offline start barrier.',
+        ),
+        DeclareLaunchArgument(
+            'subscriber_wait_timeout_sec',
+            default_value='30.0',
+            description='Fail if offline output subscribers are not ready by this timeout.',
+        ),
+        DeclareLaunchArgument(
+            'subscriber_settle_polls',
+            default_value='3',
+            description=(
+                'Consecutive subscriber-ready polls required before bag '
+                'processing starts.'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'dump_results',
+            default_value='false',
+            description='Dump RKO-LIO trajectory to disk on exit.',
+        ),
+        DeclareLaunchArgument(
+            'results_dir',
+            default_value='results',
+            description='Output directory for RKO-LIO results.',
+        ),
+        DeclareLaunchArgument(
+            'run_name',
+            default_value='rko_lio_run',
+            description='Run name tag for RKO-LIO results.',
+        ),
+        DeclareLaunchArgument(
+            'adjacent_edge_info_weight',
+            default_value='',
+            description='Optional override for adjacent_edge_info_weight.',
+        ),
+        DeclareLaunchArgument(
+            'use_scan_context',
+            default_value='',
+            description='Optional override for use_scan_context.',
+        ),
+        DeclareLaunchArgument(
+            'use_pcd_cache',
+            default_value='',
+            description='Optional override for use_pcd_cache.',
+        ),
+        DeclareLaunchArgument(
+            'threshold_loop_closure_score',
+            default_value='',
+            description='Optional override for threshold_loop_closure_score.',
+        ),
+        DeclareLaunchArgument(
+            'distance_loop_closure',
+            default_value='',
+            description='Optional override for distance_loop_closure.',
+        ),
+        DeclareLaunchArgument(
+            'publish_static_tf',
+            default_value='true',
+            description='Publish a static TF between two configurable frames.',
+        ),
+        DeclareLaunchArgument(
+            'static_tf_parent',
+            default_value='os_sensor',
+            description='Parent frame for the static TF.',
+        ),
+        DeclareLaunchArgument(
+            'static_tf_child',
+            default_value='os_imu',
+            description='Child frame for the static TF.',
+        ),
+        DeclareLaunchArgument('static_tf_x', default_value='0.006253'),
+        DeclareLaunchArgument('static_tf_y', default_value='-0.011775'),
+        DeclareLaunchArgument('static_tf_z', default_value='0.007645'),
+        DeclareLaunchArgument('static_tf_qx', default_value='0'),
+        DeclareLaunchArgument('static_tf_qy', default_value='0'),
+        DeclareLaunchArgument('static_tf_qz', default_value='0'),
+        DeclareLaunchArgument('static_tf_qw', default_value='1'),
+        DeclareLaunchArgument(
+            'use_rviz',
+            default_value='false',
+            description='Start RViz.',
+        ),
+        DeclareLaunchArgument(
+            'rviz_config',
+            default_value=rviz_config_default,
+            description='Full path to the RViz config file.',
+        ),
+        OpaqueFunction(function=create_rko_offline_node),
+        OpaqueFunction(function=create_graph_based_slam_node),
+        Node(
+            package='tf2_ros',
+            executable='static_transform_publisher',
+            arguments=[
+                LaunchConfiguration('static_tf_x'),
+                LaunchConfiguration('static_tf_y'),
+                LaunchConfiguration('static_tf_z'),
+                LaunchConfiguration('static_tf_qx'),
+                LaunchConfiguration('static_tf_qy'),
+                LaunchConfiguration('static_tf_qz'),
+                LaunchConfiguration('static_tf_qw'),
+                LaunchConfiguration('static_tf_parent'),
+                LaunchConfiguration('static_tf_child'),
+            ],
+            condition=IfCondition(LaunchConfiguration('publish_static_tf')),
+        ),
+        Node(
+            package='rviz2',
+            executable='rviz2',
+            parameters=[{'use_sim_time': LaunchConfiguration('use_sim_time')}],
+            arguments=['-d', LaunchConfiguration('rviz_config')],
+            condition=IfCondition(LaunchConfiguration('use_rviz')),
+            output='screen',
+        ),
+    ])

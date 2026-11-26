@@ -1,0 +1,1134 @@
+# Benchmarking And Release Gate
+
+This page describes the recommended benchmark path and the release/readiness
+gate used for the default permissive workflow.
+
+> **Reading guide.** New to benchmarking? Read
+> [Recommended Benchmark](#recommended-benchmark), then the release gate in
+> [Release/Readiness Gate](#releasereadiness-gate). The two-system comparison
+> tooling (competitive evidence bundles, GT-blind holdouts, runtime phase
+> contracts and the GLIM / FAST-LIVO2 runners) was retired after `v0.11.0`;
+> its procedures are in
+> [this page at that tag](https://github.com/rsasaki0109/lidar_slam_ros2/blob/v0.11.0/docs/benchmarking.md).
+
+## Recommended Benchmark
+
+The standard benchmark path for this repository is:
+
+```bash
+bash scripts/download_ntu_viral_tnp01.sh --dry-run
+bash scripts/download_ntu_viral_tnp01.sh
+bash scripts/run_rko_lio_graph_benchmark.sh
+```
+
+The dry run performs no write or network request. It shows which download,
+extraction, conversion, and restamping phases remain; pins the official archive
+size and checksum; and compares the conservative additional working-set
+estimate with the destination filesystem. A fresh full preparation currently
+needs about 49 GB free because the official archive, ROS 1 bag, converted
+rosbag2, and RKO-LIO restamped bag coexist until completion. If the repository
+filesystem is smaller, the planner looks only for sufficiently large
+attached-but-unmounted Linux hotplug/USB filesystems. It reports partition size
+as `UNVERIFIED_UNTIL_MOUNTED`, never treats that size as free capacity, and
+selects one mount action without mounting or probing the device itself.
+
+After mounting the reported device, use the device identity directly:
+
+```bash
+udisksctl mount -b /dev/sda1
+bash scripts/download_ntu_viral_tnp01.sh \
+  --dest-device /dev/sda1 \
+  --dry-run
+```
+
+`--dest-device` resolves exactly one current mountpoint, appends `ntu_viral`,
+and reruns the real free-space check. Remove only `--dry-run` after `READY`.
+The discovery path creates no directory, starts no network request, does not
+request or bypass authorization, and preserves the selected conversion options
+in its copy-ready preflight and live commands.
+
+For a manually managed filesystem, keep the data out of the checkout with:
+
+```bash
+bash scripts/download_ntu_viral_tnp01.sh \
+  --dest /path/on/large-disk/ntu_viral
+bash scripts/run_rko_lio_graph_benchmark.sh \
+  --bag /path/on/large-disk/ntu_viral/tnp_01_points_restamped_vn100_rosbag2 \
+  --reference-bag /path/on/large-disk/ntu_viral/tnp_01_rosbag2
+```
+
+The live acquisition fails before starting `wget` when the destination cannot
+hold its remaining phases. A cached archive is never extracted until its exact
+official byte count and MD5 identity pass. The shared storage helper and NTU
+acquisition script are both included in the curated release bundle.
+
+## GLIM cross-validation
+
+Use the existing comparison harness when the same rosbag2 input should be run
+through both products:
+
+```bash
+bash scripts/compare_with_glim.sh \
+  --bag /path/to/rosbag2 \
+  --out-dir output/compare_glim
+```
+
+GLIM is a cross-validation reference in this workflow, not ground truth. A
+fresh GLIM trajectory is cached only after its TUM structure and timestamps
+pass validation. If a later fresh GLIM run does not produce a trajectory, the
+harness accepts a fallback only when all of the following match:
+
+- the complete rosbag2 directory bytes and relative file layout;
+- the effective GLIM configuration bytes;
+- the Docker image ID, or the selected local GLIM runtime artifacts;
+- topics, mode, preset, IMU/viewer/OMP options; and
+- the comparison harness and cache-helper implementations.
+
+Each entry has a schema-validated manifest that binds this path-free identity
+to the trajectory SHA-256, byte count, and pose count. A missing, contradictory,
+symlinked, malformed, or modified artifact is a cache miss; the old
+path/topic-only cache format is never imported. The run records
+`glim.cache.status` and the key in `metrics.json`, and writes the observed
+identity to `glim_cache_identity.json` under the run directory.
+
+Use `--no-glim-cache` when a fresh GLIM execution is mandatory. A verified
+cache hit may support technical continuity during a failed fresh run, but it
+does not prove current GLIM installation usability, current runtime success, a
+new benchmark result, or a comparative winner.
+
+## Newer College Maths-Hard
+
+`newer_college_math_hard` is the tightest blocking release profile. It refers
+to the Multi-Camera Newer College **Maths-Hard** sequence: Ouster OS0-128,
+243.7 seconds, and approximately 320.6 m. Its reference is the official 10 Hz
+LiDAR ground-truth trajectory produced by registering each Ouster cloud to the
+survey-grade Leica BLK360 prior map. It is not prism ground truth.
+
+The dataset is CC BY-NC-SA 4.0 and the maintainers distribute it through the
+[official request form](https://ori-drs.github.io/newer-college-dataset/download/).
+The repository must not silently scrape, rehost, or relabel those
+non-commercial assets. Before running this profile, request and retain all
+three collection-specific inputs:
+
+- the Collection 3 `Maths-Hard` ROS bag;
+- the LiDAR ground-truth CSV, whose columns are epoch seconds, nanoseconds,
+  position xyz, and quaternion xyzw;
+- the matching Collection 3 calibration files.
+
+The expected sensor topics are `/os_cloud_node/points` and
+`/os_cloud_node/imu`. Convert the delivered ROS 1 bag without changing message
+timestamps:
+
+```bash
+rosbags-convert \
+  --src /path/to/maths-hard.bag \
+  --dst /path/to/math_hard_rosbag2
+```
+
+Generate immutable TUM and metadata artifacts from the official CSV. The
+body-to-reference translation must come from the matching calibration; all
+three values are required so the command cannot silently assume identity:
+
+```bash
+python3 scripts/generate_newer_college_reference.py \
+  --csv /path/to/maths-hard-lidar-gt.csv \
+  --calibration /path/to/collection3-calibration.yaml \
+  --output /path/to/math_hard_gt.tum \
+  --metadata /path/to/math_hard_reference.json \
+  --body-to-reference-x <metres> \
+  --body-to-reference-y <metres> \
+  --body-to-reference-z <metres>
+```
+
+Create the matching RKO-LIO parameter YAML from the same calibration, then run:
+
+```bash
+bash scripts/run_rko_lio_graph_benchmark.sh \
+  --bag /path/to/math_hard_rosbag2 \
+  --reference-tum /path/to/math_hard_gt.tum \
+  --reference-meta /path/to/math_hard_reference.json \
+  --lidar-topic /os_cloud_node/points \
+  --imu-topic /os_cloud_node/imu \
+  --base-frame base \
+  --rko-param /path/to/rko_lio_math_hard.yaml \
+  --lidarslam-param graph_based_slam/param/graphbasedslam_indoor.yaml \
+  --output-dir /path/to/benchmarks/newer_college_math_hard_<commit> \
+  --run-name newer_college_math_hard_<commit> \
+  --skip-reference-gen \
+  --reference-source newer_college_math_hard_icp_map_gt
+```
+
+Do not invent an identity extrinsic or a reference-frame offset. The
+collection calibration must determine the RKO-LIO LiDAR/IMU-to-`base`
+parameters and the `body_to_reference_translation_m` recorded in the reference
+metadata. A run without those exact inputs is useful for diagnosis but is not
+eligible for the 0.10 m release gate. `--fail-on-profiles` prints this
+remediation path when exact candidate-commit evidence is absent.
+
+The maintained Maths-Hard profile also sets:
+
+```yaml
+double_downsample: true
+legacy_voxel_downsample: true
+```
+
+This is a measured dataset-specific compatibility setting, not the product
+default. The RKO-LIO v0.3 hash-sorted first pass regressed this sequence from
+0.081 m to 0.141 m APE. Compatibility mode restores the complete pre-v0.3
+two-pass sampler; omitting it does not reproduce the blocking profile. The
+modern default remains `false` and is separately covered by the NTU VIRAL and
+RTK-SLAM release profiles. See the
+[clean-candidate evidence](evidence/rko-voxel-compatibility-2026-07-31.md).
+
+### Degenerate-LIO SOTA track
+
+The preregistered public degeneracy track is defined in
+`configs/slam_benchmark_profiles/degenerate_lio_sota_v1.yaml`. It begins with
+ENWIDE TunnelS/TunnelD and forbids radar, wheel odometry, GNSS, cameras,
+per-sequence tuning, and scale alignment. Download exact official inputs with:
+
+```bash
+bash scripts/download_enwide.sh \
+  --sequence tunnel_d \
+  --dest datasets/enwide \
+  --convert
+```
+
+The profile remains report-only until all ENWIDE and GEODE degenerate
+sequences, pinned rivals, and the hidden holdout are complete. See
+`docs/research/enwide-sota-benchmark-plan-2026-07.md` for the claim policy.
+Use `scripts/run_enwide_sota_benchmark.sh` for the fixed three-repetition
+candidate run; sensor and scoring choices are deliberately not command-line
+options.
+
+### Radar-less tunnel frontend A/B
+
+The radar-less tunnel research track has a frontend-only control/candidate
+runner. It uses isolated DDS domains, stops `offline_node` with `SIGINT` after
+odometry becomes quiet, and records the exact parameter layers, Git SHAs, TUM
+trajectories, and comparison metrics:
+
+```bash
+bash scripts/run_radarless_tunnel_ab.sh \
+  --sequence tunnel \
+  --output-root /media/<ssd>/benchmarks/radarless_tunnel_adaptive_v1
+```
+
+Use `--candidate-param name:=value` for a focused override and `--dry-run` to
+freeze the commands without starting ROS. Run `--sequence fog` as the first
+negative check. HILTI exp07 and MID-360 are also supported with explicit
+`--bag`, topic, base-parameter, and optional reference arguments. The runner
+intentionally rejects exp02, exp03, and exp21 because they are reserved final
+holdouts.
+
+`comparison.json` includes endpoint/path metrics, time-aligned reach-ratio
+quantiles after the first 10 m of reference motion, and an SE(3)-aligned
+translation delta. It also records candidate overrides and the velocity-blend
+diagnostic summary when present. For an existing trajectory, the same evaluator
+can be run directly:
+
+```bash
+python3 scripts/evaluate_degeneracy_trajectory.py <candidate.tum> \
+  --reference-trajectory <dense-reference.tum>
+```
+
+## RTK-SLAM exact acquisition
+
+Plan the smallest official ROS2 sequence and pinned surveyed-checkpoint assets
+before committing disk space or network time:
+
+```bash
+python3 scripts/download_rtk_slam_dataset.py \
+  --sequence construction_seq2 \
+  --eval-assets \
+  --dest /mnt/large/rtk_slam \
+  --dry-run
+```
+
+This standalone acquisition helper is included in the curated release bundle,
+so the command also works from its extracted `release_bundle/` directory. The
+measured accuracy suite below must run from the exact source checkout in a
+compatible built ROS workspace; the curated bundle is an audit and acquisition
+packet, not a replacement for that runtime workspace.
+
+`--dry-run` performs no download, Git fetch, directory creation, or other
+write. It reports the immutable dataset revision, exact size and SHA-256 of
+each DB3 and metadata file, already-present resumable bytes, remaining payload,
+filesystem reserve, observed free bytes, exact shortfall, and a copy-ready
+external-destination recovery. When Linux exposes a sufficiently large
+attached-but-unmounted hotplug filesystem, the plan lists its device,
+filesystem, partition size, and optional model/label, then makes mounting it
+the single next action. It never mounts or probes the filesystem itself, and
+marks free space unknown until the user mounts it. The follow-up command reruns
+`--dry-run --dest-device /dev/...`; the helper resolves the actual mount path
+and appends `rtk_slam`, so no mount-path placeholder needs editing. It shows
+the matching live command only after that exact filesystem reports `READY`.
+Add `--json` for the same structured plan. Use `--list` to inspect all four
+exact sequence identities without network access.
+
+When the mounted-path plan reports `READY`, remove only `--dry-run`. The live
+command checks
+capacity before its first write or network request, resumes a smaller regular
+file, and verifies exact size plus SHA-256 before accepting it. A same-size
+wrong file, oversized file, non-regular path, or symlink fails closed with a
+recovery action. Evaluation assets are fetched at commit
+`f2921a58caf5a87c1f4f73b48c6f2a5e35f92924`, never a moving default branch.
+
+After acquisition, validate and preview the measured suite without starting
+ROS:
+
+```bash
+python3 scripts/run_rtk_slam_accuracy_suite.py \
+  --dataset-root /mnt/large/rtk_slam \
+  --sequence construction_seq2 \
+  --dry-run
+```
+
+Repeat with `construction_seq1`, or pass `--sequence all` for the complete
+four-sequence suite. Acquisition readiness is not benchmark evidence: the two
+blocking release rows require fresh exact-candidate outputs from Construction
+Seq2 and Construction Seq1.
+
+## SLAM candidate regression
+
+Run plane-revisit OFF/ON with the same backend input and reference:
+
+```bash
+bash scripts/run_plane_revisit_candidate_benchmark.sh \
+  --dataset mid360_public --bag <backend-input-bag> \
+  --reference-tum <reference.tum> --fixed-loop-edges <verified.csv> \
+  --output-dir /media/<ssd>/benchmarks/phase7/mid360
+```
+
+Repeat with `hilti_exp04` and `rtkslam_construction_seq2`. Construction Seq2 is
+the required second positive sequence; its total-station checkpoints contain
+positions but no surveyed orientations, so rotational RPE is forbidden.
+`--dry-run` prints the pipeline without starting ROS. For submap-rate backend
+poses, supply the matching frontend trajectory with `--dense-raw-tum`.
+
+To create a deterministic backend input from the original sensor bag:
+
+```bash
+ROS_DOMAIN_ID=210 ROS_LOCALHOST_ONLY=1 \
+bash scripts/record_backend_input.sh --output-dir <work>/backend_input -- \
+  bash scripts/run_rko_lio_graph_benchmark.sh \
+    --bag <construction_seq2> --lidar-topic /livox/points \
+    --imu-topic /livox/imu --skip-reference-gen \
+    --reference-tum <construction_seq2_gt.tum> \
+    --reference-meta <construction_seq2_reference.json> \
+    --rko-param configs/mid360_robot/rko_lio_mid360_low_voxel_no_deskew.yaml \
+    --lidarslam-param lidarslam/param/lidarslam.yaml \
+    --output-dir <work>/source_run --offline-timeout-secs 5400
+```
+
+The recorder refuses overwrite, flushes MCAP on exit, and requires non-empty
+`/rko_lio/odometry` and `/rko_lio/frame` topics. When `--dense-raw-tum` is
+supplied to the candidate runner, its timestamp span is used as the runtime
+denominator; backend bags use processing time, not original sensor time.
+Compare the three dataset pairs:
+
+```bash
+python3 scripts/evaluate_slam_candidate_regression.py \
+  --baseline <mid360-off>/cross_repo_benchmark.json \
+  --baseline <hilti-off>/cross_repo_benchmark.json \
+  --baseline <construction-seq2-off>/cross_repo_benchmark.json \
+  --candidate <mid360-on>/cross_repo_benchmark.json \
+  --candidate <hilti-on>/cross_repo_benchmark.json \
+  --candidate <construction-seq2-on>/cross_repo_benchmark.json \
+  --output output/phase7/candidate_regression.json --require-pass
+```
+
+Promotion requires complete reports, matching inputs, bounded runtime and map
+quality, and independently improved MID-360 and Construction Seq2 trajectories.
+
+When aggregate ATE hides which surveyed positions changed, generate a
+checkpoint-level JSON and Markdown report:
+
+```bash
+python3 scripts/analyze_sparse_checkpoint_errors.py \
+  --reference-tum <surveyed-positions.tum> \
+  --reference-csv <checkpoint-labels.csv> \
+  --estimate raw=<raw.tum> --estimate baseline=<off-dense.tum> \
+  --estimate candidate=<on-dense.tum> --baseline-label baseline \
+  --output <suite>/checkpoint_errors.json
+```
+
+Each trajectory is independently SE(3)-aligned without scale before per-point
+errors are compared, matching the position-only public-suite ATE semantics.
+
+That wrapper:
+
+- uses the bundled NTU VIRAL `rosbag2`
+- selects the validated `lidarslam/param/lidarslam_ntu_viral.yaml` graph profile
+- uses the official-calibration `rko_lio_ntu_viral.yaml` frontend profile with
+  the bounded tnp_01 voxel/gravity tuning and offline output backpressure
+- runs `RKO-LIO + graph_based_slam`
+- waits for graph ingestion to become quiescent before the final map save
+- saves raw and corrected trajectories
+- computes APE against the Leica prism reference
+- verifies the Autoware map bundle when present
+- writes `metrics.json` for the reporting pipeline
+
+### Cross-repository suite (Localization Zoo)
+
+`public_suite_v1.yaml` connects Localization Zoo trajectories to trajectory,
+geometry, real-RGB, runtime, and memory gates:
+
+```bash
+python3 scripts/run_cross_repo_slam_benchmark.py \
+  --localization-zoo ../loc_zoo_ws/localization_zoo \
+  --dataset <profile> --gt-tum <gt.tum> --raw-tum <raw.tum> \
+  --corrected-tum <graph.tum> --runtime-report <runtime.json> \
+  --out-dir <benchmark-dir>
+```
+
+Candidate promotion compares frozen OFF/ON manifests from MID-360, the HILTI
+position-only holdout, and RTK-SLAM Construction Seq2 surveyed checkpoints.
+The gate never invents rotational RPE for position-only references. The
+initial result is recorded in the
+[Phase 7 regression note](research/phase7-plane-revisit-regression-2026-07.md);
+the second-positive rejection is in the
+[Phase 8 RTK-SLAM note](research/phase8-rtkslam-plane-revisit-2026-07.md).
+
+## KITTI / LiDAR-Only Evaluation
+
+The public default benchmark remains `RKO-LIO + graph_based_slam`. For KITTI
+Odometry, use the separate LiDAR-only path because the Velodyne dataset does
+not provide IMU messages.
+
+```bash
+bash scripts/download_kitti_odometry.sh --velodyne
+export KITTI_ODOMETRY_ROOT="$PWD/datasets/KITTI_odometry"
+bash scripts/run_kitti_odometry_benchmark.sh --sequence 00 --small-gicp --force-prepare
+```
+
+For frontend tuning, run the sweep wrapper:
+
+```bash
+bash scripts/sweep_kitti_small_gicp.sh \
+  --dataset "$KITTI_ODOMETRY_ROOT" \
+  --sequences "00 05 07"
+```
+
+The LO and `small_gicp` wrappers generate a rosbag2 QoS override so PointCloud2
+playback uses `best_effort`, matching the frontend sensor-data subscriptions.
+
+## Optional 3D-BBS Verification
+
+`graph_based_slam` can build MIT-licensed 3D-BBS support from
+`Thirdparty/3d_bbs`. This is an optional verifier for Scan Context loop
+candidates, not part of the default public benchmark path.
+
+Build behavior:
+
+- enabled at build time when `GRAPH_BASED_SLAM_ENABLE_3D_BBS=ON` and the vendor
+  headers are present
+- disabled at runtime unless `use_3d_bbs_for_scan_context: true` is set
+- force-disabled with
+  `colcon build --symlink-install --cmake-args -DGRAPH_BASED_SLAM_ENABLE_3D_BBS=OFF`
+
+MID-360 wrapper example (research track, `report_only_until: v0.4` in
+`scripts/release_profiles.yaml`):
+
+```bash
+bash scripts/run_rko_lio_mid360_crossval_benchmark.sh \
+  --use-3d-bbs-for-scan-context true
+```
+
+Typical outputs are written under:
+
+- `output/bench_rko_lio_ntu_viral_<name>/traj_raw_prism.tum`
+- `output/bench_rko_lio_ntu_viral_<name>/traj_corrected_sparse.tum`
+- `output/bench_rko_lio_ntu_viral_<name>/traj_corrected_prism.tum`
+- `output/bench_rko_lio_ntu_viral_<name>/ape_raw_vs_gt.txt`
+- `output/bench_rko_lio_ntu_viral_<name>/ape_corrected_vs_gt.txt`
+- `output/bench_rko_lio_ntu_viral_<name>/metrics.json`
+
+`traj_corrected_sparse.tum` preserves the optimized graph-node poses emitted
+by `/modified_path`. The canonical `traj_corrected.tum` and
+`traj_corrected_prism.tum` propagate those corrections onto every raw pose, so
+the corrected APE and `metrics.json` describe a full-rate trajectory rather
+than sparse nearest-neighbour samples.
+
+## Loop Cloud-Overlap Gate
+
+After registration, the backend can require a fraction of aligned source
+points to have target-cloud support. `loop_min_overlap_ratio: 0.0` keeps the
+gate disabled for backward compatibility; `loop_overlap_max_distance_m`
+defines the nearest-neighbor support radius. The cheap fitness and correction
+gates run first, so rejected registrations do not pay the KD-tree cost.
+
+Construction Seq2 validated the following dataset-specific candidate:
+
+```yaml
+loop_min_overlap_ratio: 0.76
+loop_overlap_max_distance_m: 0.5
+```
+
+The ratio rejected the harmful `57 -> 123` revisit and its adjacent
+substitutes while retaining five beneficial loop edges. Do not promote this
+threshold to a general default until it passes the other release datasets.
+
+For a cross-sensor candidate, the source-overlap threshold can be explicitly
+relaxed only when registration applies a large translation correction:
+
+```yaml
+loop_min_overlap_ratio: 0.76
+loop_min_overlap_ratio_large_correction: 0.70
+loop_overlap_large_correction_translation_m: 1.0
+loop_overlap_max_distance_m: 0.5
+```
+
+The effective threshold is 0.76 below 1.0 m correction and 0.70 at or above
+it. Leaving either large-correction parameter at zero disables the override.
+The candidate preserved the established MID-360 loop, rejected the HILTI
+exp04 false loop, retained Construction Seq2's five verified edges, and
+preserved KITTI 00's `28 -> 176` loop (source overlap 0.864002) with
+byte-identical edge and trajectory artifacts. The generic YAML default remains
+disabled while broader release validation is pending. Reverse and harmonic
+overlap are emitted in debug logs for diagnosis, but are not acceptance gates
+because target aggregation extent biases them.
+
+Accepted candidates and debug attempts also report `support_rmse_m` and
+`support_p90_m`. These are nearest-neighbour distances for source points that
+fall within `loop_overlap_max_distance_m`; they reuse the overlap KD-tree and
+do not launch another search. Treat them as diagnostics, not gates: repeated
+geometry can produce low support residuals at the wrong longitudinal offset.
+The p90 calculation uses linear-time selection rather than sorting all
+supported points.
+
+HILTI exp01/exp07 can be frozen and compared end to end with one command. Raw
+bags and generated backend MCAPs stay on the external SSD by default:
+
+```bash
+bash scripts/run_hilti_overlap_crossval.sh --sequence all --runs 2
+```
+
+Use `--dry-run` to inspect every command, `--record-only` to stop after input
+capture, or `--offline-only --resume` to reuse an existing capture. Each
+sequence writes `comparison.json` and `comparison.md` beside `gate_off/` and
+`gate_adaptive/`. The capture stage generates a parameter snapshot that keeps
+submap publication active but disables expensive live loop registration; both
+offline variants then consume the exact same odometry/cloud pairs.
+
+## Summaries And HTML Report
+
+To summarize all collected runs:
+
+```bash
+python3 scripts/benchmark_summary.py \
+  --root output \
+  --write-md output/benchmark_summary.md \
+  --write-csv output/benchmark_summary.csv
+```
+
+To generate the static HTML report:
+
+```bash
+python3 scripts/generate_html_report.py \
+  --root output \
+  --out output/latest_report.html
+```
+
+To generate a short public-beta readiness report from the current local
+artifacts:
+
+```bash
+python3 scripts/generate_v2_beta_readiness_report.py
+```
+
+By default this writes:
+
+- `output/v2_beta_readiness_<YYYYMMDD>.md`
+
+To generate a short public-facing map-authoring positioning report from the
+tracked benchmark, GNSS, dynamic-filter, and classic-path artifacts:
+
+```bash
+python3 scripts/generate_map_authoring_report.py \
+  --out output/map_authoring_report_$(date +%Y%m%d).md \
+  --write-json output/map_authoring_report_$(date +%Y%m%d).json
+```
+
+To stage a reusable submission-style bundle from an existing run directory:
+
+```bash
+bash scripts/create_map_authoring_submission_bundle.sh \
+  output/bench_rko_lio_ntu_viral_fresh_20260324 \
+  output/submission_bundle_ntu_viral_fresh \
+  --report output/map_authoring_report_$(date +%Y%m%d).md \
+  --verify-map
+```
+
+That bundle standardizes:
+
+- `pointcloud_map/`
+- `map_projector_info.yaml`
+- `metrics.json` when present
+- trajectories and key logs when present
+- focused reports under `reports/`, with sibling `json/svg` copied automatically when present
+- `map_qa_summary.md`
+- `manifest.json`
+
+To generate a separate stress-validation report that distinguishes the current
+default path from older long-loop and hard-dataset evidence:
+
+```bash
+python3 scripts/generate_stress_validation_report.py
+```
+
+By default this writes:
+
+- `output/stress_validation_report_<YYYYMMDD>.md`
+
+To summarize dynamic-object-filter behavior across the tracked Leo Drive
+save-time benchmarks:
+
+```bash
+python3 scripts/generate_dynamic_object_filter_validation_report.py \
+  --out output/dynamic_object_filter_validation_report_$(date +%Y%m%d).md \
+  --write-json output/dynamic_object_filter_validation_report_$(date +%Y%m%d).json \
+  --write-svg output/dynamic_object_filter_validation_report_$(date +%Y%m%d).svg
+```
+
+The default report compares the tracked `bag1` and `bag6` dynamic-filter
+benchmarks, so point reduction and voxel-removal behavior can be discussed as
+cross-dataset evidence rather than a single-case anecdote. It also reports
+coarse tile-footprint preservation via shared metadata tiles, tile jaccard,
+and filtered-tile overlap ratio.
+
+To promote an already-recorded aligned cross-validation run such as the MID360
+long-loop check into `metrics.json` so it appears in `benchmark_summary.md` and
+`latest_report.html`:
+
+```bash
+python3 scripts/write_aligned_trajectory_metrics.py \
+  --out-dir output/bench_rko_lio_mid360_v3 \
+  --bag demo_data/glim_mid360/rosbag2_2024_04_16-14_17_01 \
+  --reference-tum output/glim_mid360_reference.tum \
+  --corrected-tum output/bench_rko_lio_mid360_v3/traj_corrected.tum \
+  --raw-tum output/bench_rko_lio_mid360_v3/traj_raw.tum \
+  --graph-log output/bench_rko_lio_mid360_v3/graph_slam.log \
+  --parameter-file output/bench_rko_lio_mid360_v3/graph_params.effective.yaml \
+  --benchmark-harness scripts/run_rko_lio_mid360_crossval_benchmark.sh \
+  --runtime-artifact rko_lio_offline_node=install/rko_lio/lib/rko_lio/offline_node \
+  --runtime-artifact graph_based_slam_node=install/graph_based_slam/lib/graph_based_slam/graph_based_slam_node \
+  --reference-source glim_mid360_reference \
+  --reference-kind cross_validation \
+  --reference-label GLIM \
+  --points-topic /livox/lidar \
+  --points-frame livox_frame \
+  --robot-frame livox_frame
+```
+
+The summary/report pipeline now exposes the reference kind, so `ground_truth`
+and `cross_validation` runs do not appear as if they were the same type of APE.
+The writer also hashes rosbag2 metadata and storage, the reference trajectory,
+effective parameters, benchmark harness, metrics writer, and every declared
+runtime artifact. It records the source commit and dirty state. Every shipped
+release profile requires this complete provenance from a clean revision;
+legacy, incomplete, or dirty evidence evaluates as `NO_DATA` and therefore
+cannot satisfy a blocking release profile. “Clean” includes untracked files,
+because an untracked source or build input can otherwise alter a binary without
+changing the recorded commit. The release-profile table's `evidence` column
+distinguishes “no matching run” from candidate runs rejected for incomplete
+provenance or a dirty revision.
+
+For a public-facing snapshot built on top of these artifacts, see
+`docs/comparison.md` and `docs/releases/v0.2.2.md`.
+
+To rerun the current MID360 cross-validation benchmark end-to-end:
+
+```bash
+bash scripts/run_rko_lio_mid360_crossval_benchmark.sh
+```
+
+This MID360 wrapper defaults to a tuned `RKO-LIO + graph_based_slam` profile
+with `voxel_size=0.5`, `max_range=80.0`, `search_submap_num=5`,
+`loop_edge_dedup_index_window=20`, and `loop_edge_info_weight=200`.
+
+To benchmark the real open-data Leo Drive `driving_30_kmh` bag with mixed
+RTK/non-RTK GNSS quality:
+
+```bash
+git clone --depth=1 https://github.com/autowarefoundation/applanix.git /tmp/applanix
+bash scripts/run_open_data_applanix_velodyne_gnss_benchmark.sh \
+  --bag demo_data/autoware_leo_drive_isuzu/driving_30_kmh_2022_06_10-15_47_42_compressed \
+  --applanix-msg-dir /tmp/applanix/applanix_msgs/msg \
+  --verify-map
+```
+
+That wrapper writes a local `Applanix_GSOF49` reference trajectory,
+`traj_raw.tum`, `traj_corrected.tum`, and `metrics.json` so the run appears in
+`benchmark_summary.md` and `latest_report.html`.
+
+For rosbag2 `compression_mode: FILE` inputs, the wrapper plays a private view
+inside the output directory. ROS 2 may decompress the storage file while it
+plays, but that temporary database is removed with the private view when the
+run exits; the source bag directory remains unchanged.
+
+When the main bag already contains native `sensor_msgs/msg/NavSatFix` or
+`sensor_msgs/msg/Imu`, the same wrapper now prefers those real topics before it
+falls back to Applanix sidecar generation.
+
+Current Leo Drive packet-path evidence is:
+
+- `driving_30_kmh`, GNSS-only classic path: `APE RMSE 195.285 m`
+- `bag1_front`, default GNSS-only path: `APE RMSE 0.139 m`
+- `bag1_front`, native `/sensing/imu/imu_data`: `APE RMSE 0.251 m`
+- `bag6_front`, `no_imu`: `APE RMSE 0.422 m`
+- `bag6_front`, native `/sensing/imu/imu_data`: `APE RMSE 0.365 m`
+
+The important result is that packet IMU deskew is usable on the native
+`all-sensors` bags, but only when the benchmark is replayed conservatively.
+The benchmark now defaults to `rate=1.0` for every configuration and
+deterministically prefers a `/front/` packet topic when a bag contains several
+Velodyne streams. The exact-revision
+[bag1 evidence](evidence/leo-drive-packet-benchmark-2026-07-30.md) records the
+input, software, and output hashes. The earlier `20m+` regressions were
+runtime-sensitivity and sensor-selection artifacts, not proof that the deskew
+math itself was fundamentally broken. To reproduce the current experimental
+IMU result on the driving bag:
+
+```bash
+git clone --depth=1 https://github.com/autowarefoundation/applanix.git /tmp/applanix
+bash scripts/run_open_data_applanix_velodyne_gnss_benchmark.sh \
+  --bag demo_data/autoware_leo_drive_isuzu/driving_30_kmh_2022_06_10-15_47_42_compressed \
+  --applanix-msg-dir /tmp/applanix/applanix_msgs/msg \
+  --use-imu true \
+  --tf-bag demo_data/autoware_leo_drive_isuzu/all-sensors-bag6_compressed \
+  --robot-frame-id base_link \
+  --imu-frame-id base_link \
+  --verify-map
+```
+
+To compare the same packet path on `all-sensors-bag6` while isolating IMU
+deskew from GNSS:
+
+```bash
+git clone --depth=1 https://github.com/autowarefoundation/applanix.git /tmp/applanix
+bash scripts/run_open_data_applanix_velodyne_gnss_benchmark.sh \
+  --bag demo_data/autoware_leo_drive_isuzu/all-sensors-bag6_compressed \
+  --packet-topic /sensing/lidar/front/velodyne_packets \
+  --applanix-msg-dir /tmp/applanix/applanix_msgs/msg \
+  --use-gnss false \
+  --verify-map
+
+bash scripts/run_open_data_applanix_velodyne_gnss_benchmark.sh \
+  --bag demo_data/autoware_leo_drive_isuzu/all-sensors-bag6_compressed \
+  --packet-topic /sensing/lidar/front/velodyne_packets \
+  --applanix-msg-dir /tmp/applanix/applanix_msgs/msg \
+  --tf-bag demo_data/autoware_leo_drive_isuzu/all-sensors-bag6_compressed \
+  --use-gnss false \
+  --use-imu true \
+  --verify-map
+
+bash scripts/run_open_data_applanix_velodyne_gnss_benchmark.sh \
+  --bag demo_data/autoware_leo_drive_isuzu/all-sensors-bag6_compressed \
+  --packet-topic /sensing/lidar/left/velodyne_packets \
+  --applanix-msg-dir /tmp/applanix/applanix_msgs/msg \
+  --tf-bag demo_data/autoware_leo_drive_isuzu/all-sensors-bag6_compressed \
+  --use-gnss false \
+  --use-imu true \
+  --imu-rotation-use-orientation false \
+  --verify-map
+```
+
+To summarize the current cross-dataset odom-prior validation evidence after the
+classic-path runs have been recorded:
+
+```bash
+python3 scripts/generate_odom_prior_validation_report.py \
+  --out output/odom_prior_validation_report_$(date +%Y%m%d).md \
+  --write-json output/odom_prior_validation_report_$(date +%Y%m%d).json \
+  --write-svg output/odom_prior_validation_report_$(date +%Y%m%d).svg
+```
+
+This report intentionally compares `driving_30_kmh` and `bag6_front` side by
+side, because the current velocity-based prior helps the fallback classic path
+on one dataset and hurts or helps differently on another.
+
+To validate packet IMU deskew as a repeatable matrix on real open data, use:
+
+```bash
+git clone --depth=1 https://github.com/autowarefoundation/applanix.git /tmp/applanix
+bash scripts/run_open_data_packet_imu_deskew_validation_matrix.sh \
+  --applanix-msg-dir /tmp/applanix/applanix_msgs/msg
+```
+
+That matrix compares `no_imu` and native-IMU runs for the default `bag1_front`
+and `bag6_front` cases at `rate=1.0` and emits:
+
+- `packet_imu_deskew_validation.md`
+- `packet_imu_deskew_validation.json`
+
+The report is generated by `generate_packet_imu_deskew_validation_report.py`
+and fails if any case violates the configured path-coverage, RMSE-regression,
+or matched-pose thresholds.
+
+The same bag also exposes native `/gnss/fix`. The backend falls back to
+sensor time (the latest odometry stamp, or the node clock before the first one)
+when the NavSatFix header stamp is far from it
+(`gnss_header_stamp_max_skew_sec`, default `30 s`), which lets the graph attach
+GNSS edges on `all-sensors-bag6`. In practice that native `/gnss/fix` still
+disagrees with the `GSOF49` reference enough to degrade the cross-validation
+APE, so `all-sensors-bag6` is useful for georeferenced smoke tests but not a
+clean GNSS benchmark source.
+
+To compare place-recognition behavior on MID360, rerun the same benchmark with
+and without an optional descriptor family and then render the short report:
+
+```bash
+bash scripts/run_place_recognition_benchmark.sh
+```
+
+To compare the current experimental BEV-assisted distance rerank instead:
+
+```bash
+bash scripts/run_place_recognition_benchmark.sh --candidate-mode bev_rerank
+```
+
+The report shows:
+
+- runtime `use_scan_context`
+- accepted/attempted loop counts
+- accepted loop source counts
+- observed `ScanContext loop candidate` count
+- observed `BEV rerank hint` count
+- observed `SOLiD rerank candidate` count
+- `APE RMSE` delta between the two runs
+- optional JSON summary via `--write-json`
+- optional SVG summary via `--write-svg`
+
+The report is generated by `generate_place_recognition_report.py`.
+
+Current checked-in evidence is:
+
+- fair current-code baseline rerun:
+  `output/bench_rko_lio_mid360_current_default_rerun_20260326/metrics.json`
+  (`APE RMSE 4.096 m`)
+- current best checked-in Scan Context candidate with DB/index fix,
+  aggregated descriptor/registration cloud, and `scan_context_threshold=0.55`:
+  `output/bench_rko_lio_mid360_sc055_yawguess_scagg_screg_20260326/metrics.json`
+  (`APE RMSE 3.568 m`)
+- current experimental BEV-assisted distance rerank:
+  `output/bench_rko_lio_mid360_20260326_202840/metrics.json`
+  (`APE RMSE 3.607 m`)
+- best observed BEV-assisted distance rerank:
+  `output/bench_rko_lio_mid360_20260326_202119/metrics.json`
+  (`APE RMSE 3.533 m`)
+- short comparison report:
+  `output/place_recognition_report_20260326.md`
+
+That candidate currently beats both the fair rerun baseline and the published
+`3.641 m` default artifact, but the accepted loop still comes from the
+distance-based path. Treat `use_scan_context=true` as an opt-in tuning path
+rather than the repository default.
+
+The BEV path is now more useful as a sensor-agnostic distance-candidate rerank
+than as a standalone loop source. It has shown better-than-baseline runs, but
+its rerun variance is still too large for a default-on setting.
+
+To summarize the current stop/go decisions for place recognition and the
+classic fallback path in one short report:
+
+```bash
+python3 scripts/generate_exploration_closeout_report.py \
+  --out output/exploration_closeout_report_$(date +%Y%m%d).md \
+  --write-json output/exploration_closeout_report_$(date +%Y%m%d).json
+```
+
+A local snapshot can be written to:
+
+- `output/exploration_closeout_report_20260327.md`
+
+That report fixes the current repository position in one place:
+
+- public default place recognition remains the distance-based path
+- `Scan Context` stays opt-in
+- `BEV-assisted rerank` stays experimental
+- `SOLiD` stays experimental/off by default
+- the classic path remains a fallback workflow rather than the main public path
+
+## Dynamic Object Filter Benchmark
+
+The dynamic-object filter is save-time only. It does not change live odometry
+or loop closure, so the right comparison is the saved map output with the same
+bag and the same backend settings.
+
+Run the paired comparison on the open-data bag6 smoke path:
+
+```bash
+bash scripts/run_dynamic_object_filter_benchmark.sh
+```
+
+That wrapper:
+
+- runs `run_open_data_gnss_smoke.sh` twice on the same bag
+- saves `no_filter/` and `dynamic_filter/` outputs under one root
+- renders `dynamic_object_filter_report.md`,
+  `dynamic_object_filter_report.json`, and `dynamic_object_filter_report.svg`
+
+The report tracks:
+
+- Autoware map verify result for both runs
+- projector type
+- saved grid cell count
+- metadata tile count
+- total saved point count
+- filter candidate/kept/removed voxel counts
+- saved-point reduction ratio
+
+The current checked-in evidence is:
+
+- baseline smoke:
+  `output/open_data_gnss_smoke_bag6_autodetect_throttled_20260325`
+- filtered smoke:
+  `output/open_data_gnss_smoke_bag6_dynamic_filter_20260326`
+- benchmark report bundle:
+  `output/dynamic_object_filter_benchmark_bag6_20260326`
+
+In that checked run, the saved map went from `138732` to `87861` points while
+keeping `verify_autoware_map.py` at `PASS`.
+
+## Leo Drive Classic Path Benchmark
+
+To compare the current classic `scanmatcher + graph_based_slam` path on the
+mixed-quality Leo Drive `driving_30_kmh` open-data bag, run:
+
+```bash
+git clone --depth=1 https://github.com/autowarefoundation/applanix.git /tmp/applanix
+bash scripts/run_open_data_classic_path_benchmark_suite.sh \
+  --applanix-msg-dir /tmp/applanix/applanix_msgs/msg \
+  --verify-map
+```
+
+This wrapper emits:
+
+- `classic_path_report.md`
+- `classic_path_report.json`
+- `classic_path_report.svg`
+
+The checked-in snapshot is:
+
+- `output/classic_path_report_20260327.md`
+
+Current evidence is:
+
+- `no GNSS`: `APE RMSE 313.695 m`
+- `GNSS only`: `APE RMSE 195.285 m`
+- `GNSS + velocity-based planar odom prior`: `APE RMSE 175.732 m`
+- `GNSS + IMU`: `APE RMSE 271.144 m`
+
+So the classic path still needs work, but the direction is clearer now:
+backend GNSS helps substantially, and a velocity-based planar odom prior helps
+further on `driving_30_kmh`, while the current packet IMU path is still not a
+default recommendation.
+
+## Release/Readiness Gate
+
+To run the local readiness gate in one command:
+
+```bash
+bash scripts/run_release_readiness_checks.sh --fail-on-profiles
+```
+
+That wrapper can run:
+
+- default build and package tests
+- benchmark summary generation
+- HTML report generation
+- optional public MID-360 segment-reset completion gate
+- standalone public MID-360 continuous kidnap-relocalization gate
+- optional Autoware dogfood
+
+The release command uses the per-dataset profile thresholds. With
+`--fail-on-profiles`, it exits non-zero when a blocking profile exceeds its
+threshold or has no matching run. A passing synthetic fixture therefore
+checks reporting mechanics but cannot count as release evidence.
+
+The wrapper resolves the current repository `HEAD` and binds every blocking
+profile to that exact 40-character commit. Clean benchmark evidence from an
+older revision is reported as a candidate-commit mismatch and evaluates as
+`NO_DATA`; it cannot authorize the current release candidate. Profiles marked
+`report_only_until` remain useful as historical comparisons and are not
+commit-bound. When invoking `benchmark_summary.py` directly as a hard gate,
+pass both `--fail-on-profiles` and
+`--required-git-commit "$(git rev-parse HEAD)"`.
+
+For a one-off uniform threshold check, `--ape-threshold <metres>` is also
+hard:
+
+- it exits non-zero if `--benchmark-root` contains no `metrics.json` evidence
+- it exits non-zero if any selected run is missing APE
+- it exits non-zero if any selected run exceeds the threshold
+- by default `run_release_readiness_checks.sh` applies that hard gate only to
+  `ground_truth` runs; `cross_validation` runs stay visible in reports without
+  blocking release
+
+`--fail-on-profiles` requires an active, existing release-profile YAML and an
+exact candidate commit (automatically supplied by the wrapper).
+Profiles marked `report_only_until` remain non-blocking even when their data
+is absent. Neither hard benchmark gate can be combined with
+`--skip-benchmark-summary`. Without `--ape-threshold` or
+`--fail-on-profiles`, an empty benchmark root remains report-only and the
+wrapper records that benchmark reporting was skipped.
+
+With `--fail-on-profiles`, an empty benchmark root remains a hard failure but
+is no longer a dead end. The output directory retains a Markdown/CSV summary
+that marks every profile `NO_DATA`, distinguishes the five blocking profiles
+from report-only canaries, and prints the tracked dataset acquisition or rerun
+instruction for each blocker. The process still exits 2 and cannot authorize a
+release without exact-commit evidence.
+
+For the public MID-360 segment-reset completion evidence, add:
+
+```bash
+bash scripts/run_release_readiness_checks.sh \
+  --skip-default-ci \
+  --skip-benchmark-summary \
+  --public-mid360-completion
+```
+
+That hook runs `scripts/run_mid360_robot_public_completion_gate.py` as a hard
+gate and writes its JSON/Markdown under the release-readiness output directory.
+
+### Paired map-quality non-regression
+
+When a candidate map has a like-for-like baseline report, the release wrapper
+can add a fail-closed paired check without changing the existing absolute
+profile gate:
+
+```bash
+bash scripts/run_release_readiness_checks.sh \
+  --skip-default-ci \
+  --skip-benchmark-summary \
+  --map-quality-pcd /path/to/candidate/map_refined.pcd@configs/map_quality_profiles/indoor_construction.yaml \
+  --map-quality-baseline-report /path/to/baseline/map_quality_report.yaml \
+  --map-quality-max-regression-percent 2.0
+```
+
+`run_map_quality_check.sh` evaluates the candidate's run-1 report against the
+named baseline with `scripts/check_map_quality_regression.py`. The five paired
+metrics are plane thickness mean/p95 (lower is better), planar coverage and
+mean-map-entropy valid fraction (higher is better), and entropy value (higher,
+or less negative, is worse). Reports must have finite values, meaningful
+planes, and identical extraction settings; a missing field, zero baseline
+denominator, or mismatch is invalid and fails closed. The paired budget never
+relaxes `indoor_construction.yaml` or any other absolute profile. The command
+writes `paired_regression_verdict.yaml` and `.json` beside the map-quality
+summary, plus human-readable rows in `paired_regression_verdict.txt`.
+
+The HILTI exp04 current-vs-old map reports used in the M4c diagnostic pass this
+2% paired check. Both reports independently violate the indoor profile's
+`mme_valid_fraction_min` threshold, so that absolute-profile result remains a
+separate applicability issue rather than being hidden by the paired pass.
+
+M4c also closed the fixed backend regression receipts for two HILTI inputs:
+
+- exp04: `/tmp/lidarslam-m4c-hilti-exp04-gate.pzufEB`, three-run artifact
+  identity and old optimized trajectory exact, wall `2.71/2.90/2.73 s`,
+  maximum RTF `0.010347643`, peak RSS `272.167968750 MiB`, and wall CV
+  `3.066357758%`.
+- exp07: `/tmp/lidarslam-m4c-hilti-exp07-gate.zCELMb`, three-run artifact
+  identity and old optimized trajectory exact, historical interpolated APE
+  `0.6186851452574647 m` from 5/6 sparse GT points, wall `1.90/1.90/1.97 s`,
+  maximum RTF `0.050166829`, peak RSS `201.136718750 MiB`, and wall CV
+  `1.715683698%`.
+
+Both receipts pass the fixed RTF/RSS/CV gates and record the canonical host NDT
+`backend_loop` receipt with `target_cell_cache_capacity=3`. These are named
+input compatibility/resource gates, not official dense-GT or SOTA comparisons;
+the M5 fresh-holdout and competitor protocol remains pending. The old/current
+indoor absolute-profile violation is reported separately and is not relaxed.
+
+For the continuous RKO-LIO kidnap-relocalization evidence, run:
+
+```bash
+python3 scripts/run_mid360_robot_public_continuous_relocalization_gate.py
+```
+
+That gate checks the merged public `outdoor_kidnap_a+b` run for full-duration
+RKO output, at least one global relocalization event, loop-alignment PASS,
+public loop endpoint closure at the GT start/end stamps, Autoware map verify
+PASS, offline completion, and tracked kidnap recovery config matching the run
+config. The endpoint closure check prevents a local revisit from being counted
+as continuous kidnap relocalization.
+
+## CI Coverage
+
+CI exercises the reporting path in two ways:
+
+- a passing synthetic benchmark fixture must generate summary and HTML report
+- a failing synthetic benchmark fixture must trip the threshold gate with
+  exit code `2`
+
+The fixture generator is:
+
+```bash
+python3 scripts/generate_sample_benchmark_metrics.py \
+  --root /tmp/ci_fixture \
+  --profile passing
+```
+
+Use `--profile failing` to create a negative-path fixture.
+
+## Recommended Artifacts To Publish
+
+For a run based only on public, licensed input, first review every file for
+credentials, private paths, host or user names, precise locations, and private
+geometry. The safe publication set is:
+
+- `metrics.json`
+- `benchmark_summary.md`
+- `benchmark_summary.csv`
+- `latest_report.html`
+- a tracked/public parameter preset plus a redacted list of changed arguments,
+  not a complete custom parameter YAML
+- `docs/comparison.md` when publishing the current positioning of the repo
+- `docs/releases/v0.2.2.md` when publishing the current public beta scope
+- `v2_beta_readiness_<YYYYMMDD>.md` when preparing a public beta snapshot
+- `stress_validation_report_<YYYYMMDD>.md` when discussing long-loop or
+  aggressive-motion evidence
+
+For a private or custom bag, use the Benchmark report form and share only its
+redacted metadata and key-metric fields. Do not publish the bag, map, trajectory,
+APE/raw logs, raw sensor data, private-site images, local/output paths, or precise
+coordinates. An optional `metrics.json` or public aggregate report is safe only
+after review confirms that none of those values is present.
+
+## Related Commands
+
+- Autoware quickstart: `docs/autoware-quickstart.md`
+- public Autoware entrypoint: `bash scripts/run_autoware_quickstart.sh`
+- public comparison page: `docs/comparison.md`
+- end-to-end dogfood: `bash scripts/run_rko_lio_graph_autoware_dogfood.sh --auto-exit-secs 20`
+
+## Release-gate accuracy snapshot
+
+Numbers from the release-gate profiles (`scripts/release_profiles.yaml`) at the
+v0.13.0 carrier commit `37216eff`. Every release is blocked by these
+per-dataset thresholds; v0.11.0, v0.12.0 and v0.13.0 were released without
+the Maths-Hard row as recorded one-time exceptions (see `RELEASING.md`).
+
+| Dataset | Sensor | Reference | APE RMSE | Gate (pass) |
+| --- | --- | --- | --- | --- |
+| NTU VIRAL `tnp_01` (outdoor, ~580 s) | Ouster OS1-16 + VN-100 | Leica prism ground truth | **0.995 m** (v0.12.0: 0.995) | ≤ 1.00 m |
+| RTK-SLAM Construction Hall 2 (indoor, ~600 s) | Livox MID-360 | total-station checkpoints¹ | **0.062 m** (median 0.059, 16/16; v0.12.0: 0.062) | ≤ 0.30 m |
+| RTK-SLAM Construction Hall 1 (indoor, ~741 s) | Livox MID-360 | total-station checkpoints¹ | **0.205 m** (median 0.095, 16/16; v0.12.0: 0.205) | ≤ 0.55 m |
+| RTK-SLAM Stadtgarten 2 (outdoor park, ~876 s) | Livox MID-360 | total-station checkpoints¹ | **0.426 m** (median 0.264, 19/19; earlier run) | report-only² |
+| RTK-SLAM Stadtgarten 1 (outdoor park, ~1 km loop) | Livox MID-360 | total-station checkpoints¹ | **0.838 m** (median 0.511, 36/36; earlier run) | report-only² |
+| Newer College `Maths-Hard` (~320 m loop) | Ouster OS0-128 | ICP registration to survey-grade map | not measured for v0.13.0, v0.12.0 or v0.11.0 (v0.10.0: 0.070) | ≤ 0.10 m |
+| Leo Drive all-sensors bag 1 (~36 s) | Velodyne VLP-16 packets | Applanix GSOF49 (cross-validation) | **0.142 m** (v0.12.0: 0.142) | ≤ 1.50 m |
+
+¹ Surveyed checkpoints from the public RTK-SLAM dataset (CC-BY 4.0), scored like
+its published baselines (dense odometry trajectory).
+² Outdoor profiles soak as report-only before graduating; the former GLIM
+cross-validation gate is also report-only since v0.5. Methodology and
+caveats: [Comparison](comparison.md).
+
+Reproduce locally:
+```bash
+bash scripts/run_rko_lio_graph_benchmark.sh
+bash scripts/run_release_readiness_checks.sh --fail-on-profiles
+```

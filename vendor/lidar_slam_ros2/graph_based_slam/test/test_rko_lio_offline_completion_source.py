@@ -1,0 +1,134 @@
+# Copyright 2026 Sasaki
+# All rights reserved.
+#
+# Software License Agreement (BSD 2-Clause Simplified License)
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions
+# are met:
+#
+#  * Redistributions of source code must retain the above copyright
+#    notice, this list of conditions and the following disclaimer.
+#  * Redistributions in binary form must reproduce the above
+#    copyright notice, this list of conditions and the following
+#    disclaimer in the documentation and/or other materials provided
+#    with the distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+# "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+# LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
+# FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
+# COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+# INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+# BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+# LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+# LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
+# ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+# POSSIBILITY OF SUCH DAMAGE.
+
+"""
+Source-level regression checks for RKO-LIO offline completion.
+
+Paths and identifiers track the upstream-integrated rko_lio layout
+(base_node/threaded_node split, snake_case VoxelHashMap API).
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+RKO_ROS_DIR = REPO_ROOT / 'Thirdparty' / 'rko_lio' / 'rko_lio' / 'ros'
+
+
+def test_offline_completion_does_not_wait_for_trailing_imu_buffer():
+    offline_node = (RKO_ROS_DIR / 'offline_node.cpp').read_text(encoding='utf-8')
+    threaded_header = (RKO_ROS_DIR / 'threaded_node.hpp').read_text(encoding='utf-8')
+    threaded_cpp = (RKO_ROS_DIR / 'threaded_node.cpp').read_text(encoding='utf-8')
+
+    assert 'registration_busy' in threaded_header
+    assert 'registration_busy = true;' in threaded_cpp
+    assert 'registration_busy = false;' in threaded_cpp
+    assert 'Trailing IMU messages are expected' in offline_node
+    assert 'lidar_buffer.empty() && !registration_busy.load()' in offline_node
+    # The end-of-bag drain must also drop trailing frames that can never be
+    # matched with IMU data instead of idling forever.
+    assert '!atomic_can_process && !registration_busy.load()' in offline_node
+    assert 'imu_buffer.empty() && lidar_buffer.empty()' not in offline_node
+
+
+@pytest.mark.skip(
+    reason='the benchmark drain diagnostic exists only on the experimental '
+    'sota rko_lio branch; the release-pinned rko_lio 0.3.2 predates it')
+def test_v2_drain_fixture_pass_and_timeout_are_distinct_fail_closed_states():
+    offline_node = (RKO_ROS_DIR / 'offline_node.cpp').read_text(encoding='utf-8')
+
+    # Keep the fixture deliberately small and representation-only: a pass is
+    # valid only for an empty lidar queue, while a timeout remains invalid even
+    # when all input counters happen to match.  This mirrors the production
+    # diagnostic's fail-closed meaning without opening a bag or GT.
+    passing_snapshot = {
+        'status': 'eof_observed',
+        'lidar_buffer_size': 0,
+        'registration_active': False,
+        'expected_messages': 3,
+        'received_messages': 3,
+        'processed_messages': 3,
+        'dropped_messages': 0,
+        'queue_overflow': 0,
+        'processing_failures': 0,
+    }
+    timeout_snapshot = dict(passing_snapshot, status='timeout', lidar_buffer_size=1)
+    assert (
+        passing_snapshot['status'] == 'eof_observed'
+        and passing_snapshot['lidar_buffer_size'] == 0
+        and not passing_snapshot['registration_active']
+    )
+    assert not (
+        timeout_snapshot['status'] == 'eof_observed'
+        and timeout_snapshot['lidar_buffer_size'] == 0
+        and not timeout_snapshot['registration_active']
+    )
+    assert 'write_benchmark_drain_diagnostic("eof"' in offline_node
+    assert 'write_benchmark_drain_diagnostic(' in offline_node
+    assert '"timeout", "benchmark drain timeout before lidar buffer became empty"' in offline_node
+    assert 'exit_status = diagnostic_written ? 124 : 1' in offline_node
+
+
+def test_threaded_node_supports_opt_in_output_backpressure():
+    threaded_header = (RKO_ROS_DIR / 'threaded_node.hpp').read_text(encoding='utf-8')
+    threaded_cpp = (RKO_ROS_DIR / 'threaded_node.cpp').read_text(encoding='utf-8')
+
+    assert 'std::chrono::milliseconds output_publish_delay{0}' in threaded_header
+    assert '"async.output_publish_delay_ms", 0' in threaded_cpp
+    assert 'async.output_publish_delay_ms must be non-negative' in threaded_cpp
+    assert 'std::this_thread::sleep_for(output_publish_delay)' in threaded_cpp
+
+
+def test_rko_lio_has_kidnap_relocalization_recovery_path():
+    rko_core_dir = REPO_ROOT / 'Thirdparty' / 'rko_lio' / 'rko_lio' / 'core'
+    config_path = (
+        REPO_ROOT / 'configs' / 'mid360_robot' / 'rko_lio_mid360_kidnap_tolerant.yaml'
+    )
+    core_header = (rko_core_dir / 'lio.hpp').read_text(encoding='utf-8')
+    core_cpp = (rko_core_dir / 'lio.cpp').read_text(encoding='utf-8')
+    # The node's parameters are read by rko_lio::driver::declare_driver_config.
+    driver_config_cpp = (
+        RKO_ROS_DIR.parent / 'driver' / 'driver_config.cpp').read_text(encoding='utf-8')
+    config = config_path.read_text(encoding='utf-8')
+
+    assert 'enable_kidnap_relocalization' in core_header
+    assert 'reset_on_registration_failure' in core_header
+    assert 'relocalize_after_scan_gap' in core_header
+    assert 'try_global_relocalization' in core_cpp
+    assert 'Kidnap relocalization matched' in core_cpp
+    assert 'Kidnap recovery accepted scan' in core_cpp
+    assert 'relocalization_map.add_points' in core_cpp
+    assert 'declare<bool>("enable_kidnap_relocalization"' in driver_config_cpp
+    assert 'enable_kidnap_relocalization: true' in config
+    assert 'reset_on_registration_failure: true' in config
+    assert 'relocalize_after_scan_gap: false' in config

@@ -1,0 +1,215 @@
+# MIT License
+#
+# Copyright (c) 2025 Meher V.R. Malladi.
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+cmake_minimum_required(VERSION 3.22.0)
+project(rko_lio LANGUAGES CXX C)
+
+if(POLICY CMP0135)
+  cmake_policy(SET CMP0135 NEW)
+endif()
+
+option(RKO_LIO_BUILD_ROS "Build the ROS wrapper for RKO LIO" ON)
+option(RKO_LIO_BUILD_TESTS "Build core C++ tests" OFF)
+option(RKO_LIO_FETCH_CONTENT_DEPS
+       "Fetch dependencies via FetchContent instead of using find_package" OFF)
+
+option(BUILD_TESTING "Build ROS package tests" ON)
+# Eigen's subproject configuration rewrites the cache option. Keep our
+# requested value in this directory's scope while configuring dependencies.
+set(BUILD_TESTING "${BUILD_TESTING}")
+
+include(cmake/dependencies.cmake)
+# Retain the choice on later configure runs that omit -DBUILD_TESTING.
+set(BUILD_TESTING "${BUILD_TESTING}" CACHE BOOL "Build ROS package tests" FORCE)
+include(cmake/compat_target_sources.cmake)
+
+find_package(Eigen3 3.4 REQUIRED CONFIG)
+find_package(Sophus REQUIRED CONFIG)
+find_package(TBB REQUIRED CONFIG)
+find_package(tsl-robin-map REQUIRED CONFIG)
+
+add_subdirectory(rko_lio/core)
+add_subdirectory(rko_lio/driver)
+
+if(NOT RKO_LIO_BUILD_ROS)
+  message(STATUS "RKO_LIO_BUILD_ROS is OFF. Skipping ROS Build.")
+else()
+  message(STATUS "Building RKO_LIO ROS wrapper.")
+
+  find_package(nlohmann_json REQUIRED CONFIG)
+
+  find_package(ament_cmake REQUIRED)
+  find_package(rclcpp REQUIRED CONFIG)
+  find_package(std_msgs REQUIRED CONFIG)
+  find_package(tf2 REQUIRED CONFIG)
+  find_package(tf2_ros REQUIRED CONFIG)
+  find_package(sensor_msgs REQUIRED CONFIG)
+  find_package(nav_msgs REQUIRED CONFIG)
+  find_package(geometry_msgs REQUIRED CONFIG)
+  find_package(rosbag2_cpp REQUIRED CONFIG)
+  find_package(rosbag2_storage REQUIRED CONFIG)
+  find_package(rclcpp_components REQUIRED CONFIG)
+
+  add_subdirectory(rko_lio/ros)
+
+  if(BUILD_TESTING)
+    find_package(ament_cmake_gtest REQUIRED)
+    ament_add_gtest(test_initialized_output test/test_initialized_output.cpp)
+    if(TARGET test_initialized_output)
+      target_link_libraries(test_initialized_output rko_lio::core)
+    endif()
+    ament_add_gtest(test_gyro_deskew_history test/test_gyro_deskew_history.cpp)
+    if(TARGET test_gyro_deskew_history)
+      target_link_libraries(test_gyro_deskew_history rko_lio::core)
+    endif()
+    ament_add_gtest(test_robust_gravity_residual test/test_robust_gravity_residual.cpp)
+    if(TARGET test_robust_gravity_residual)
+      target_link_libraries(test_robust_gravity_residual rko_lio::core)
+    endif()
+    ament_add_gtest(test_imu_acceleration_unit test/test_imu_acceleration_unit.cpp)
+    if(TARGET test_imu_acceleration_unit)
+      target_link_libraries(test_imu_acceleration_unit rko_lio::core)
+    endif()
+    ament_add_gtest(test_driver_point_cloud test/test_driver_point_cloud.cpp)
+    if(TARGET test_driver_point_cloud)
+      target_link_libraries(test_driver_point_cloud rko_lio::ros::utils rko_lio::driver)
+    endif()
+    ament_add_gtest(test_latest_pending test/test_latest_pending.cpp)
+    if(TARGET test_latest_pending)
+      target_link_libraries(test_latest_pending rko_lio::ros)
+    endif()
+
+    ament_add_gtest(
+      test_direct_visual_odometry
+      test/test_direct_visual_odometry.cpp)
+    if(TARGET test_direct_visual_odometry)
+      target_link_libraries(test_direct_visual_odometry rko_lio::core)
+    endif()
+    # test_process_timestamps: superseded by upstream's Catch2-based
+    # tests/core/test_process_timestamps.cpp, which covers the same
+    # process_timestamps() function against the current Nsec-based API.
+    ament_add_gtest(
+      test_voxel_hash_map
+      test/test_voxel_hash_map.cpp)
+    if(TARGET test_voxel_hash_map)
+      target_link_libraries(test_voxel_hash_map rko_lio::core)
+    endif()
+    ament_add_gtest(
+      test_gravity_alignment
+      test/test_gravity_alignment.cpp)
+    if(TARGET test_gravity_alignment)
+      target_link_libraries(test_gravity_alignment rko_lio::core)
+    endif()
+    ament_add_gtest(
+      test_output_position_filter
+      test/test_output_position_filter.cpp)
+    if(TARGET test_output_position_filter)
+      target_link_libraries(test_output_position_filter rko_lio::core)
+    endif()
+    ament_add_gtest(
+      test_localizability_weighting
+      test/test_localizability_weighting.cpp)
+    if(TARGET test_localizability_weighting)
+      target_link_libraries(test_localizability_weighting rko_lio::core)
+    endif()
+    ament_add_gtest(
+      test_refine_keypoints
+      test/test_refine_keypoints.cpp)
+    if(TARGET test_refine_keypoints)
+      target_link_libraries(test_refine_keypoints rko_lio::core)
+    endif()
+    ament_add_gtest(
+      test_kinematic_velocity_gate
+      test/test_kinematic_velocity_gate.cpp)
+    if(TARGET test_kinematic_velocity_gate)
+      target_link_libraries(test_kinematic_velocity_gate rko_lio::core)
+    endif()
+    ament_add_gtest(
+      test_kinematic_velocity_blend
+      test/test_kinematic_velocity_blend.cpp)
+    if(TARGET test_kinematic_velocity_blend)
+      target_link_libraries(test_kinematic_velocity_blend rko_lio::core)
+    endif()
+    ament_add_gtest(
+      test_stall_guard
+      test/test_stall_guard.cpp)
+    if(TARGET test_stall_guard)
+      target_link_libraries(test_stall_guard rko_lio::core)
+    endif()
+    ament_add_gtest(
+      test_kinematic_scene_range_gate
+      test/test_kinematic_scene_range_gate.cpp)
+    if(TARGET test_kinematic_scene_range_gate)
+      target_link_libraries(test_kinematic_scene_range_gate rko_lio::core)
+    endif()
+  endif()
+
+  # ament macros cannot be in a CMake subdirectory, even rclcpp
+  rclcpp_components_register_node(
+    online_node_component
+    PLUGIN
+    "rko_lio::ros::OnlineNode"
+    EXECUTABLE
+    online_node)
+
+  rclcpp_components_register_node(
+    online_imu_rate_node_component
+    PLUGIN
+    "rko_lio::ros::OnlineImuRateNode"
+    EXECUTABLE
+    online_imu_rate_node)
+
+  if(NOT RKO_LIO_FETCH_CONTENT_DEPS AND CMAKE_VERSION VERSION_GREATER_EQUAL "3.23")
+    install(
+      TARGETS rko_lio.core rko_lio.driver rko_lio.ros rko_lio.ros.utils
+      EXPORT rko_lioTargets
+      FILE_SET HEADERS)
+
+    ament_export_targets(rko_lioTargets HAS_LIBRARY_TARGET)
+    ament_export_dependencies(
+      Eigen3
+      Sophus
+      tsl-robin-map
+      rclcpp
+      std_msgs
+      tf2
+      tf2_ros
+      sensor_msgs
+      nav_msgs
+      geometry_msgs
+      rosbag2_cpp
+      rosbag2_storage)
+  endif()
+
+  install(TARGETS online_node_component online_imu_rate_node_component offline_node
+          LIBRARY DESTINATION lib
+          RUNTIME DESTINATION lib/${PROJECT_NAME})
+
+  install(DIRECTORY config launch DESTINATION share/rko_lio)
+
+  ament_package()
+endif()
+
+if(RKO_LIO_BUILD_TESTS)
+  enable_testing()
+  add_subdirectory(tests/core)
+endif()

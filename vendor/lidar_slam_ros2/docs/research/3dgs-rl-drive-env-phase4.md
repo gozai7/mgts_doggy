@@ -1,0 +1,156 @@
+# 3DGS closed-loop RL — Phase 4 環境基盤 (2026-06-16)
+
+sim2real トラックの Phase 4（RL）の第一段 = **学習環境**。closed-loop の部品は
+既に揃っている（GPU レンダラ、sensor-sim node、depth-test actor 合成、検出
+スコアリング）ので、それらを標準の `gymnasium.Env` として包み、エージェントが
+学習できる基盤を作った。
+
+ツール: `tools/gaussian_splatting/drive_env.py`（pure 部 12 ケースを
+`graph_based_slam/test/test_gaussian_splatting_drive_env.py` で CPU テスト、
+gymnasium env_checker 通過、ament_flake8 clean）。
+学習: `tools/gaussian_splatting/train_drive_policy.py` / `scripts/run_drive_rl.sh`。
+
+## タスクと環境
+
+- **ego**: 平面 unicycle `(x, y, yaw)`。action = `[v, omega]`（正規化）。
+- **タスク**: goal pose に到達。ただし **valid viewpoint corridor**（Phase 0:
+  3DGS render が信頼できるのは記録軌跡から `max_dev` 以内）に留まる。
+- **報酬**: goal への前進 − step cost − corridor 逸脱ペナルティ（+ 到達ボーナス）。
+- **終了**: goal 到達 / 場外 / corridor を `hard_dev` 超で逸脱 / timeout。
+- **観測 2 モード**:
+  - `state` — 低次元ベクトル `[goal_dist, cos(bearing), sin(bearing), corridor_dev]`。
+    GPU 不要、CPU で数秒学習・単体テスト可能。
+  - `camera` — ego カメラの 3DGS render（注入する `render_fn` = `GaussianRenderer`
+    クロージャ）。これが **sim2real 観測**で、closed-loop sensor-sim が配信する像と一致。
+
+運動学・報酬・終了は pure numpy ヘルパー（単体テスト済み）で、`DriveEnv` は
+それらを Gymnasium API と任意のレンダラに配線するだけ。
+
+## 学習結果（state 観測、PPO、合成 arc コリドー）
+
+stable-baselines3 PPO / MlpPolicy / 60k step（CPU）:
+
+```
+random policy : mean return -26.07, success  0%
+PPO (60k step): mean return  23.78, success 100%
+```
+
+- **RL ループが収束**: ランダム方策は corridor を外れて 0% 成功なのに対し、PPO は
+  60k step で **goal 到達 100%**・return が大きく改善。環境が end-to-end で学習可能
+  であることを実証（= Phase 4 RL 着手）。
+- 報酬が「前進 − corridor 逸脱」なので、学習方策は **Phase 0 の有効視点範囲内に
+  留まりながら goal へ向かう**走り方を獲得する（sim2real の前提と一貫）。
+
+## 追記: dynamic actor 回避タスク (2026-06-16)
+
+closed-loop の dynamic actor（`3dgs-actor-compositing-phase3.md`）を RL に取り込んだ。
+env に**横断歩行者**（`crossing_actor`、step→xy のスクリプト actor）を追加し、
+state 観測に actor の ego 相対 range/bearing（+3 次元）、報酬に近接 yield コスト、
+衝突（`actor_radius` 内）で終了＋ペナルティを加えた（後方互換: actor 無しは現状維持）。
+
+直線コリドー＋「フル速で走ると到達タイミングで歩行者が経路中心に来る」横断を設定
+（= **直進フル速は step 18 で衝突**する経路）。stable-baselines3 PPO / state 観測 / CPU:
+
+```
+random policy : mean return -24.17, success   0%, collision 0%
+PPO (120k)    : mean return  24.05, success 100%, collision 0%
+```
+
+- **PPO は衝突 0% で goal 到達 100%** を獲得。rollout では最小 ego–歩行者距離 2.86 m
+  （衝突半径 1.0 m に対し安全マージン）を保ち、安全な接近速度（throttle ~0.74、
+  フル 1.0 でない）で歩行者が抜けた後に通過する。**直進フル速が衝突する経路で、
+  actor 観測を使って衝突回避方策を学習**したことを示す。
+- これで RL は「ナビ（goal 到達）」だけでなく「**動的物体の知覚-回避**」まで学習可能と
+  実証。検出スコアリング（`detect_in_scene`/`sim2real_gap`）を報酬項に差し替えれば、
+  pixel 観測下の知覚駆動方策へ直結する。
+
+## 追記: pixel 観測 RL（閉ループ完成, 2026-06-16）
+
+`state` 観測（低次元ベクトル）で env の学習可能性を確かめたので、最終段の
+**pixel 観測**＝エージェントが **3DGS render を直接見て**学習する閉ループを実装した。
+
+- ツール: `tools/gaussian_splatting/scene_camera.py`（ego pose `(x,y,yaw)` →
+  3DGS viewmat の写像。pure 幾何 4 ケースを `test_gaussian_splatting_scene_camera.py`
+  で CPU テスト、ament_flake8 clean）。
+- コリドー/カメラは記録済み軌跡（`transforms.json`）から導出: カメラ姿勢の up 列を
+  平均して **world-up** を、位置を ground 平面に射影して PCA で **travel 軸 e1**
+  （`e2 = up×e1`）を復元。ego は `origin + x·e1 + y·e2 + height·up` に立ち、heading
+  方向を見る。これで env の 2D コリドー（Phase 0 有効視点範囲）と 3DGS render が同一
+  frame に揃う。
+- render は GPU 常駐 `GaussianRenderer`（84×84 で **509 FPS**）。`obs_mode='camera'`
+  で毎 step ego カメラから rasterise → `CnnPolicy` PPO。
+
+stadtgarten LiDAR-primed 3DGS（recon 18.9 dB）の実コリドー（直線 17 m）で学習:
+
+```
+random policy : mean return -19.44, success   0%
+PPO (40k,  omega_max=1.0): mean return  -3.54, success 0%   # idle ローカル最適
+PPO (120k, omega_max=0.5): mean return  25.30, success 100%
+```
+
+- 当初 40k では return が −35→−3.5 に改善しただけで **success 0%**。−3.5 ≈
+  `step_cost × ~175 step` で、「**コリドー逸脱の −5 を避けて idle する**」ローカル最適に
+  陥っていた（過操舵での逸脱リスクを学習）。直線コリドーなので **操舵自由度を絞り**
+  （`omega_max` 1.0→0.5）、学習量を 120k に増やすと **goal 到達 100%** に到達。
+- 学習方策の rollout（`output/stadt_3dgs/pixel_rl/rollout_pov.gif` / `_strip.png`）:
+  goal 到達・57 step・x −8.48→8.05 m（コリドー全長走破）・最大横ずれ 0.64 m・
+  throttle 0.99（フル前進）。**3DGS render だけを観測してコリドーを走破**する方策を獲得。
+- これで Phase 0–4 の全部品（render・actor・検出・RL）が **1 本の閉ループ**に繋がった:
+  記録軌跡 → 3DGS シーン → ego カメラ render → CNN 方策 → 行動 → 次 pose。検出
+  スコアリング（`detect_in_scene` / `sim2real_gap`）を報酬項に差し替えれば知覚駆動方策へ
+  そのまま拡張できる。
+- 罠: pixel 観測は idle ローカル最適に落ちやすい（操舵自由度を task 難度に合わせる）。
+  start heading は隣接アンカーの y ジッタで荒れるので **始点→終点の全体方向**から取る。
+
+## 追記: 知覚駆動 RL（能動知覚, 2026-06-16）
+
+pixel 観測の閉ループに、**報酬を検出器の出力に差し替え**た = 知覚駆動方策。エージェントは
+camera 観測（3DGS render）から学習し、**報酬 = その render 上で YOLO が対象を検出する
+confidence のみ**（`percept_only`、ナビ報酬なし）。Phase 3 で測った**検出レンジの sweet spot**
+（truck は 7–13m・正面で conf 0.83、遠近で低下）が報酬地形になるので、エージェントは
+「対象が最もよく見える視点に自分を立たせる」ことを学ぶ。
+
+- env: `drive_env` に `percept_reward_fn`(ego pose→scalar) / `percept_weight` / `percept_only`
+  フック追加（後方互換、pure テスト済み 4 ケース）。
+- カメラ: `scene_camera.make_target_orbit_render_fn` — ego が対象を周回し常に対象を注視
+  （`azimuth_basis`/`target_orbit_eye`、`detect_in_scene.dolly_viewmats` と同一幾何、pure 3 ケース）。
+- 報酬: 別レンダ（320px, fx 240）に `sim2real_gap.Detector`(yolov8n) をかけ、対象クラスの
+  最大 conf を返すクロージャ。観測は 84×84（fx 60）の同一視点 render。`CnnPolicy` PPO。
+
+Truck シーン（Tanks&Temples, 2.06M Gaussian）、対象=truck(COCO 7)、azimuth 125°、start_range 14m:
+
+```
+random policy : mean return  60.4, mean detect-conf 0.302
+PPO (40k step): mean return 136.5, mean detect-conf 0.683
+```
+
+- **検出 conf を 2 倍以上（0.302→0.683）に改善**。rollout では range 13.7m から **sweet spot
+  ~10–12m・正面（lateral→-0.27）に収束**して dwell、conf は終盤 0.91 まで上昇
+  （`output/stadt_3dgs/pixel_rl/detect_pov.gif`/`_strip.png` で truck がフレーム中央に寄る）。
+  **84×84 pixel だけを観測し、YOLO の出力だけを報酬に、対象が最もよく見える視点を獲得**した。
+- これで Phase 0–4 が完全な閉ループに: render → CNN 方策 → 行動 → render → **検出器 → 報酬**。
+  検出スコアリング（`detect_in_scene`/`sim2real_gap`）がそのまま RL 報酬として機能することを実証。
+- 罠: **obs と検出の render は別物**（obs=fx60 広角 / 検出=fx240 望遠 320px）。評価時に obs の fx を
+  学習時(=60)と変えると方策が別観測を受け取り性能が崩れる（fx240 で評価し 0.30 と誤認 → fx60 で 0.68 に訂正）。
+  検出 conf は同一 pose でもフレーム間で揺れる（recon フローター）ので報酬はノイジー、horizon を長めに。
+
+## sim2real ブリッジ（pixel 観測）と次
+
+- `obs_mode='camera'` + `render_fn`（`GaussianRenderer.render(pose→viewmat)`）で、
+  **エージェントが 3DGS render を直接観測**して学習できる。これは GPU rollout で
+  重いので本検証（state 観測）から分離した、明確な次ステップ。
+- corridor anchors は記録 SLAM 軌跡（TUM）をそのまま使える（`--traj`）。stadtgarten /
+  construction の実コリドーで「有効視点範囲内を走る」方策を学べる。
+- dynamic actor（`3dgs-actor-compositing-phase3.md` の box/sprite/ply）を毎 step
+  シーンに合成すれば、**動的交通下の知覚-行動方策**（回避・追従）に拡張できる。検出
+  スコアリング（`detect_in_scene` / `sim2real_gap`）はそのまま報酬項に使える。
+
+## ロードマップ上の位置づけ
+
+```
+Phase 0  外挿安定性 / 有効視点範囲                  ← 完了
+Phase 1  open-loop RGB-D データ生成                 ← 完了
+Phase 2  closed-loop sensor-sim ROS 2 node          ← 完了
+Phase 3  dynamic actors + 検出 gap (orbit/dolly/LiDAR-primed) ← 完了
+Phase 4  closed-loop RL                              ← 本ノート（env + state PPO + dynamic 回避 + pixel 観測 100% 走破 + 知覚駆動 detect-conf 0.30→0.68）
+```

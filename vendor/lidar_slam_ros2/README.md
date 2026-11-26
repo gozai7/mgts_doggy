@@ -1,0 +1,205 @@
+# lidar_slam
+
+[![CI](https://github.com/rsasaki0109/lidar_slam/actions/workflows/main.yml/badge.svg?branch=develop)](https://github.com/rsasaki0109/lidar_slam/actions/workflows/main.yml)
+[![License: BSD-2-Clause](https://img.shields.io/badge/License-BSD--2--Clause-blue.svg)](https://opensource.org/licenses/BSD-2-Clause)
+[![ROS 2: Humble | Jazzy](https://img.shields.io/badge/ROS%202-Humble%20%7C%20Jazzy-22314E?logo=ros&logoColor=white)](#support-and-license)
+[![GitHub stars](https://img.shields.io/github/stars/rsasaki0109/lidar_slam?style=flat&logo=github)](https://github.com/rsasaki0109/lidar_slam/stargazers)
+[![Sponsor on GitHub](https://img.shields.io/badge/Sponsor-GitHub%20Sponsors-ea4aaa?logo=githubsponsors&logoColor=white)](https://github.com/sponsors/rsasaki0109)
+
+**Turn a rosbag into a map you can actually drive on.** LiDAR SLAM that writes an Autoware-compatible map bundle: `pointcloud_map/`, `map_projector_info.yaml` and lanelet2. It runs as ROS 2 packages (Humble, Jazzy) or without ROS 2 from `pip install lidarslam`. `RKO-LIO` (MIT) + `graph_based_slam` (BSD-2), no GPL on the default workflow. [Try it in your browser](https://rsasaki0109.github.io/lidar_slam/browser-demo.html) · [Open in Colab](https://colab.research.google.com/github/rsasaki0109/lidar_slam/blob/develop/examples/colab/first_map.ipynb) · [日本語クイックスタート](docs/getting-started-ja.md) · release notes [v0.13.0](docs/releases/v0.13.0.md) · [v0.12.0](docs/releases/v0.12.0.md)
+
+[Documentation](https://rsasaki0109.github.io/lidar_slam/) · [Supported inputs and outputs](docs/product-contract.md) · [Workflow and benchmark comparison](docs/comparison.md)
+
+<p align="center">
+  <img src="lidarslam/images/slam_koide_outdoor_hard_02a.gif" alt="Live map building on a handheld outdoor walk, coloured by when each part was mapped" width="56%">
+  <img src="lidarslam/images/map_flythrough_stadtgarten.webp" alt="Camera-coloured SLAM point-cloud map of a park" width="42%">
+  <img src="lidarslam/images/slam_geode_stairs_beta.gif" alt="Handheld Ouster OS1-64 going down one stairwell and up another" width="49%">
+  <img src="lidarslam/images/slam_geode_tunnel4_beta.gif" alt="UGV with an Ouster OS1-64 mapping a metro tunnel" width="49%">
+  <img src="docs/assets/images/multisession_oxford_new_college.gif" alt="Three separate walks through New College, Oxford, each first drawn where it was recorded, then joined into one map" width="98%">
+  <img src="docs/assets/images/lifelong_nclt.gif" alt="One map of a university campus revisited 19 times through 2012: each session finds itself in the map without an initial pose, then adds what is new and removes what has gone" width="98%">
+  <img src="lidarslam/images/kitti_3dgs_drive_sim.gif" alt="KITTI drive 0018 rebuilt as 3D Gaussian Splatting from this SLAM's camera poses and used as a driving simulator: added cars next to the real photo, a look-around, a car cutting in, and a 2.2 km fast-forward with a LiDAR map minimap" width="98%">
+  <img src="lidarslam/images/slam_vs_sfm_3dgs.gif" alt="Same KITTI photos and the same 3DGS trainer with camera poses from this LiDAR SLAM and from SfM (COLMAP): the renders look alike, but only the SLAM poses are in metres with gravity down, while the SfM path has no scale and bends up to 17 m" width="98%">
+</p>
+
+*Outdoor walk, APE 0.55 m ([Koide](https://zenodo.org/records/10122133), CC BY 4.0) · camera-coloured park ([RTK-SLAM](https://rtk-slam-dataset.github.io/), CC BY 4.0) · stairs, ATE 0.24 m on development data · held-out metro tunnel, 0.38 m like BIEVR-LIO and FAST-LIO2 ([GEODE](https://github.com/PengYu-Team/GEODE_dataset)) · three separate walks joined into one map with no position hint ([Oxford Spires](https://huggingface.co/datasets/ori-drs/oxford_spires_dataset), CC BY-NC-SA 4.0) · one map kept for a year: 19 visits, each relocalized from scratch and updated with change detection ([NCLT](https://robots.engin.umich.edu/nclt/), ODbL 1.0) · a 2.2 km [KITTI](https://www.cvlibs.net/datasets/kitti/raw_data.php) street rebuilt as 3D Gaussian Splatting from this SLAM's poses and driven in [RobotNativeEngine](https://github.com/rsasaki0109/RobotNativeEngine) (CC BY-NC-SA 3.0) · the same photos posed by this SLAM or by SfM: equal image quality, but only SLAM is metric and gravity-aligned. [How these were made](docs/readme-media.md).*
+
+## Quickstart
+
+### Choose your shortest path
+
+| Goal | Start here | Safety and cost boundary |
+| --- | --- | --- |
+| See a verified map, no build | **Default if unsure:** [Docker demo](#try-it-with-docker-one-command-no-build) | Stable `v0.12.0-humble`; needs Docker; host writes stay in `./lidarslam_output`. |
+| Map my own rosbag | [Own-bag route](#map-your-own-bag-one-command-after-install): `lidarslam-map doctor /path/to/rosbag2` | Read-only diagnosis first; then `lidarslam-map start /path/to/rosbag2` writes a new output. |
+| Build from source or contribute | [Source quickstart](#build--verified-demo-from-source-one-helper): `bash scripts/source_quickstart.sh --dry-run` | Release `v0.12.0`; needs ROS 2, 8 GiB, and roughly 30 minutes. |
+| Map a bag without ROS 2 (preview) | [pip install](#without-ros-2-pip-preview): `pip install lidarslam-*.whl` (prebuilt) or `pip install ./lidarslam_core`, then `lidarslam-map start /path/to/rosbag2` | No ROS 2; the prebuilt wheel needs no apt packages (Linux x86_64/aarch64, Python 3.10-3.13). RKO-LIO profiles; with `--lidarslam-param lidarslam_rtk_gnss.yaml` the map is anchored to the bag's RTK GNSS (`/gnss/fix`); Velodyne packet bags (VelodyneScan + Imu) with `--engine core`. The classic GNSS and packet profiles need ROS 2. |
+
+### Try it with Docker (one command, no build)
+
+```bash
+docker run --rm -e LIDARSLAM_HOST_UID="$(id -u)" -e LIDARSLAM_HOST_GID="$(id -g)" \
+  -v "$PWD/lidarslam_output:/lidarslam_ws/output" \
+  ghcr.io/rsasaki0109/lidar_slam_ros2:v0.12.0-humble
+```
+
+The repository was renamed from `lidar_slam_ros2` to `lidar_slam`; the `v0.12.0` images keep their published name `ghcr.io/rsasaki0109/lidar_slam_ros2`, and old GitHub links redirect.
+
+The 517 MB MID-360 demo writes `lidarslam_output/mid360_demo/` as your user. Other platforms: [Getting Started](docs/getting-started.md).
+
+### Map your own bag (one command after install)
+
+```bash
+lidarslam-map start /path/to/rosbag2
+```
+
+Run `lidarslam-map` with no arguments for a guided start, or `lidarslam-map doctor` first: it uses no network and writes no files. See [supported inputs](#use-your-own-bag).
+
+### Build + verified demo from source (one helper)
+
+```bash
+mkdir -p ~/ros2_ws/src
+cd ~/ros2_ws/src
+git clone --recursive https://github.com/rsasaki0109/lidar_slam.git
+cd lidar_slam
+bash scripts/source_quickstart.sh
+```
+
+The helper detects Humble/Jazzy, installs the dependencies, builds the six maintained packages and runs the verified demo (`--dry-run`, `--build-only`). It prints a `lidarslam-map` path that auto-activates this build. Needs ROS 2, 8 GiB and about 30 minutes. Before handoff: `python3 scripts/check_first_map_verification_package.py --json`, continue only on `READY`.
+
+### Without ROS 2 (pip, preview)
+
+ROS 2 is becoming one option rather than a requirement. The pip package installs the `lidarslam-map` command with the RKO-LIO odometry and the graph_based_slam backend (loop closure, pose graph, refinement, Autoware map bundle) inside, and reads rosbag2 (MCAP, SQLite3) and ROS 1 bags without ROS 2 ([roadmap](docs/roadmap/ros-free-core-2026-11.md)).
+
+**Prebuilt wheel (no apt packages, no compiler).** The [wheels workflow](https://github.com/rsasaki0109/lidar_slam/actions/workflows/wheels.yml) builds manylinux wheels (glibc 2.28+, x86_64 and aarch64, Python 3.10-3.13) that bundle PCL, g2o and the other C++ libraries. From the first release published to PyPI on, `pip install lidarslam` installs them. Until then, open the latest successful run on `develop`, download `lidarslam-wheels-x86_64` (or `-aarch64`; GitHub sign-in needed), unzip it and install the wheel for your Python:
+
+```bash
+python3 -m venv .venv && . .venv/bin/activate
+pip install lidarslam-*-cp312-cp312-manylinux_2_28_x86_64.whl   # your cpXY and arch
+lidarslam-map doctor                             # ready: map engine core, no ROS 2 needed
+lidarslam-map start /path/to/rosbag2             # verified Autoware map bundle, lanelet2, 3D preview
+```
+
+On HILTI exp14 the x86_64 wheel writes the same map bytes as the source install below.
+
+**From source** (Ubuntu packages, builds the C++ core):
+
+```bash
+sudo apt install build-essential cmake libeigen3-dev libtbb-dev robin-map-dev \
+  libpcl-dev libg2o-dev libzstd-dev python3-venv   # tested on Ubuntu 24.04
+git clone --recursive https://github.com/rsasaki0109/lidar_slam.git
+cd lidar_slam
+python3 -m venv .venv && . .venv/bin/activate
+pip install ./lidarslam_core                     # Python >= 3.10; downloads Sophus while building
+lidarslam-map doctor                             # ready: map engine core, no ROS 2 needed
+lidarslam-map start /path/to/rosbag2             # verified Autoware map bundle, lanelet2, 3D preview
+python -m lidarslam inspect /path/to/rosbag2     # topics and message types
+python -m lidarslam odometry /path/to/rosbag2 --params my_rko_lio.yaml --out odom/
+python -m lidarslam map /path/to/rosbag2 --odometry-params my_rko_lio.yaml \
+  --backend-params lidarslam/param/lidarslam.yaml --out map/      # both, in one pass
+python -m lidarslam backend /path/to/backend_input \
+  --params lidarslam/param/lidarslam_mid360_rko_graph_walking.yaml --out map/ \
+  -p "extrinsic_lidar2base_quat_xyzw_xyz:=[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]"
+```
+
+`--params` takes the same parameter file as the ROS 2 RKO-LIO node (`ros__parameters` layout), with `imu_topic`, `lidar_topic`, `base_frame` and both `extrinsic_*2base_quat_xyzw_xyz` set. On HILTI exp14 the trajectory is byte-identical to the ROS 2 offline node. Visual and radar fusion still need ROS 2. A `lidar_topic` of Velodyne packets (`velodyne_msgs/msg/VelodyneScan`) is decoded as velodyne_transform_node does; set `velodyne.model` (`VLP16` by default, `32C`, `32E`, `VLS128`) or `velodyne.calibration`. The decoder's per-point `time` counts from the scan stamp, so `lidar_timestamps.force_relative` is set for packet input unless the parameter file sets `lidar_timestamps.force_relative` or `force_absolute`.
+
+`lidarslam-map` is the same product command as the ROS 2 install (`run`, `start`, `view`, `sessions`, `report`, ...). Its map engine is chosen by `--engine auto`, the default: ROS 2 when the `ros2` command is found, else the pip package (`--engine core`). With the core engine the maps of an RKO-LIO profile are byte-identical to the ROS 2 offline path, and `--join-map` / `merge --place-recognition` run the multi-session join from the package. With a graph parameter file that sets `use_gnss` (e.g. `--lidarslam-param lidarslam_rtk_gnss.yaml`) the core engine anchors the map to the bag's RTK GNSS (RTK-SLAM Stadtgarten: 0.100 / 0.067 m absolute, the same as the ROS 2 `--bag-gnss` benchmark path). A Velodyne packet bag (VelodyneScan + Imu) maps with the RKO-LIO profile on the packets when you pass `--engine core` (with ROS 2 found, `auto` keeps the ROS 2 profiles); pass the bag's extrinsics as for any RKO-LIO bag. The classic GNSS and packet profiles still need ROS 2.
+
+`backend` runs `graph_slam_offline_runner` without ROS 2 on a backend input (the frontend's odometry and deskewed clouds, `/rko_lio/odometry` and `/rko_lio/frame`): it reads the `graph_based_slam` section of the parameter files, takes `-p name:=value` overrides like ROS 2, and writes the same files as the ROS 2 runner, byte for byte on the MapsHD checks. Registration plugins loaded through pluginlib still need ROS 2; the built-in NDT, GICP and SMALL_GICP do not.
+
+## Use your own bag
+
+For an Ouster, Velodyne, RoboSense or other PointCloud2 bag, do not edit this package's launch files or YAML first: run `lidarslam-map doctor`, then `lidarslam-map start`. It checks topics, frames, fields, timestamps, a maintained profile and calibration, and stops unsafe inputs with a stable reason code and one next action. Maintained inputs: PointCloud2+Imu, PointCloud2+NavSatFix, VelodyneScan+Applanix GSOF49.
+
+- **Docker, no ROS:** `bash scripts/docker_map_bag.sh /absolute/path/to/rosbag2` mounts the bag read-only ([Docker Own-Bag Map](docs/getting-started.md#docker-own-bag-map)).
+- **After a run:** `lidarslam-map view`, `lidarslam-map sessions`, `lidarslam-map compare day1 day2`, `lidarslam-map support day1`, `lidarslam-map merge day1 day2 --output-dir site_project`.
+- **Report on a fixed output:** `lidarslam-map report /path/to/output/mid360_demo --json` ([first-map validation guide](docs/external-first-map-validation.md)).
+- **Automation:** `lidarslam-map run` ([Operator workflows](docs/workflows.md)). Localization: [Localize On The Map](docs/getting-started.md#5-localize-on-the-map).
+
+## Why lidar_slam
+
+- **Autoware-compatible output:** `verify_autoware_map.py` prints `map_verify: PASS` on every saved bundle.
+- **lanelet2 auto-generation** from the SLAM trajectory, validated for Autoware routing.
+- **Surveyed ground truth:** per-dataset APE thresholds gate every release in CI ([accuracy](#accuracy)).
+- **Loop closure, GPL-free:** Scan Context, BEV / SOLiD / Triangle descriptors and 3D-BBS verification (opt-in).
+- **Tunnels and fog:** radar fusion maps a ~500 m tunnel; without radar, an Ouster preset holds all ten ENWIDE sequences; on GEODE's 13 held-out tunnel bags, no failure but not the most accurate ([comparison](docs/comparison.md#degenerate-lidar-imu-odometry-on-enwide), [guide](docs/degeneracy-guide.md)).
+- **Deterministic offline mapping:** byte-identical trajectories, loop edges and submaps.
+- **Refined maps:** plane bundle adjustment under holdout-validated thresholds ([evidence](docs/research/map-quality-baseline.md)).
+
+```mermaid
+flowchart LR
+    bag(["rosbag2"]) --> rko["RKO-LIO<br/>LiDAR-inertial odometry"]
+    rko --> gbs["graph_based_slam<br/>loop closure + graph optimization"]
+    gbs --> bundle["Autoware map bundle<br/>pointcloud_map · lanelet2 · projector info"]
+```
+
+## Camera-coloured point-cloud maps
+
+The pipeline refines each camera pose against the LiDAR map, then projects the pixels onto it. On the park walk at the top (RTK-SLAM Stadtgarten 2, the RTK-GNSS-anchored trajectory at 0.100 m absolute error; [MP4](lidarslam/images/map_flythrough_stadtgarten.mp4)) the refinement takes the held-out epipolar error from 1.09 to 0.34 px ([tool](tools/colored_map/README.md), [GNSS anchoring](docs/research/gnss-rtk-slam-absolute-accuracy.md), [release reference](docs/research/colored-map-release-readiness-2026-07.md)).
+
+```bash
+python3 tools/colored_map/colored_map_pipeline.py \
+  <bag> output/<run>/traj_corrected.tum output/<run>/colored_map \
+  --raw-traj output/<run>/traj_raw.tum \
+  --extrinsic configs/gaussian_splatting/<lidar_camera_extrinsic>.yaml
+```
+
+Moving rigs: `--refine-spatiotemporal-calibration` ([design](docs/research/colored-map-spatiotemporal-calibration-2026-07.md)). Regression gates: [Benchmarking](docs/benchmarking.md#slam-candidate-regression).
+
+## Open-source benchmark results
+
+On the same HILTI 2022 `exp04` LiDAR/IMU input and CPU-only host, the competitive
+profile recorded **44.1% lower median APE RMSE than GLIM** over three runs:
+
+| System | Median APE RMSE | Median processing RTF | Maximum peak RSS |
+| --- | ---: | ---: | ---: |
+| **lidar_slam** | **0.0482 m** | **0.194** | **369.4 MB** |
+| GLIM CPU | 0.0863 m | 0.218 | 696.0 MB |
+
+This is a scoped HILTI `exp04` result from one 4-vCPU cloud VM (2026-10-19, three alternated runs per system, GLIM v1.2.2 built natively because the VM has no Docker daemon). There, lidar_slam has the lower median APE, processing RTF and peak RSS; the RTF ranges barely separate. It is not an overall best-system claim. Commands, scoring rules, the earlier Docker-based record and map-quality limits: [Comparison](docs/comparison.md#same-input-hilti-2022-exp04-vs-glim-cpu). The two-system comparison runners were retired after `v0.11.0`; rerun them from that tag.
+
+The separate Voxel-SLAM `v17` research candidate also achieved the lowest
+geometric-mean APE across NavINST, Oxford, and UrbanNav: **2.2836 m**, versus
+GLIM `5.0779`, Point-LIO `3.8388`, FAST-LIO2 `6.9576`, and fixed Voxel-SLAM
+`2.7160` — **55.0% lower than GLIM**. It is not the default release path, does
+not win every sequence, and is not fresh-blind evidence. Exact revisions,
+per-sequence results, input hashes, resource results, map limitations, and
+reproduction notes are in [Comparison](docs/comparison.md#voxel-slam-v17-research-candidate-vs-pinned-oss-rivals).
+
+Development-data results with loop closure on the MapsHD humanoid MID-360
+trials, Oxford Spires Keble 05 and HILTI `exp04`, with settings chosen on those
+same sequences, are in
+[Comparison](docs/comparison.md#development-data-results-mapshd-humanoid-trials-oxford-spires-and-exp04).
+
+## Accuracy
+
+Release-gate thresholds ([Benchmarking](docs/benchmarking.md#release-gate-accuracy-snapshot)) block every release in CI. Tunnel and fog mapping: [Degeneracy Resilience Guide](docs/degeneracy-guide.md).
+
+## Docs
+
+- **Getting started**: [Getting Started](docs/getting-started.md) · [Distribution](docs/distribution.md) · [Autoware quickstart](docs/autoware-quickstart.md) · [Operator workflows](docs/workflows.md) · [Autoware Foxglove](docs/autoware-foxglove.md)
+- **Pipelines**: [Autoware-compatible map authoring](docs/autoware-map-authoring.md)
+- **Benchmarking**: [Benchmarking and release gate](docs/benchmarking.md) · [Comparison](docs/comparison.md)
+- **Project**: [Product contract](docs/product-contract.md) · [v1.0 readiness](docs/v1-readiness.md) · [Independent first-map validation](docs/external-first-map-validation.md) · [v0.11.0 notes](docs/releases/v0.11.0.md) · [v0.12.0 notes](docs/releases/v0.12.0.md) · [v0.13.0 notes](docs/releases/v0.13.0.md) · [v0.9 roadmap](docs/roadmap/v0.9.md) · [Contributing](CONTRIBUTING.md) · [Support](SUPPORT.md) · [Security](SECURITY.md) · [Governance](GOVERNANCE.md) · [Changelog](CHANGELOG.md) · [Releasing](RELEASING.md)
+
+Preview the doc site locally: `python3 -m mkdocs serve`.
+
+## Support and license
+
+| ROS 2 distro | Ubuntu | Scope |
+| --- | --- | --- |
+| Humble | 22.04 | default workflow build + package tests in CI |
+| Jazzy  | 24.04 | default workflow build + package tests in CI; Autoware dogfood exercised locally |
+
+`graph_based_slam` is BSD-2-Clause; `RKO-LIO`, `DLIO`, and the optional vendored
+`3D-BBS` are MIT; `FAST_GICP` is BSD-3-Clause; built-in Scan Context is local. GPL-only
+components (`Thirdparty/lio-sam`, `Thirdparty/3d_bbs`) are excluded via `COLCON_IGNORE`.
+
+## Quality gates
+
+```bash
+bash scripts/run_default_ci_checks.sh
+```
+Full gate list and parameter pointers: [docs/workflows.md](docs/workflows.md).
+
+If this project saves you mapping time, a ⭐ helps others find it.

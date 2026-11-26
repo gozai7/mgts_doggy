@@ -1,0 +1,473 @@
+# Copyright 2026 Sasaki
+# All rights reserved.
+#
+# Software License Agreement (BSD 2-Clause Simplified License)
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions
+# are met:
+#
+#  * Redistributions of source code must retain the above copyright
+#    notice, this list of conditions and the following disclaimer.
+#  * Redistributions in binary form must reproduce the above
+#    copyright notice, this list of conditions and the following
+#    disclaimer in the documentation and/or other materials provided
+#    with the distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+# "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+# LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
+# FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
+# COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+# INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+# BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+# LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+# LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
+# ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+# POSSIBILITY OF SUCH DAMAGE.
+
+"""Regression tests for the recommended RKO-LIO launch defaults."""
+
+from __future__ import annotations
+
+import ast
+from pathlib import Path
+
+import yaml
+
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+LAUNCH_PATH = REPO_ROOT / 'lidarslam' / 'launch' / 'rko_lio_slam.launch.py'
+
+
+def _parse_launch_ast() -> ast.Module:
+    return ast.parse(LAUNCH_PATH.read_text(encoding='utf-8'))
+
+
+def _constant_string(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    return None
+
+
+def _find_function(module: ast.Module, name: str) -> ast.FunctionDef:
+    for node in module.body:
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            return node
+    raise AssertionError(f'function not found: {name}')
+
+
+def _find_declare_launch_argument_call(
+    launch_description: ast.Call,
+    argument_name: str,
+) -> ast.Call:
+    for item in launch_description.args[0].elts:
+        if not isinstance(item, ast.Call):
+            continue
+        if not isinstance(item.func, ast.Name):
+            continue
+        if item.func.id != 'DeclareLaunchArgument':
+            continue
+        if not item.args:
+            continue
+        if _constant_string(item.args[0]) == argument_name:
+            return item
+    raise AssertionError(f'DeclareLaunchArgument not found: {argument_name}')
+
+
+def test_base_frame_defaults_to_base_link():
+    """The default base frame should remain base_link for NTU VIRAL."""
+    module = _parse_launch_ast()
+    generate_launch_description = _find_function(
+        module,
+        'generate_launch_description',
+    )
+    return_stmt = next(
+        node for node in generate_launch_description.body
+        if isinstance(node, ast.Return)
+    )
+    assert isinstance(return_stmt.value, ast.Call)
+    base_frame_call = _find_declare_launch_argument_call(
+        return_stmt.value,
+        'base_frame',
+    )
+    default_kw = next(
+        kw for kw in base_frame_call.keywords if kw.arg == 'default_value'
+    )
+    assert _constant_string(default_kw.value) == 'base_link'
+
+
+def test_rko_param_file_is_applied_after_launch_defaults():
+    """The optional YAML must be appended after inline defaults to override them."""
+    module = _parse_launch_ast()
+    create_node = _find_function(module, 'create_rko_offline_node')
+
+    append_values: list[str] = []
+
+    class AppendCollector(ast.NodeVisitor):
+        def visit_Call(self, node: ast.Call) -> None:
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == 'parameters'
+                and node.func.attr == 'append'
+                and len(node.args) == 1
+            ):
+                arg = node.args[0]
+                if isinstance(arg, ast.Dict):
+                    append_values.append('dict')
+                elif isinstance(arg, ast.Name):
+                    append_values.append(arg.id)
+            self.generic_visit(node)
+
+    AppendCollector().visit(create_node)
+
+    assert append_values[:2] == ['dict', 'rko_param_file']
+
+
+def test_graph_param_overrides_are_optional():
+    """Graph launch arguments must not override custom YAML by default."""
+    module = _parse_launch_ast()
+    generate_launch_description = _find_function(
+        module,
+        'generate_launch_description',
+    )
+    return_stmt = next(
+        node for node in generate_launch_description.body
+        if isinstance(node, ast.Return)
+    )
+    assert isinstance(return_stmt.value, ast.Call)
+
+    optional_overrides = [
+        'adjacent_edge_info_weight',
+        'use_scan_context',
+        'use_pcd_cache',
+        'threshold_loop_closure_score',
+        'distance_loop_closure',
+    ]
+    for argument_name in optional_overrides:
+        arg_call = _find_declare_launch_argument_call(
+            return_stmt.value,
+            argument_name,
+        )
+        default_kw = next(
+            kw for kw in arg_call.keywords if kw.arg == 'default_value'
+        )
+        assert _constant_string(default_kw.value) == ''
+
+
+def test_rko_graph_backend_receives_gnss_topic_override():
+    """RKO-LIO launch should pass gnss_topic through to graph_based_slam."""
+    module = _parse_launch_ast()
+    create_graph_node = _find_function(module, 'create_graph_based_slam_node')
+
+    parameters_assign = next(
+        node for node in create_graph_node.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == 'parameters'
+            for target in node.targets
+        )
+    )
+    assert isinstance(parameters_assign.value, ast.List)
+    dict_nodes = [elt for elt in parameters_assign.value.elts if isinstance(elt, ast.Dict)]
+    assert dict_nodes
+    launch_dict = dict_nodes[0]
+
+    found = False
+    for key, value in zip(launch_dict.keys, launch_dict.values):
+        if not isinstance(key, ast.Constant) or key.value != 'gnss_topic':
+            continue
+        if not isinstance(value, ast.Call):
+            continue
+        if not isinstance(value.func, ast.Name) or value.func.id != 'LaunchConfiguration':
+            continue
+        if not value.args or not isinstance(value.args[0], ast.Constant):
+            continue
+        if value.args[0].value == 'gnss_topic':
+            found = True
+            break
+
+    assert found
+
+
+def test_rko_launch_declares_gnss_topic_argument():
+    """RKO-LIO launch should expose a gnss_topic argument."""
+    module = _parse_launch_ast()
+    generate_launch_description = _find_function(
+        module,
+        'generate_launch_description',
+    )
+    return_stmt = next(
+        node for node in generate_launch_description.body
+        if isinstance(node, ast.Return)
+    )
+    assert isinstance(return_stmt.value, ast.Call)
+    gnss_topic_call = _find_declare_launch_argument_call(
+        return_stmt.value,
+        'gnss_topic',
+    )
+    default_kw = next(
+        kw for kw in gnss_topic_call.keywords if kw.arg == 'default_value'
+    )
+    assert _constant_string(default_kw.value) == '/gnss/fix'
+
+
+def test_bag_gnss_is_opt_in_and_feeds_the_offline_node_gnss_topic():
+    """bag_gnss:=true passes the bag's gnss_topic through the offline node."""
+    module = _parse_launch_ast()
+    generate_launch_description = _find_function(
+        module,
+        'generate_launch_description',
+    )
+    return_stmt = next(
+        node for node in generate_launch_description.body
+        if isinstance(node, ast.Return)
+    )
+    bag_gnss_call = _find_declare_launch_argument_call(return_stmt.value, 'bag_gnss')
+    default_kw = next(kw for kw in bag_gnss_call.keywords if kw.arg == 'default_value')
+    assert _constant_string(default_kw.value) == 'false'
+
+    factory = _find_function(module, 'create_rko_offline_node')
+    gnss_values = [
+        value
+        for launch_dict in (n for n in ast.walk(factory) if isinstance(n, ast.Dict))
+        for key, value in zip(launch_dict.keys, launch_dict.values)
+        if _constant_string(key) == 'gnss_topic'
+    ]
+    assert len(gnss_values) == 1
+    # Off unless bag_gnss is true: the conditional falls back to an empty topic.
+    assert isinstance(gnss_values[0], ast.IfExp)
+    assert _constant_string(gnss_values[0].orelse) == ''
+    assert 'bag_gnss' in ast.unparse(gnss_values[0].test)
+
+
+def test_offline_node_publishes_with_a_deep_queue_presets_can_override():
+    """Default depth 128, placed before the preset file so the preset wins."""
+    module = _parse_launch_ast()
+    factory = _find_function(module, 'create_rko_offline_node')
+    depths = [
+        value
+        for launch_dict in (n for n in ast.walk(factory) if isinstance(n, ast.Dict))
+        for key, value in zip(launch_dict.keys, launch_dict.values)
+        if _constant_string(key) == 'publisher_queue_depth'
+    ]
+    assert len(depths) == 1
+    assert isinstance(depths[0], ast.Constant) and depths[0].value == 128
+    source = ast.unparse(factory)
+    assert source.index("'publisher_queue_depth'") < source.index(
+        'parameters.append(rko_param_file)')
+
+
+def test_bag_gnss_makes_the_backend_gnss_reader_reliable():
+    """bag_gnss:=true asks graph_based_slam for a reliable GNSS subscription."""
+    module = _parse_launch_ast()
+    factory = _find_function(module, 'create_graph_based_slam_node')
+    guarded = [
+        node for node in ast.walk(factory)
+        if isinstance(node, ast.If) and 'bag_gnss' in ast.unparse(node.test)
+    ]
+    assert len(guarded) == 1
+    assert "overrides['gnss_subscriber_qos_reliable'] = True" in ast.unparse(guarded[0])
+
+
+def test_offline_gnss_passthrough_exists_in_vendored_rko_lio():
+    offline_node = (
+        REPO_ROOT / 'Thirdparty' / 'rko_lio' / 'rko_lio' / 'ros' / 'offline_node.cpp'
+    )
+    if not offline_node.is_file():
+        return  # submodule not checked out
+    assert 'declare_parameter<std::string>("gnss_topic"' in (
+        offline_node.read_text(encoding='utf-8')
+    )
+
+
+def test_offline_node_pins_odom_topic():
+    """The frontend must publish odometry on the fork's historical topic."""
+    # The upstream-integrated rko_lio renamed its default odometry topic from
+    # "rko_lio/odometry" to "rko_lio/odom".  The graph backend's odom_input
+    # remap (and the record_backend_input tooling) still expect
+    # "/rko_lio/odometry", so the launch must pin odom_topic explicitly;
+    # otherwise the backend silently receives no odometry and saves an empty
+    # map.
+    module = _parse_launch_ast()
+    factory = _find_function(module, 'create_rko_offline_node')
+
+    found = False
+    for launch_dict in (n for n in ast.walk(factory) if isinstance(n, ast.Dict)):
+        for key, value in zip(launch_dict.keys, launch_dict.values):
+            if _constant_string(key) != 'odom_topic':
+                continue
+            assert _constant_string(value) == '/rko_lio/odometry'
+            found = True
+    assert found
+
+
+def test_offline_node_pins_deskewed_scan_topic():
+    """The frontend must publish the deskewed scan where the backend listens."""
+    # Official rko_lio 0.4.1 renamed the deskewed scan topic from
+    # "rko_lio/frame" to "rko_lio/deskewed_scan".  The backend's cloud_input
+    # remap, the offline start barrier and the record_backend_input tooling
+    # use "/rko_lio/frame", so the launch must pin deskewed_scan_topic.
+    module = _parse_launch_ast()
+    factory = _find_function(module, 'create_rko_offline_node')
+
+    found = False
+    for launch_dict in (n for n in ast.walk(factory) if isinstance(n, ast.Dict)):
+        for key, value in zip(launch_dict.keys, launch_dict.values):
+            if _constant_string(key) != 'deskewed_scan_topic':
+                continue
+            assert _constant_string(value) == '/rko_lio/frame'
+            found = True
+    assert found
+
+
+def test_graph_backend_odom_remap_matches_frontend_topic():
+    """The backend odom_input remap must target the pinned frontend topic."""
+    module = _parse_launch_ast()
+    factory = _find_function(module, 'create_graph_based_slam_node')
+
+    remap_pairs = []
+    for call in (n for n in ast.walk(factory) if isinstance(n, ast.Call)):
+        if not isinstance(call.func, ast.Name) or call.func.id != 'Node':
+            continue
+        remappings_kw = next(
+            (kw for kw in call.keywords if kw.arg == 'remappings'), None
+        )
+        if remappings_kw is None:
+            continue
+        remap_pairs.extend(
+            tuple(_constant_string(elt) for elt in pair.elts)
+            for pair in remappings_kw.value.elts
+            if isinstance(pair, ast.Tuple)
+        )
+    assert ('odom_input', '/rko_lio/odometry') in remap_pairs
+    assert ('cloud_input', '/rko_lio/frame') in remap_pairs
+
+
+def test_offline_start_barrier_is_opt_in_and_fail_closed():
+    module = _parse_launch_ast()
+    generate_launch_description = _find_function(
+        module,
+        'generate_launch_description',
+    )
+    return_stmt = next(
+        node for node in generate_launch_description.body
+        if isinstance(node, ast.Return)
+    )
+    assert isinstance(return_stmt.value, ast.Call)
+
+    expected_defaults = {
+        'wait_for_output_subscribers': 'false',
+        'min_odom_subscribers': '1',
+        'min_deskewed_scan_subscribers': '1',
+        'subscriber_wait_timeout_sec': '30.0',
+        'subscriber_settle_polls': '3',
+    }
+    for argument_name, expected_default in expected_defaults.items():
+        argument = _find_declare_launch_argument_call(
+            return_stmt.value,
+            argument_name,
+        )
+        default_kw = next(
+            kw for kw in argument.keywords if kw.arg == 'default_value'
+        )
+        assert _constant_string(default_kw.value) == expected_default
+
+    launch_source = LAUNCH_PATH.read_text(encoding='utf-8')
+    assert 'wait_for_offline_output_subscribers.sh' in launch_source
+    assert "'/rko_lio/odometry'" in launch_source
+    assert "'/rko_lio/frame'" in launch_source
+    assert 'prefix = shlex.join([' in launch_source
+    assert "'output_subscriber_timeout_sec': subscriber_wait_timeout_sec" in launch_source
+    # The barrier script accepts only whole seconds, so the '30.0' default is
+    # rounded up before it reaches --timeout-secs.
+    assert 'str(max(1, math.ceil(subscriber_wait_timeout_sec)))' in launch_source
+    # rko_lio never declared these; passing them left the node's own wait off.
+    assert "'offline." not in launch_source
+    assert 'prefix=prefix' in launch_source
+
+
+def test_offline_node_waits_for_the_backend_by_default():
+    module = _parse_launch_ast()
+    generate_launch_description = _find_function(
+        module,
+        'generate_launch_description',
+    )
+    return_stmt = next(
+        node for node in generate_launch_description.body
+        if isinstance(node, ast.Return)
+    )
+    argument = _find_declare_launch_argument_call(
+        return_stmt.value,
+        'wait_for_backend',
+    )
+    default_kw = next(kw for kw in argument.keywords if kw.arg == 'default_value')
+    assert _constant_string(default_kw.value) == 'true'
+    launch_source = LAUNCH_PATH.read_text(encoding='utf-8')
+    # Only the node's own wait: no barrier script unless wait_for_output_subscribers.
+    assert "LaunchConfiguration('wait_for_backend').perform(context)" in launch_source
+    assert "'output_subscriber_timeout_sec': float(" in launch_source
+
+
+def test_offline_node_leaves_the_launch_prefix_to_ros2_launch():
+    # An empty prefix in the launch file would override ros2 launch --launch-prefix.
+    launch_source = LAUNCH_PATH.read_text(encoding='utf-8')
+    assert 'prefix=prefix or None,' in launch_source
+
+
+def test_offline_wait_parameter_exists_in_vendored_rko_lio():
+    offline_node = (
+        REPO_ROOT / 'Thirdparty' / 'rko_lio' / 'rko_lio' / 'ros' / 'offline_node.cpp'
+    )
+    if not offline_node.is_file():
+        return  # submodule not checked out
+    assert 'declare_parameter<double>("output_subscriber_timeout_sec"' in (
+        offline_node.read_text(encoding='utf-8')
+    )
+    # The node's parameters are read by rko_lio::driver::declare_driver_config.
+    driver_config = offline_node.parents[1] / 'driver' / 'driver_config.cpp'
+    assert 'declare<std::string>("deskewed_scan_topic"' in (
+        driver_config.read_text(encoding='utf-8')
+    )
+
+
+def _launch_function(name: str):
+    """Compile one helper of the launch file on its own, without ROS imports."""
+    function = _find_function(_parse_launch_ast(), name)
+    namespace = {'yaml': yaml}
+    module = ast.Module(body=[function], type_ignores=[])
+    exec(compile(module, str(LAUNCH_PATH), 'exec'), namespace)
+    return namespace[name]
+
+
+def test_graph_backend_receives_the_rko_lidar_extrinsic(tmp_path):
+    """cloud_input is a LiDAR-frame scan: the backend needs the frontend's extrinsic."""
+    load_rko_params = _launch_function('load_rko_params')
+    extrinsic = [0.7071068, -0.7071068, 0.0, 0.0, -0.001, -0.00855, 0.055]
+    ros_layout = tmp_path / 'ros.yaml'
+    ros_layout.write_text(
+        yaml.safe_dump({'/**': {'ros__parameters': {
+            'extrinsic_lidar2base_quat_xyzw_xyz': extrinsic}}}),
+        encoding='utf-8',
+    )
+    flat_layout = tmp_path / 'flat.yaml'
+    flat_layout.write_text(
+        yaml.safe_dump({'extrinsic_lidar2base_quat_xyzw_xyz': extrinsic}),
+        encoding='utf-8',
+    )
+    for path in (ros_layout, flat_layout):
+        loaded = load_rko_params(str(path))
+        assert loaded['extrinsic_lidar2base_quat_xyzw_xyz'] == extrinsic
+
+    source = ast.get_source_segment(
+        LAUNCH_PATH.read_text(encoding='utf-8'),
+        _find_function(_parse_launch_ast(), 'create_graph_based_slam_node'),
+    )
+    assert "LaunchConfiguration('rko_param_file')" in source
+    assert (
+        "load_rko_params(rko_param_file).get('extrinsic_lidar2base_quat_xyzw_xyz')"
+        in source
+    )
+    assert "overrides['extrinsic_lidar2base_quat_xyzw_xyz']" in source

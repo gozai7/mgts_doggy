@@ -1,0 +1,33 @@
+[
+  {
+    "name": "lidar_localization_ros2",
+    "url": "https://github.com/rsasaki0109/lidar_localization_ros2",
+    "commit": "a1d56ecbde0eb65ad6e238bca124aac95a226c30",
+    "date": "2026-11-23T12:46:41Z",
+    "archive_bytes": 33166209
+  },
+  {
+    "name": "ndt_omp_ros2",
+    "url": "https://github.com/rsasaki0109/ndt_omp_ros2",
+    "commit": "8b77fa5a6cdcad45bf35918361c892b6d94a287e"
+  },
+  {
+    "name": "kiss-icp",
+    "url": "https://github.com/PRBonn/kiss-icp",
+    "commit": "1ffa7d7512f10bfc8b1185095011fa31184019e3",
+    "date": "2026-05-04T10:33:52Z",
+    "archive_bytes": 76529
+  },
+  {
+    "name": "lidar_slam_ros2",
+    "url": "https://github.com/rsasaki0109/lidar_slam_ros2",
+    "commit": "bfe6d280e06cf6433f714a70f8e0f725a274890c",
+    "date": "2026-11-25T05:45:06Z",
+    "archive_bytes": 149194480
+  },
+  {
+    "name": "rko_fork",
+    "url": "https://github.com/rsasaki0109/rko_lio",
+    "commit": "74e6c27e9533e77b564638b18923ce573086acb4"
+  }
+]

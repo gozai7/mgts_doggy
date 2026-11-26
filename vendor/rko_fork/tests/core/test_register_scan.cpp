@@ -1,0 +1,678 @@
+// MIT License
+//
+// Copyright (c) 2025 Meher V.R. Malladi.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
+#include "eigen_approx.hpp"
+#include "rko_lio/core/lio.hpp"
+#include "synthetic_clouds.hpp"
+#include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers_floating_point.hpp>
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <random>
+#include <stdexcept>
+#include <tuple>
+#include <utility>
+
+using rko_lio::core::GRAVITY_MAG;
+using rko_lio::core::ImuControl;
+using rko_lio::core::LIO;
+using rko_lio::core::Nsec;
+using rko_lio::core::TimestampVector;
+using rko_lio::core::to_seconds;
+using rko_lio::core::Vector3dVector;
+using rko_lio::tests::approx_equal;
+using rko_lio::tests::make_hollow_cube;
+using Catch::Matchers::WithinAbs;
+
+namespace {
+inline Nsec ns_from_seconds(double s) { return Nsec(static_cast<int64_t>(std::llround(s * 1e9))); }
+}
+
+namespace {
+// dt between consecutive scans, used to derive the IMU values that produce a
+// given initial-guess pose. With v0 = 0 the kinematic model collapses to
+//   tau.head = a * DT^2 / 2,  tau.tail = omega * DT,  initial_guess = SE3::exp(tau).
+constexpr double DT = 1.0;
+constexpr double FIRST_SCAN_END = 0.1;
+constexpr double SECOND_SCAN_END = FIRST_SCAN_END + DT;
+
+TimestampVector linspace_timestamps(size_t n, double t_start, double t_end) {
+  TimestampVector ts;
+  ts.reserve(n);
+  for (size_t i = 0; i < n; ++i) {
+    const double frac = n == 1 ? 0.0 : static_cast<double>(i) / static_cast<double>(n - 1);
+    ts.emplace_back(ns_from_seconds(t_start + (t_end - t_start) * frac));
+  }
+  return ts;
+}
+
+// Single-instant timestamps for the second scan: deskewing reduces to identity
+// when every point shares end_time.
+TimestampVector instant_timestamps(size_t n, double t) {
+  return TimestampVector(n, ns_from_seconds(t));
+}
+
+void feed_imu(LIO& lio, double t_start, double t_end, int n,
+              const Eigen::Vector3d& acceleration, const Eigen::Vector3d& angular_velocity) {
+  for (int i = 0; i < n; ++i) {
+    ImuControl m;
+    const double frac = n == 1 ? 0.0 : static_cast<double>(i) / static_cast<double>(n - 1);
+    m.time = ns_from_seconds(t_start + (t_end - t_start) * frac);
+    m.acceleration = acceleration;
+    m.angular_velocity = angular_velocity;
+    lio.add_imu_measurement(m);
+  }
+}
+
+void feed_static_imu(LIO& lio, double t_start, double t_end, int n) {
+  feed_imu(lio, t_start, t_end, n, {0.0, 0.0, GRAVITY_MAG}, Eigen::Vector3d::Zero());
+}
+
+// Same as feed_imu but with per-sample Gaussian noise added to accel and gyro.
+// Seed is fixed at the call site so the test is deterministic.
+void feed_imu_noisy(LIO& lio, double t_start, double t_end, int n,
+                    const Eigen::Vector3d& acceleration, const Eigen::Vector3d& angular_velocity,
+                    double accel_stddev, double gyro_stddev, uint32_t seed) {
+  std::mt19937 rng(seed);
+  std::normal_distribution<double> a_noise(0.0, accel_stddev);
+  std::normal_distribution<double> g_noise(0.0, gyro_stddev);
+  for (int i = 0; i < n; ++i) {
+    ImuControl m;
+    const double frac = n == 1 ? 0.0 : static_cast<double>(i) / static_cast<double>(n - 1);
+    m.time = ns_from_seconds(t_start + (t_end - t_start) * frac);
+    m.acceleration = acceleration + Eigen::Vector3d{a_noise(rng), a_noise(rng), a_noise(rng)};
+    m.angular_velocity = angular_velocity + Eigen::Vector3d{g_noise(rng), g_noise(rng), g_noise(rng)};
+    lio.add_imu_measurement(m);
+  }
+}
+
+// Noise levels for the [!mayfail] robustness variants. Small enough that ICP
+// should still close the gap to ground truth; large enough to perturb the
+// IMU-derived initial guess noticeably.
+constexpr double NOISY_ACCEL_STDDEV = 0.05; // m/s^2
+constexpr double NOISY_GYRO_STDDEV = 5e-3;  // rad/s
+} // namespace
+
+TEST_CASE("First scan: empty map -> populated, single pose at lidar_state.time", "[register_scan]") {
+  LIO lio((LIO::Config{}));
+  const auto cloud = make_hollow_cube();
+  const auto ts = linspace_timestamps(cloud.size(), 0.0, FIRST_SCAN_END);
+
+  REQUIRE(lio.map.empty());
+  REQUIRE(lio.poses_with_timestamps.empty());
+
+  lio.register_scan(cloud, ts);
+
+  REQUIRE_FALSE(lio.map.empty());
+  REQUIRE(lio.poses_with_timestamps.size() == 1);
+  REQUIRE_THAT(to_seconds(lio.lidar_state.time), WithinAbs(FIRST_SCAN_END, 1e-9));
+  REQUIRE(approx_equal(lio.lidar_state.pose, Sophus::SE3d{}, 1e-12));
+  REQUIRE_THAT(to_seconds(lio.poses_with_timestamps[0].first), WithinAbs(FIRST_SCAN_END, 1e-9));
+}
+
+TEST_CASE("Identity registration: same cloud twice -> pose ~= identity", "[register_scan]") {
+  LIO lio((LIO::Config{}));
+  const auto cloud = make_hollow_cube();
+
+  lio.register_scan(cloud, linspace_timestamps(cloud.size(), 0.0, FIRST_SCAN_END));
+  feed_static_imu(lio, FIRST_SCAN_END + 0.05, SECOND_SCAN_END - 0.05, 10);
+  lio.register_scan(cloud, instant_timestamps(cloud.size(), SECOND_SCAN_END));
+
+  REQUIRE(lio.poses_with_timestamps.size() == 2);
+  REQUIRE(lio.lidar_state.pose.translation().norm() < 1e-3);
+  REQUIRE(lio.lidar_state.pose.so3().log().norm() < 1e-3);
+}
+
+TEST_CASE("deskew = false: register_scan still produces a valid pose", "[register_scan]") {
+  LIO::Config cfg{};
+  cfg.deskew = false;
+  LIO lio(cfg);
+  const auto cloud = make_hollow_cube();
+
+  lio.register_scan(cloud, linspace_timestamps(cloud.size(), 0.0, FIRST_SCAN_END));
+  feed_static_imu(lio, FIRST_SCAN_END + 0.05, SECOND_SCAN_END - 0.05, 10);
+  lio.register_scan(cloud, instant_timestamps(cloud.size(), SECOND_SCAN_END));
+
+  REQUIRE(lio.poses_with_timestamps.size() == 2);
+  REQUIRE(lio.lidar_state.pose.translation().norm() < 1e-3);
+  REQUIRE(lio.lidar_state.pose.so3().log().norm() < 1e-3);
+}
+
+TEST_CASE("Pure translation: recover +1m in x", "[register_scan]") {
+  LIO lio((LIO::Config{}));
+  const auto cloud = make_hollow_cube();
+
+  lio.register_scan(cloud, linspace_timestamps(cloud.size(), 0.0, FIRST_SCAN_END));
+
+  // Body accel a such that a * DT^2 / 2 = 1m in x  =>  a = 2 m/s^2. Add gravity for
+  // the raw IMU value so compensated body accel comes out to (a, 0, 0).
+  const Eigen::Vector3d t(1.0, 0.0, 0.0);
+  const Eigen::Vector3d a_body = 2.0 * t / (DT * DT);
+  const Eigen::Vector3d imu_accel = a_body + Eigen::Vector3d{0.0, 0.0, GRAVITY_MAG};
+  feed_imu(lio, FIRST_SCAN_END + 0.05, SECOND_SCAN_END - 0.05, 10, imu_accel, Eigen::Vector3d::Zero());
+
+  Vector3dVector cloud2;
+  cloud2.reserve(cloud.size());
+  for (const auto& p : cloud) {
+    cloud2.emplace_back(p - t);
+  }
+  lio.register_scan(cloud2, instant_timestamps(cloud2.size(), SECOND_SCAN_END));
+
+  const auto& pose = lio.lidar_state.pose;
+  REQUIRE(approx_equal(pose.translation(), t, 1e-3));
+  REQUIRE(pose.so3().log().norm() < 1e-3);
+}
+
+TEST_CASE("Pure rotation: recover 5 deg yaw", "[register_scan]") {
+  LIO lio((LIO::Config{}));
+  const auto cloud = make_hollow_cube();
+
+  lio.register_scan(cloud, linspace_timestamps(cloud.size(), 0.0, FIRST_SCAN_END));
+
+  // omega * DT = yaw (5 deg) about z  =>  omega = yaw/DT rad/s.
+  const double yaw = 5.0 * M_PI / 180.0;
+  const Eigen::Vector3d omega(0.0, 0.0, yaw / DT);
+  feed_imu(lio,
+           FIRST_SCAN_END + 0.05,
+           SECOND_SCAN_END - 0.05,
+           10,
+           {0.0, 0.0, GRAVITY_MAG},
+           omega);
+
+  const Sophus::SO3d R = Sophus::SO3d::rotZ(yaw);
+  const Sophus::SO3d R_inv = R.inverse();
+  Vector3dVector cloud2;
+  cloud2.reserve(cloud.size());
+  for (const auto& p : cloud) {
+    cloud2.emplace_back(R_inv * p);
+  }
+  lio.register_scan(cloud2, instant_timestamps(cloud2.size(), SECOND_SCAN_END));
+
+  const auto& pose = lio.lidar_state.pose;
+  REQUIRE(approx_equal(pose.so3(), R, 1e-3));
+  REQUIRE(pose.translation().norm() < 1e-3);
+}
+
+TEST_CASE("Full SE(3): translation + rotation combined", "[register_scan]") {
+  LIO lio((LIO::Config{}));
+  const auto cloud = make_hollow_cube();
+
+  lio.register_scan(cloud, linspace_timestamps(cloud.size(), 0.0, FIRST_SCAN_END));
+
+  // Combined yaw + acceleration
+  const double yaw = 3.0 * M_PI / 180.0;
+  const Eigen::Vector3d t(0.5, 0.3, 0.0);
+  const Eigen::Vector3d a_body = 2.0 * t / (DT * DT);
+  const Eigen::Vector3d imu_accel = a_body + Eigen::Vector3d{0.0, 0.0, GRAVITY_MAG};
+  const Eigen::Vector3d omega(0.0, 0.0, yaw / DT);
+  feed_imu(lio, FIRST_SCAN_END + 0.05, SECOND_SCAN_END - 0.05, 10, imu_accel, omega);
+
+  const Sophus::SE3d T_expected(Sophus::SO3d::rotZ(yaw), t);
+  const Sophus::SE3d T_inv = T_expected.inverse();
+  Vector3dVector cloud2;
+  cloud2.reserve(cloud.size());
+  for (const auto& p : cloud) {
+    cloud2.emplace_back(T_inv * p);
+  }
+  lio.register_scan(cloud2, instant_timestamps(cloud2.size(), SECOND_SCAN_END));
+
+  REQUIRE(approx_equal(lio.lidar_state.pose, T_expected, 1e-2));
+}
+
+// ===========================================================================
+// Noisy variants. The IMU-derived initial guess is perturbed by Gaussian noise;
+// ICP has to refine it. Tagged [!mayfail] so a borderline failure surfaces in
+// the report without breaking the suite -- drop the tag to make these strict.
+// ===========================================================================
+
+TEST_CASE("Noisy: pure translation +1m in x", "[register_scan][!mayfail]") {
+  LIO lio((LIO::Config{}));
+  const auto cloud = make_hollow_cube();
+
+  lio.register_scan(cloud, linspace_timestamps(cloud.size(), 0.0, FIRST_SCAN_END));
+
+  const Eigen::Vector3d t(1.0, 0.0, 0.0);
+  const Eigen::Vector3d a_body = 2.0 * t / (DT * DT);
+  const Eigen::Vector3d imu_accel = a_body + Eigen::Vector3d{0.0, 0.0, GRAVITY_MAG};
+  feed_imu_noisy(lio, FIRST_SCAN_END + 0.05, SECOND_SCAN_END - 0.05, 10, imu_accel,
+                 Eigen::Vector3d::Zero(), NOISY_ACCEL_STDDEV, NOISY_GYRO_STDDEV, /*seed=*/1u);
+
+  Vector3dVector cloud2;
+  cloud2.reserve(cloud.size());
+  for (const auto& p : cloud) {
+    cloud2.emplace_back(p - t);
+  }
+  lio.register_scan(cloud2, instant_timestamps(cloud2.size(), SECOND_SCAN_END));
+
+  const auto& pose = lio.lidar_state.pose;
+  CAPTURE(pose.translation().transpose(), pose.so3().log().transpose());
+  CHECK(approx_equal(pose.translation(), t, 1e-3));
+  CHECK(pose.so3().log().norm() < 1e-3);
+}
+
+TEST_CASE("Noisy: pure rotation 5 deg yaw", "[register_scan][!mayfail]") {
+  LIO lio((LIO::Config{}));
+  const auto cloud = make_hollow_cube();
+
+  lio.register_scan(cloud, linspace_timestamps(cloud.size(), 0.0, FIRST_SCAN_END));
+
+  const double yaw = 5.0 * M_PI / 180.0;
+  const Eigen::Vector3d omega(0.0, 0.0, yaw / DT);
+  feed_imu_noisy(lio, FIRST_SCAN_END + 0.05, SECOND_SCAN_END - 0.05, 10,
+                 {0.0, 0.0, GRAVITY_MAG}, omega, NOISY_ACCEL_STDDEV, NOISY_GYRO_STDDEV,
+                 /*seed=*/2u);
+
+  const Sophus::SO3d R = Sophus::SO3d::rotZ(yaw);
+  const Sophus::SO3d R_inv = R.inverse();
+  Vector3dVector cloud2;
+  cloud2.reserve(cloud.size());
+  for (const auto& p : cloud) {
+    cloud2.emplace_back(R_inv * p);
+  }
+  lio.register_scan(cloud2, instant_timestamps(cloud2.size(), SECOND_SCAN_END));
+
+  const auto& pose = lio.lidar_state.pose;
+  CAPTURE(pose.translation().transpose(), pose.so3().log().transpose());
+  CHECK(approx_equal(pose.so3(), R, 1e-3));
+  CHECK(pose.translation().norm() < 1e-3);
+}
+
+TEST_CASE("Noisy: full SE(3) translation + rotation", "[register_scan][!mayfail]") {
+  LIO lio((LIO::Config{}));
+  const auto cloud = make_hollow_cube();
+
+  lio.register_scan(cloud, linspace_timestamps(cloud.size(), 0.0, FIRST_SCAN_END));
+
+  const double yaw = 3.0 * M_PI / 180.0;
+  const Eigen::Vector3d t(0.5, 0.3, 0.0);
+  const Eigen::Vector3d a_body = 2.0 * t / (DT * DT);
+  const Eigen::Vector3d imu_accel = a_body + Eigen::Vector3d{0.0, 0.0, GRAVITY_MAG};
+  const Eigen::Vector3d omega(0.0, 0.0, yaw / DT);
+  feed_imu_noisy(lio, FIRST_SCAN_END + 0.05, SECOND_SCAN_END - 0.05, 10, imu_accel, omega,
+                 NOISY_ACCEL_STDDEV, NOISY_GYRO_STDDEV, /*seed=*/3u);
+
+  const Sophus::SE3d T_expected(Sophus::SO3d::rotZ(yaw), t);
+  const Sophus::SE3d T_inv = T_expected.inverse();
+  Vector3dVector cloud2;
+  cloud2.reserve(cloud.size());
+  for (const auto& p : cloud) {
+    cloud2.emplace_back(T_inv * p);
+  }
+  lio.register_scan(cloud2, instant_timestamps(cloud2.size(), SECOND_SCAN_END));
+
+  CAPTURE(lio.lidar_state.pose.translation().transpose(),
+          lio.lidar_state.pose.so3().log().transpose());
+  CHECK(approx_equal(lio.lidar_state.pose, T_expected, 1e-2));
+}
+
+TEST_CASE("Levenberg-Marquardt matches Gauss-Newton on a well-constrained scan", "[register_scan]") {
+  auto run = [](const bool lm) {
+    LIO::Config config;
+    config.icp_levenberg_marquardt = lm;
+    LIO lio(config);
+    const auto cloud = make_hollow_cube();
+    lio.register_scan(cloud, linspace_timestamps(cloud.size(), 0.0, FIRST_SCAN_END));
+    const Eigen::Vector3d t(0.5, 0.3, 0.0);
+    const Eigen::Vector3d imu_accel = 2.0 * t / (DT * DT) + Eigen::Vector3d{0.0, 0.0, GRAVITY_MAG};
+    feed_imu(lio, FIRST_SCAN_END + 0.05, SECOND_SCAN_END - 0.05, 10, imu_accel, Eigen::Vector3d::Zero());
+    Vector3dVector cloud2;
+    cloud2.reserve(cloud.size());
+    for (const auto& p : cloud) {
+      cloud2.emplace_back(p - t);
+    }
+    lio.register_scan(cloud2, instant_timestamps(cloud2.size(), SECOND_SCAN_END));
+    return lio.lidar_state.pose;
+  };
+  REQUIRE(approx_equal(run(true), run(false), 1e-4));
+}
+
+TEST_CASE("register_scan: empty timestamps throws instead of UB", "[register_scan]") {
+  LIO lio((LIO::Config{}));
+  const auto cloud = make_hollow_cube();
+  const TimestampVector empty_timestamps;
+  REQUIRE_THROWS_AS(lio.register_scan(cloud, empty_timestamps), std::invalid_argument);
+}
+
+TEST_CASE("Scans below min_icp_keypoints are not registered", "[register_scan]") {
+  // A mostly occluded scan: a few dozen keypoints that ICP could slide on.
+  Vector3dVector sparse;
+  for (int i = 0; i < 30; ++i) {
+    sparse.emplace_back(2.0 + 1.5 * i, (i % 2) ? 3.0 : -3.0, 0.3 * (i % 5));
+  }
+  const auto cloud = make_hollow_cube();
+  for (const size_t min_keypoints : {size_t{10}, size_t{100}}) {
+    LIO::Config config;
+    config.min_icp_keypoints = min_keypoints;
+    LIO lio(config);
+    lio.register_scan(cloud, linspace_timestamps(cloud.size(), 0.0, FIRST_SCAN_END));
+    feed_static_imu(lio, FIRST_SCAN_END + 0.05, SECOND_SCAN_END - 0.05, 10);
+    const auto register_sparse = [&] {
+      lio.register_scan(sparse, instant_timestamps(sparse.size(), SECOND_SCAN_END));
+    };
+    if (min_keypoints > sparse.size()) {
+      REQUIRE_THROWS_AS(register_sparse(), std::invalid_argument);
+      REQUIRE(lio.poses_with_timestamps.size() == 1);
+    } else {
+      REQUIRE_NOTHROW(register_sparse());
+    }
+  }
+}
+
+TEST_CASE("Scan gap re-anchor keeps the motion the IMU propagated", "[register_scan]") {
+  // The LiDAR drops out for ~2 s (> max_scan_delta_sec) while the IMU keeps streaming.
+  constexpr double gap_end = FIRST_SCAN_END + 2.0;
+  const double imu_span = gap_end - 0.05 - FIRST_SCAN_END; // first scan to last IMU sample
+  const auto cloud = make_hollow_cube();
+
+  SECTION("constant yaw rate") {
+    LIO lio((LIO::Config{}));
+    lio.register_scan(cloud, linspace_timestamps(cloud.size(), 0.0, FIRST_SCAN_END));
+    constexpr double yaw_rate = 0.5;
+    feed_imu(lio, FIRST_SCAN_END + 0.05, gap_end - 0.05, 40, {0.0, 0.0, GRAVITY_MAG}, {0.0, 0.0, yaw_rate});
+    REQUIRE(lio.register_scan(cloud, instant_timestamps(cloud.size(), gap_end)).empty());
+    REQUIRE_THAT(to_seconds(lio.lidar_state.time), WithinAbs(gap_end, 1e-9));
+    REQUIRE_THAT(lio.lidar_state.pose.so3().log().z(), WithinAbs(yaw_rate * imu_span, 1e-9));
+    REQUIRE(lio.lidar_state.pose.so3().log().head<2>().norm() < 1e-9);
+  }
+
+  SECTION("constant forward acceleration") {
+    LIO lio((LIO::Config{}));
+    lio.register_scan(cloud, linspace_timestamps(cloud.size(), 0.0, FIRST_SCAN_END));
+    constexpr double accel = 1.0;
+    feed_imu(lio, FIRST_SCAN_END + 0.05, gap_end - 0.05, 40, {accel, 0.0, GRAVITY_MAG}, Eigen::Vector3d::Zero());
+    REQUIRE(lio.register_scan(cloud, instant_timestamps(cloud.size(), gap_end)).empty());
+    REQUIRE_THAT(lio.lidar_state.pose.translation().x(), WithinAbs(0.5 * accel * imu_span * imu_span, 1e-6));
+    REQUIRE(lio.lidar_state.pose.so3().log().norm() < 1e-9);
+  }
+}
+
+TEST_CASE("samplewise_gyro_deskew only matters when the rate changes within an interval", "[register_scan]") {
+  const auto cloud = make_hollow_cube();
+  // 200 Hz IMU between the scans; the yaw rate is early_rate, then late_rate.
+  auto deskewed_second_scan = [&](bool samplewise, double early_rate, double late_rate) {
+    LIO::Config config;
+    config.samplewise_gyro_deskew = samplewise;
+    LIO lio(config);
+    lio.register_scan(cloud, linspace_timestamps(cloud.size(), 0.0, FIRST_SCAN_END));
+    feed_imu(lio, FIRST_SCAN_END + 0.005, FIRST_SCAN_END + 0.5, 100, {0.0, 0.0, GRAVITY_MAG}, {0.0, 0.0, early_rate});
+    feed_imu(lio, FIRST_SCAN_END + 0.505, SECOND_SCAN_END, 100, {0.0, 0.0, GRAVITY_MAG}, {0.0, 0.0, late_rate});
+    return lio.register_scan(cloud, linspace_timestamps(cloud.size(), SECOND_SCAN_END - 0.1, SECOND_SCAN_END));
+  };
+  auto max_point_difference = [](const Vector3dVector& a, const Vector3dVector& b) {
+    REQUIRE(a.size() == b.size());
+    double max_difference = 0.0;
+    for (size_t i = 0; i < a.size(); ++i) {
+      max_difference = std::max(max_difference, (a[i] - b[i]).norm());
+    }
+    return max_difference;
+  };
+
+  REQUIRE(LIO::Config{}.samplewise_gyro_deskew);
+
+  SECTION("constant rate: the integrated samples equal the mean rate") {
+    const auto samplewise = deskewed_second_scan(true, 0.5, 0.5);
+    const auto mean_rate = deskewed_second_scan(false, 0.5, 0.5);
+    REQUIRE_FALSE(samplewise.empty());
+    REQUIRE(max_point_difference(samplewise, mean_rate) < 1e-6);
+  }
+
+  SECTION("a rate step: only the samplewise model follows it") {
+    const auto samplewise = deskewed_second_scan(true, 0.0, 1.0);
+    const auto mean_rate = deskewed_second_scan(false, 0.0, 1.0);
+    REQUIRE_FALSE(samplewise.empty());
+    REQUIRE(max_point_difference(samplewise, mean_rate) > 1e-3);
+  }
+}
+
+TEST_CASE("Bump images alone and with the point-to-point terms both recover a translation", "[register_scan]") {
+  auto run = [](const double point_to_point_weight) {
+    LIO::Config config;
+    config.bump_image_registration = true;
+    config.bump_image_point_to_point_weight = point_to_point_weight;
+    // A map voxel as fine as the cloud, so that the point-to-point terms are not biased by the
+    // sampling (at the default 1 m voxel they alone would settle 9 cm off).
+    config.voxel_size = 0.1;
+    LIO lio(config);
+    const auto cloud = make_hollow_cube(0.1);
+    lio.register_scan(cloud, linspace_timestamps(cloud.size(), 0.0, FIRST_SCAN_END));
+    const Eigen::Vector3d t(0.5, 0.3, 0.0);
+    const Eigen::Vector3d imu_accel = 2.0 * t / (DT * DT) + Eigen::Vector3d{0.0, 0.0, GRAVITY_MAG};
+    feed_imu(lio, FIRST_SCAN_END + 0.05, SECOND_SCAN_END - 0.05, 10, imu_accel, Eigen::Vector3d::Zero());
+    Vector3dVector cloud2;
+    cloud2.reserve(cloud.size());
+    for (const auto& p : cloud) {
+      cloud2.emplace_back(p - t);
+    }
+    lio.register_scan(cloud2, instant_timestamps(cloud2.size(), SECOND_SCAN_END));
+    return std::pair{lio.lidar_state.pose, t};
+  };
+  for (const double weight : {0.0, 1.0}) {
+    const auto [pose, t] = run(weight);
+    INFO("weight " << weight << " translation " << pose.translation().transpose() << " rotation "
+                   << pose.so3().log().norm());
+    REQUIRE(approx_equal(pose.translation(), t, 1e-2));
+    REQUIRE(pose.so3().log().norm() < 1e-2);
+  }
+}
+
+TEST_CASE("Point-to-point terms wait for the start distance", "[register_scan]") {
+  // The second scan is 0.58 m from the first: with a start distance beyond that, the point-to-point
+  // terms are not added and the result is the bump terms' alone, to the bit.
+  auto run = [](const double point_to_point_weight, const double start_distance) {
+    LIO::Config config;
+    config.bump_image_registration = true;
+    config.voxel_size = 0.1;
+    config.bump_image_point_to_point_weight = point_to_point_weight;
+    config.bump_image_point_to_point_start_distance = start_distance;
+    LIO lio(config);
+    const auto cloud = make_hollow_cube(0.1);
+    lio.register_scan(cloud, linspace_timestamps(cloud.size(), 0.0, FIRST_SCAN_END));
+    const Eigen::Vector3d t(0.5, 0.3, 0.0);
+    const Eigen::Vector3d imu_accel = 2.0 * t / (DT * DT) + Eigen::Vector3d{0.0, 0.0, GRAVITY_MAG};
+    feed_imu(lio, FIRST_SCAN_END + 0.05, SECOND_SCAN_END - 0.05, 10, imu_accel, Eigen::Vector3d::Zero());
+    Vector3dVector cloud2;
+    cloud2.reserve(cloud.size());
+    for (const auto& p : cloud) {
+      cloud2.emplace_back(p - t);
+    }
+    lio.register_scan(cloud2, instant_timestamps(cloud2.size(), SECOND_SCAN_END));
+    return lio.lidar_state.pose;
+  };
+  const auto bump_alone = run(0.0, 0.0);
+  const auto waiting = run(1.0, 100.0);
+  REQUIRE(waiting.translation() == bump_alone.translation());
+  REQUIRE(waiting.so3().unit_quaternion().coeffs() == bump_alone.so3().unit_quaternion().coeffs());
+}
+
+TEST_CASE("Standing intervals set the gyro bias per interval, as their average, or not at all", "[register_scan]") {
+  // A static start, then a robot that sways while it stands: the intervals' mean rates
+  // alternate between +4 and -4 mrad/s about z (a tactical-grade gyro's bias is far smaller).
+  const auto run = [](const std::string& mode) {
+    LIO::Config config;
+    config.initialization_phase = true;
+    config.initialization_max_gyro_rad_s = 0.02;
+    config.start_standstill_radius = 1.0;
+    config.start_standstill_bias = mode;
+    LIO lio(config);
+    const auto cloud = make_hollow_cube();
+    lio.register_scan(cloud, instant_timestamps(cloud.size(), 0.1));
+    feed_static_imu(lio, 0.11, 0.2, 10);
+    lio.register_scan(cloud, instant_timestamps(cloud.size(), 0.2));
+    for (int k = 3; k <= 11; ++k) {
+      const double t = 0.1 * k;
+      const double rate = (k % 2 == 0 ? 1.0 : -1.0) * 0.004;
+      feed_imu(lio, t - 0.09, t, 10, {0.0, 0.0, GRAVITY_MAG}, {0.0, 0.0, rate});
+      lio.register_scan(cloud, instant_timestamps(cloud.size(), t));
+    }
+    return lio.imu_bias.gyroscope.z();
+  };
+  REQUIRE_THAT(run("interval"), WithinAbs(-0.004, 1e-6)); // the last interval's mean
+  REQUIRE(std::abs(run("average")) < 0.0006);              // nine intervals: +4, -4, ..., -4 mrad/s
+  REQUIRE_THAT(run("none"), WithinAbs(0.0, 1e-9));         // the static start's bias stays
+}
+
+TEST_CASE("A held standing scan keeps its position in a tilted frame", "[register_scan]") {
+  // A walking start leaves the frame tilted by about 11 deg; the biases stay at zero, so the
+  // IMU prediction of a standing robot carries 2 m/s^2 of misplaced gravity. The hold must not.
+  LIO::Config config;
+  config.initialization_phase = true;
+  config.initialization_max_gyro_rad_s = 0.02;
+  config.start_standstill_radius = 1.0;
+  config.start_standstill_hold = true;
+  config.start_standstill_bias = "none";
+  LIO lio(config);
+  const auto cloud = make_hollow_cube();
+  const Sophus::SO3d true_attitude = Sophus::SO3d::exp(Eigen::Vector3d(10.0 * M_PI / 180.0, 0.0, 0.0));
+  const Eigen::Vector3d standing_force = true_attitude.inverse() * Eigen::Vector3d(0.0, 0.0, GRAVITY_MAG);
+  lio.register_scan(cloud, instant_timestamps(cloud.size(), 0.1));
+  feed_imu(lio, 0.11, 0.2, 10, standing_force + Eigen::Vector3d(2.0, 0.0, 0.0), {0.0, 0.0, 0.1});
+  lio.register_scan(cloud, instant_timestamps(cloud.size(), 0.2));
+  const Eigen::Vector3d start = lio.lidar_state.pose.translation();
+  for (int k = 3; k <= 12; ++k) {
+    const double t = 0.1 * k;
+    feed_imu(lio, t - 0.09, t, 10, standing_force, Eigen::Vector3d::Zero());
+    lio.register_scan(cloud, instant_timestamps(cloud.size(), t));
+  }
+  REQUIRE(lio.start_standstill_count == 10);
+  REQUIRE((lio.lidar_state.pose.translation() - start).norm() < 1e-9);
+}
+
+TEST_CASE("A standing position is clamped to the hold radius", "[register_scan]") {
+  using rko_lio::core::clamp_to_radius;
+  const Eigen::Vector3d anchor(1.0, 2.0, 3.0);
+  // inside: unchanged; outside: pulled back onto the sphere along the same direction
+  REQUIRE(approx_equal(clamp_to_radius(anchor + Eigen::Vector3d(0.02, 0.0, 0.0), anchor, 0.05),
+                       anchor + Eigen::Vector3d(0.02, 0.0, 0.0), 1e-12));
+  REQUIRE(approx_equal(clamp_to_radius(anchor + Eigen::Vector3d(0.3, 0.4, 0.0), anchor, 0.05),
+                       anchor + Eigen::Vector3d(0.03, 0.04, 0.0), 1e-12));
+  // radius 0 keeps the anchor
+  REQUIRE(approx_equal(clamp_to_radius(anchor + Eigen::Vector3d(0.3, 0.4, 0.0), anchor, 0.0), anchor, 1e-12));
+}
+
+TEST_CASE("Standing intervals set the accelerometer bias too", "[register_scan]") {
+  // A static start, then standing intervals whose specific force leans 0.05 m/s^2 off the level
+  // attitude: they take it for an accelerometer bias, and the gyro bias follows them as well.
+  LIO::Config config;
+  config.initialization_phase = true;
+  config.initialization_max_gyro_rad_s = 0.02;
+  config.start_standstill_radius = 1.0;
+  config.start_standstill_bias = "interval";
+  LIO lio(config);
+  const auto cloud = make_hollow_cube();
+  lio.register_scan(cloud, instant_timestamps(cloud.size(), 0.1));
+  feed_static_imu(lio, 0.11, 0.2, 10);
+  lio.register_scan(cloud, instant_timestamps(cloud.size(), 0.2));
+  for (int k = 3; k <= 8; ++k) {
+    const double t = 0.1 * k;
+    feed_imu(lio, t - 0.09, t, 10, {0.05, 0.0, GRAVITY_MAG}, {0.0, 0.0, 0.003});
+    lio.register_scan(cloud, instant_timestamps(cloud.size(), t));
+  }
+  REQUIRE(lio.start_standstill_count == 6);
+  REQUIRE_THAT(lio.imu_bias.gyroscope.z(), WithinAbs(0.003, 1e-9));
+  REQUIRE_THAT(lio.imu_bias.accelerometer.x(), WithinAbs(0.05, 1e-3));
+}
+
+TEST_CASE("A moving start's gravity can go to the output filter alone", "[register_scan]") {
+  // The sensor stands tilted by 10 deg of roll after a walking first interval, so the initial
+  // gravity is off. With moving_start_gravity_output_only the window's estimate reaches only the
+  // output filter: the registered poses are those of a run without the window.
+  const auto run = [](const double window_sec, const bool output_only) {
+    LIO::Config config;
+    config.initialization_phase = true;
+    config.initialization_max_gyro_rad_s = 0.02;
+    config.moving_start_gravity_window_sec = window_sec;
+    config.moving_start_gravity_output_only = output_only;
+    config.output_filter_position_sigma = 0.02;
+    LIO lio(config);
+    const auto cloud = make_hollow_cube();
+    const Sophus::SO3d true_attitude = Sophus::SO3d::exp(Eigen::Vector3d(10.0 * M_PI / 180.0, 0.0, 0.0));
+    const Eigen::Vector3d standing_force = true_attitude.inverse() * Eigen::Vector3d(0.0, 0.0, GRAVITY_MAG);
+    lio.register_scan(cloud, instant_timestamps(cloud.size(), 0.1));
+    feed_imu(lio, 0.11, 0.2, 10, standing_force + Eigen::Vector3d(2.0, 0.0, 0.0), {0.0, 0.0, 0.1});
+    lio.register_scan(cloud, instant_timestamps(cloud.size(), 0.2));
+    for (int k = 3; k <= 35; ++k) {
+      const double t = 0.1 * k;
+      feed_imu(lio, t - 0.09, t, 10, standing_force, Eigen::Vector3d::Zero());
+      lio.register_scan(cloud, instant_timestamps(cloud.size(), t));
+    }
+    return std::make_tuple(lio.poses_with_timestamps, lio.output_poses_with_timestamps, lio.moving_start_gravity_tilt_deg);
+  };
+  const auto [poses_off, output_off, tilt_off] = run(0.0, false);
+  const auto [poses_only, output_only, tilt_only] = run(1.0, true);
+  REQUIRE(tilt_off == 0.0);
+  REQUIRE(tilt_only > 5.0); // estimated
+  REQUIRE(poses_only.size() == poses_off.size());
+  for (size_t i = 0; i < poses_off.size(); ++i) {
+    REQUIRE(poses_only[i].second.translation() == poses_off[i].second.translation());
+  }
+  // without the window the output after a moving start is the registration's; with it, the
+  // filter runs once the gravity is estimated
+  for (size_t i = 0; i < poses_off.size(); ++i) {
+    REQUIRE(output_off[i].second.translation() == poses_off[i].second.translation());
+  }
+  REQUIRE(output_only.size() == poses_only.size());
+  bool filtered = false;
+  for (size_t i = 0; i < poses_only.size(); ++i) {
+    filtered = filtered || output_only[i].second.translation() != poses_only[i].second.translation();
+  }
+  REQUIRE(filtered);
+  // the filtered output stays with the standing sensor
+  REQUIRE((output_only.back().second.translation() - poses_only.back().second.translation()).norm() < 0.01);
+}
+
+TEST_CASE("The start standstill handling can be kept to moving starts", "[register_scan]") {
+  // The same standing robot after a static and after a walking start: with
+  // start_standstill_moving_start_only only the walking start counts standing intervals, and the
+  // static start runs as without start_standstill_radius.
+  const auto run = [](const bool moving_start, const double radius) {
+    LIO::Config config;
+    config.initialization_phase = true;
+    config.initialization_max_gyro_rad_s = 0.02;
+    config.start_standstill_radius = radius;
+    config.start_standstill_hold = true;
+    config.start_standstill_moving_start_only = true;
+    LIO lio(config);
+    const auto cloud = make_hollow_cube();
+    lio.register_scan(cloud, instant_timestamps(cloud.size(), 0.1));
+    if (moving_start) {
+      feed_imu(lio, 0.11, 0.2, 10, {1.0, 0.0, GRAVITY_MAG}, {0.0, 0.0, 0.1});
+    } else {
+      feed_static_imu(lio, 0.11, 0.2, 10);
+    }
+    lio.register_scan(cloud, instant_timestamps(cloud.size(), 0.2));
+    for (int k = 3; k <= 8; ++k) {
+      const double t = 0.1 * k;
+      feed_imu(lio, t - 0.09, t, 10, {0.0, 0.0, GRAVITY_MAG}, {0.0, 0.0, 0.003});
+      lio.register_scan(cloud, instant_timestamps(cloud.size(), t));
+    }
+    return std::make_pair(lio.start_standstill_count, lio.poses_with_timestamps);
+  };
+  REQUIRE(run(true, 1.0).first == 6);
+  const auto [count, poses] = run(false, 1.0);
+  REQUIRE(count == 0);
+  const auto [count_off, poses_off] = run(false, 0.0);
+  REQUIRE(poses.size() == poses_off.size());
+  for (size_t i = 0; i < poses.size(); ++i) {
+    REQUIRE(poses[i].second.translation() == poses_off[i].second.translation());
+  }
+}

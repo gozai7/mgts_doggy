@@ -1,0 +1,42 @@
+# Handheld Livox MID-360 outdoors (Koide et al. hard localization dataset).
+# Set KOIDE_ROOT to the directory with sequences/, gt/ and the map_*.ply files.
+# The maps are in the ground-truth frame; kidnap sequences cover the sensor
+# and carry it elsewhere, so they also test recovery.
+# Quickstart runs with the default (standalone) profile (the mid360 profile's
+# imu_accel_scale is for an IMU in g; these bags' is in m/s^2) and with odometry
+# prediction, so it gets the defaults with odometry prediction: the 2 s window
+# guard, 1.5 m candidate suppression and the near-alias rule
+# (docs/quickstart.md#defaults-with-odometry-prediction). Results up to v1.12.0
+# had none of them; to compare with them add quickstart_args:
+# [--seed-correction-window-sec=0, --global-nms-radius-m=3,
+#  --global-consensus-near-alias-samples=0].
+defaults:
+  repeats: 3
+  odometry_launch: lidarslam rko_lio_odometry.launch.py
+  odometry_args: [lidar_topic:=/livox/points, imu_topic:=/livox/imu]
+  topics: [/livox/points, /livox/imu]
+cases:
+  - name: outdoor_hard_01a
+    bag: ${KOIDE_ROOT}/sequences/outdoor_hard_01a
+    map: ${KOIDE_ROOT}/map_outdoor_hard.ply
+    gt: ${KOIDE_ROOT}/gt/traj_lidar_outdoor_hard_01.txt
+  - name: outdoor_hard_01b
+    bag: ${KOIDE_ROOT}/sequences/outdoor_hard_01b
+    map: ${KOIDE_ROOT}/map_outdoor_hard.ply
+    gt: ${KOIDE_ROOT}/gt/traj_lidar_outdoor_hard_01.txt
+  - name: outdoor_hard_02a
+    bag: ${KOIDE_ROOT}/sequences/outdoor_hard_02a
+    map: ${KOIDE_ROOT}/map_outdoor_hard.ply
+    gt: ${KOIDE_ROOT}/gt/traj_lidar_outdoor_hard_02.txt
+  - name: outdoor_hard_02b
+    bag: ${KOIDE_ROOT}/sequences/outdoor_hard_02b
+    map: ${KOIDE_ROOT}/map_outdoor_hard.ply
+    gt: ${KOIDE_ROOT}/gt/traj_lidar_outdoor_hard_02.txt
+  - name: outdoor_kidnap_a
+    bag: ${KOIDE_ROOT}/sequences/outdoor_kidnap_a
+    map: ${KOIDE_ROOT}/map_outdoor_kidnap.ply
+    gt: ${KOIDE_ROOT}/gt/traj_lidar_outdoor_kidnap.txt
+  - name: outdoor_kidnap_b
+    bag: ${KOIDE_ROOT}/sequences/outdoor_kidnap_b
+    map: ${KOIDE_ROOT}/map_outdoor_kidnap.ply
+    gt: ${KOIDE_ROOT}/gt/traj_lidar_outdoor_kidnap.txt

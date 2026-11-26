@@ -1,0 +1,98 @@
+name: docs-site
+
+on:
+  push:
+    branches:
+      - develop
+    paths:
+      - 'docs/**'
+      - 'web/**'
+      - 'Thirdparty/rko_lio'
+      - 'mkdocs.yml'
+      - '.github/workflows/docs-site.yml'
+      - 'README.md'
+      - 'VERSION'
+      - 'scripts/generate_docs_deployment_manifest.py'
+      - 'scripts/docs_deployment_contract.py'
+      - 'scripts/check_first_map_verification_package.py'
+      - 'docs/schemas/first-map-verification-package-v1.schema.json'
+      - 'scripts/product_schema.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: docs-site
+  cancel-in-progress: true
+
+jobs:
+  build:
+    if: github.ref == 'refs/heads/develop'
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install doc dependencies
+        shell: bash
+        run: |
+          python3 -m pip install --upgrade jsonschema mkdocs mkdocs-material
+
+      - name: Build the browser demo module
+        shell: bash
+        run: |
+          web/install_wasm_toolchain.sh "${RUNNER_TEMP}/wasm-include"
+          web/build_wasm.sh --include-dir "${RUNNER_TEMP}/wasm-include" --out-dir docs/demo
+          web/build_wasm.sh --include-dir "${RUNNER_TEMP}/wasm-include" \
+            --out-dir "${RUNNER_TEMP}/wasm-node" --target node
+          node web/replay_node.js "${RUNNER_TEMP}/wasm-node/slam_web_node.js" \
+            docs/demo/clip_mid360_60s.lswc2.gz docs/demo/params.json \
+            "${RUNNER_TEMP}/wasm.tum" --reference web/demo_reference.tum
+
+      - name: Build site
+        shell: bash
+        run: |
+          python3 scripts/check_first_map_verification_package.py --json
+          python3 -m mkdocs build --strict
+          python3 scripts/check_docs_metadata.py
+
+      - name: Bind rendered docs to the exact source revision
+        shell: bash
+        run: |
+          python3 scripts/generate_docs_deployment_manifest.py \
+            --site-dir site \
+            --source-revision "${GITHUB_SHA}" \
+            --version-file VERSION
+          python3 -m json.tool site/docs-deployment-v1.json >/dev/null
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: site
+
+  deploy:
+    if: github.ref == 'refs/heads/develop'
+    needs: build
+    runs-on: ubuntu-24.04
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Deploy GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
