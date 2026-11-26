@@ -65,8 +65,23 @@ def validate(c, require_imu=True):
     for v in c["time_offsets_s"].values():
         if not np.isfinite(v):
             raise ValueError("Time offsets must be finite")
-    if c["localization"]["prediction"] not in ("constant_velocity", "kinematic", "imu"):
+    localization = c["localization"]
+    if localization["prediction"] not in ("constant_velocity", "kinematic", "imu"):
         raise ValueError("Choose one localization predictor")
+    for key in ("prior_map", "prior_trajectory"):
+        value = localization.get(key)
+        if value is not None and (not isinstance(value, str) or not value):
+            raise ValueError(f"localization.{key} must be a path or null")
+    if localization.get("prior_trajectory") and not localization.get("prior_map"):
+        raise ValueError("localization.prior_trajectory requires localization.prior_map")
+    for key in ("deskew", "use_odom_origin_hint"):
+        if key in localization and not isinstance(localization[key], bool):
+            raise ValueError(f"localization.{key} must be a boolean")
+    if localization.get("use_odom_origin_hint") and localization["prediction"] != "kinematic":
+        raise ValueError("An odom origin hint requires kinematic prediction")
+    max_step = c["mapping"].get("max_trajectory_step_m")
+    if max_step is not None and (type(max_step) not in (int, float) or not np.isfinite(max_step) or max_step <= 0):
+        raise ValueError("mapping.max_trajectory_step_m must be positive")
     occ = c["occupancy"]
     for key in ("resolution_m", "angular_bins", "every_n_scans", "min_hit_scans", "max_pose_gap_s", "max_cells"):
         if not np.isfinite(occ[key]) or occ[key] <= 0:

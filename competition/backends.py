@@ -191,15 +191,32 @@ def localization_config(c, path, map_path):
         "voxel_leaf_size": float(l["voxel_leaf_size"]), "scan_period": float(c["lidar"]["scan_period_s"]),
         "scan_min_range": float(c["lidar"]["range_m"][0]), "scan_max_range": float(c["lidar"]["range_m"][1]),
         "publish_tf": True, "enable_map_odom_tf": predictor == "kinematic",
-        "use_odom": predictor == "kinematic", "use_odom_tf_prediction": False,
+        "use_odom": predictor == "kinematic", "use_odom_tf_prediction": predictor == "kinematic",
         "use_twist_prediction": False, "use_imu_preintegration": predictor == "imu",
         "imu_preintegration_use_base_frame_transform": True, "imu_accel_scale": 1.0,
         "predict_pose_from_previous_delta": predictor == "constant_velocity",
-        "use_continuous_time_deskew": c["point_time"]["mode"] != "none",
+        "use_continuous_time_deskew": l.get("deskew", True) and c["point_time"]["mode"] != "none",
         "continuous_time_deskew_mode": "imu_pose_history" if predictor == "imu" else "relative_motion",
         "point_timestamp_unit": "seconds", "enable_timer_publishing": False,
         "publish_bridge_pose_when_lost": False, "cloud_queue_depth": 50,
         "enable_reinitialization_request_output": True, "enable_reinitialization_request_latch": True}
+    tuning = {
+        "level_map_to_odom": False, "gicp_max_correspondence_distance": 2.0,
+        "min_inlier_ratio": 0.0, "inlier_ratio_distance_m": 0.5, "inlier_ratio_min_points": 200,
+        "enable_seed_correction_guard": False, "seed_correction_guard_translation_m": 0.5,
+        "seed_correction_guard_yaw_deg": 15.0, "seed_correction_guard_warmup_accepts": 5,
+        "seed_correction_guard_release_rejections": 10, "enable_seed_correction_window_guard": False,
+        "seed_correction_window_guard_translation_m": 0.3,
+    }
+    overrides = l.get("registration_parameters", {})
+    if not isinstance(overrides, dict):
+        raise ValueError("localization.registration_parameters must be a mapping")
+    parameter_types = {key: type(value) for key, value in tuning.items()}
+    tune(tuning, overrides)
+    for key in overrides:
+        if parameter_types[key] is int and type(tuning[key]) is not int:
+            raise ValueError(f"Expected integer tuning parameter {key}")
+        params[key] = parameter_types[key](tuning[key])
     if initial is not None:
         params.update({"initial_pose_" + k: float(v) for k, v in zip(("x","y","z","qx","qy","qz","qw"), initial)})
     yaml_params(path, params)

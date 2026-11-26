@@ -62,6 +62,31 @@ phase_overrides:
 Это пример синтаксиса, не калибровка реального робота. Оставшиеся значения наследуются.
 Менять физическую калибровку между проходами следует только по измеренным данным.
 
+## Записи Unitree Go2 из hackathon
+
+В `configs/competition/go2.yaml` заданы калибровки LiDAR и IMU, исходные топики
+и относительное время точек в секундах. Для записи B бортовая одометрия предсказывает
+движение между сканами. Её первая поза добавляется к кандидатам автостарта и
+проверяется по карте, в том числе на отдельном скане.
+
+Распакуйте архивы A и B так, чтобы в `DATA_DIR` находились каталоги
+`bag_for_mapping` и `bag_for_localization`. Из корня проекта выполните:
+
+```bash
+export DATA_DIR=/absolute/path/to/rosbags
+make build
+docker compose run --rm competition python3 tools/go2_reference_map.py /data/bag_for_mapping /results/go2-prior
+make localization CONFIG=configs/competition/go2.yaml
+```
+
+Экспорт создаёт новый каталог `results/go2-prior` в стандартном `RESULTS_DIR`.
+Карта строится из записанных облаков A `/utlidar/cloud_deskewed` в системе `odom`.
+Траектория A берётся из `/utlidar/robot_odom`. Для RViz укажите
+`/results/go2-calibrated` в [команде просмотра](VISUALIZATION.md#rviz-готовый-результат).
+Сборка карты A из сырых данных Fast-LIO пока расходится. В профиле Go2 этап
+`mapping` останавливается, если шаг между соседними позами больше 0,5 м.
+Команда `localization` использует указанный в профиле PCD независимо от этапа `mapping`.
+
 ## Настройка алгоритма
 
 Сначала изменяйте range, плотность/voxel и профиль. Сгенерированные нативные конфигурации

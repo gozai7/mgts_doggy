@@ -7,7 +7,8 @@ from competition.cold_start import initialize
 
 
 @pytest.mark.parametrize("duplicate", [False, True])
-def test_unknown_start(tmp_path, config, duplicate):
+@pytest.mark.parametrize("kinematic", [False, True])
+def test_unknown_start(tmp_path, config, duplicate, kinematic):
     rng = np.random.default_rng(12)
     # Perpendicular walls and an off-centre pillar distinguish position and heading.
     line = np.linspace(-3, 3, 81)
@@ -26,8 +27,26 @@ def test_unknown_start(tmp_path, config, duplicate):
     bag = tmp_path / "B"
     config["extrinsics"]["T_base_lidar"] = [0, 0, 0, 0, 0, 0, 1]
     times = [1_000_000_000 + 300_000_000*i for i in range(9)]
-    bagio.write_messages(bag, (("/competition/lidar", n,
-                        cloud.pack(scene + rng.normal(0, .003, scene.shape), n, "lidar")) for n in times))
+    rows = []
+    for i, n in enumerate(times):
+        motion = np.array([.15 * i, .03 * i, 0.]) if kinematic else np.zeros(3)
+        rows.append(("/competition/lidar", n, cloud.pack(scene - motion + rng.normal(0, .003, scene.shape), n, "lidar")))
+        if kinematic:
+            types = bagio.STORE.types
+            odom = types["nav_msgs/msg/Odometry"](
+                bagio.header(n, "odom"), "base_link",
+                types["geometry_msgs/msg/PoseWithCovariance"](
+                    types["geometry_msgs/msg/Pose"](
+                        types["geometry_msgs/msg/Point"](*(motion + [37., 13., 0.])),
+                        types["geometry_msgs/msg/Quaternion"](0., 0., 0., 1.)), np.zeros(36)),
+                types["geometry_msgs/msg/TwistWithCovariance"](
+                    types["geometry_msgs/msg/Twist"](
+                        types["geometry_msgs/msg/Vector3"](0., 0., 0.),
+                        types["geometry_msgs/msg/Vector3"](0., 0., 0.)), np.zeros(36)))
+            rows.append(("/competition/odometry", n, odom))
+    bagio.write_messages(bag, rows)
+    if kinematic:
+        config["localization"].update(prediction="kinematic", use_odom_origin_hint=True)
     if duplicate:
         with pytest.raises(ValueError, match="No unambiguous"):
             initialize(name, bag, config)

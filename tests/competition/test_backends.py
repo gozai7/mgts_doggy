@@ -65,6 +65,7 @@ def test_only_one_motion_predictor(config,tmp_path,predictor):
  if predictor=='kinematic':config['topics']['odometry']='/odom'
  p=backends.localization_config(config,tmp_path/'l.yaml','/map.pcd')
  assert sum([p['use_odom'],p['use_imu_preintegration'],p['predict_pose_from_previous_delta']])==1
+ assert p['use_odom_tf_prediction'] == (predictor == 'kinematic')
  assert p['initial_pose_qw']==1.;assert p['reject_above_score_threshold']
 
 def test_config_parameters_are_in_pinned_localizer(config,tmp_path):

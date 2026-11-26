@@ -63,10 +63,28 @@ def normalized(c, phase, root, baseline=False):
     return dest / "bag", resolved
 
 
+def localization_map(loc, root):
+    if loc.get("prior_map"):
+        return Path(loc["prior_map"]), loc.get("prior_trajectory")
+    return root / "mapping/map.pcd", root / "mapping/trajectory_optimized.tum"
+
+
 def run_phase(phase, c, root, backend):
     if shutil.which("ros2") is None and phase in ("mapping", "localization", "baseline"):
         raise RuntimeError("ROS 2 is unavailable. Run inside the built competition Docker image")
     folder = root / phase
+    if phase == "localization":
+        loc = phase_config(c, phase)["localization"]
+        map_path, reference_trajectory = localization_map(loc, root)
+        mapping_marker = root / "mapping/complete.json"
+        if not loc.get("prior_map") and (
+            not mapping_marker.is_file() or json.loads(mapping_marker.read_text()).get("backend") != backend
+        ):
+            raise ValueError("Mapping has no successful checkpoint")
+        if not map_path.is_file():
+            raise FileNotFoundError(f"Localization map not found: {map_path}")
+        map_identity = source_identity(map_path)
+        prior_trajectory_identity = source_identity(loc["prior_trajectory"]) if loc.get("prior_trajectory") else None
     if (folder / "complete.json").exists():
         saved = json.loads((folder / "complete.json").read_text())
         if saved.get("backend") != backend or saved.get("phase_config_sha256") != phase_fingerprint(c, phase):
@@ -75,8 +93,9 @@ def run_phase(phase, c, root, backend):
         if not all((folder / x).is_file() and (folder / x).stat().st_size > 0 for x in required):
             raise RuntimeError("Completed phase has missing artifacts; use a new output root")
         normalized(c, phase, root, phase == "baseline")
-        if phase == "localization" and saved.get("map_identity") != source_identity(root / "mapping/map.pcd"):
-            raise ValueError("Map changed after localization; choose a new output root")
+        if phase == "localization" and (saved.get("map_identity") != map_identity or
+                                        saved.get("prior_trajectory_identity") != prior_trajectory_identity):
+            raise ValueError("Reference changed after localization; choose a new output root")
         print(f"Reusing validated {phase} checkpoint {folder}")
         return
     if folder.exists():
@@ -115,16 +134,15 @@ def run_phase(phase, c, root, backend):
             write_json(folder / "coverage.json", quality)
             if quality["coverage_fraction"] < c["mapping"]["min_trajectory_coverage"]:
                 raise RuntimeError("Mapping trajectory coverage below configured threshold; inspect partial output")
+            max_step = resolved["mapping"].get("max_trajectory_step_m")
+            if max_step is not None and quality["maximum_step_m"] is not None and quality["maximum_step_m"] > max_step:
+                raise RuntimeError(f"Mapping trajectory has a step of {quality['maximum_step_m']:.3f} m; limit is {max_step:.3f} m")
         else:
             if phase == "localization":
-                map_path = root / "mapping/map.pcd"
-                mapping_marker = root / "mapping/complete.json"
-                if not mapping_marker.is_file() or json.loads(mapping_marker.read_text()).get("backend") != backend:
-                    raise ValueError("Mapping has no successful checkpoint")
                 loc = resolved["localization"]
                 if loc["initial_pose"] is None and not loc.get("manual_initial_pose"):
                     from .cold_start import initialize
-                    result = initialize(map_path, bag, resolved, root / "mapping/trajectory_optimized.tum")
+                    result = initialize(map_path, bag, resolved, reference_trajectory)
                     write_json(folder / "initialization.json", result)
                     loc["initial_pose"] = result["initial_pose"]
                     (folder / "config_resolved.yaml").write_text(yaml.safe_dump(resolved))
@@ -145,7 +163,8 @@ def run_phase(phase, c, root, backend):
             read_tum(folder / "trajectory.tum")
         write_json(folder / "complete.json", {"complete": True, "backend": backend, "phase": phase,
                    "phase_config_sha256": phase_fingerprint(c, phase),
-                   "map_identity": source_identity(root / "mapping/map.pcd") if phase == "localization" else None,
+                   "map_identity": map_identity if phase == "localization" else None,
+                   "prior_trajectory_identity": prior_trajectory_identity if phase == "localization" else None,
                    "requested_config_sha256": fingerprint(c), "resolved_config_sha256": fingerprint(resolved),
                    "wall_time_s": time.monotonic() - started})
     except BaseException as e:
@@ -175,7 +194,8 @@ def main(argv=None):
             backends.fastlio_config(mapping, d / "mapping", root / "normalized/mapping/bag", root / "mapping/backend")
         else:
             backends.rko_configs(mapping, d / "mapping", root / "normalized/mapping/bag", root / "mapping")
-        backends.localization_config(localization, d / "localization.yaml", root / "mapping/map.pcd")
+        backends.localization_config(localization, d / "localization.yaml",
+                                    localization_map(localization["localization"], root)[0])
         print(f"Configuration generated in {d}; no SLAM was executed")
         return 0
     if args.action == "normalize":

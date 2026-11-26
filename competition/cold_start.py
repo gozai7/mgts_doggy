@@ -9,7 +9,7 @@ from scipy.spatial.transform import Rotation
 
 from . import bagio, cloud, pcd
 from .config import pose7, transform
-from .trajectory import read_tum
+from .trajectory import interpolate, read_tum
 
 # Use the same BBS implementation as the team's ROS global-localization node.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "vendor/lidar_localization_ros2/scripts"))
@@ -86,22 +86,49 @@ def initialize(map_path, bag, config, reference_path=None):
     query_after = 1.
     with bagio.reader(bag) as reader:
         conns = [c for c in reader.connections if c.topic == "/competition/lidar"]
+        odometry = None
+        if config["localization"]["prediction"] == "kinematic":
+            odometry_conns = [c for c in reader.connections if c.topic == "/competition/odometry"]
+            odometry = []
+            for conn, _, data in reader.messages(connections=odometry_conns):
+                msg = reader.deserialize(data, conn.msgtype)
+                odometry.append([bagio.ns(msg) * 1e-9, *bagio.pose_values(msg.pose.pose)])
+            odometry = np.asarray(odometry)
+            if len(odometry) < 2:
+                raise ValueError("Automatic initialization requires normalized B odometry")
         for conn, _, data in reader.messages(connections=conns):
             msg = reader.deserialize(data, conn.msgtype)
             stamp = bagio.ns(msg)
             if last_stamp is not None and stamp - last_stamp < 250_000_000:
                 continue
+            if odometry is not None:
+                time_s = stamp * 1e-9
+                period = config["lidar"]["scan_period_s"]
+                if previous is None and 0 < odometry[0, 0] - time_s <= period:
+                    time_s = odometry[0, 0]
+                pose_at_scan, valid = interpolate(odometry, [time_s], max_gap=2 * period)
+                if not valid[0]:
+                    if previous is None:
+                        raise ValueError("B odometry does not cover the first LiDAR scan")
+                    continue
+                odom_from_current = transform(pose_at_scan[0])
             points = sample(moved(cloud.unpack(msg)[0], mount), .12, 1800)
             if len(points) < 12:
                 raise ValueError("Insufficient B scan geometry for automatic initialization")
             if previous is None:
                 first_stamp = last_stamp = stamp
                 accumulated, previous = points, cKDTree(points)
+                if odometry is not None:
+                    first_from_odom = np.linalg.inv(odom_from_current)
+                    odom_origin_hint = odom_from_current if config["localization"].get("use_odom_origin_hint") else None
                 continue
-            step = fit(points, previous, np.eye(4))
-            if distance(points, previous, step) > .24:
-                raise ValueError("Cannot link successive B scans for automatic initialization")
-            first_from_current = first_from_current @ step
+            if odometry is not None:
+                first_from_current = first_from_odom @ odom_from_current
+            else:
+                step = fit(points, previous, np.eye(4))
+                if distance(points, previous, step) > .24:
+                    raise ValueError("Cannot link successive B scans for automatic initialization")
+                first_from_current = first_from_current @ step
             held_out = moved(points, first_from_current)
             elapsed = (stamp - first_stamp) * 1e-9
             if elapsed >= query_after:
@@ -113,12 +140,18 @@ def initialize(map_path, bag, config, reference_path=None):
                 # Preserve heading alternatives at one location and spatially separated hypotheses.
                 spaced = branch_and_bound_candidates(grid, xy, res, np.deg2rad(5), 4, 8, 4)
                 candidates = dict.fromkeys([*candidates, *spaced])
-                ranked = []
+                seeds = []
                 for candidate in candidates:
                     seed = np.eye(4)
                     seed[:2, 3] = origin + (np.array([candidate.tx_cell, candidate.ty_cell]) + .5) * res
                     seed[2, 3] = ref[ref_xy.query(seed[:2, 3])[1], 3] if ref is not None else nominal_z
                     seed[:3, :3] = Rotation.from_euler("z", candidate.yaw_rad).as_matrix()
+                    seeds.append(seed)
+                if odometry is not None and odom_origin_hint is not None:
+                    # The recordings may have different odom origins. Score this hint like any map hypothesis.
+                    seeds.append(odom_origin_hint)
+                ranked = []
+                for seed in seeds:
                     pose = fit(accumulated, target, seed)
                     cost = max(distance(accumulated, target, pose), distance(held_out, target, pose))
                     ranked.append((cost, pose))

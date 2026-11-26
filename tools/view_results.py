@@ -13,24 +13,30 @@ def main():
     from rclpy.node import Node
     from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
     from rclpy.serialization import deserialize_message
+    from rclpy.utilities import remove_ros_args
     from sensor_msgs.msg import PointCloud2
     from nav_msgs.msg import Path as PathMsg, OccupancyGrid
     from geometry_msgs.msg import PoseStamped
     parser = argparse.ArgumentParser(); parser.add_argument('results'); parser.add_argument('--max-points', type=int, default=500000)
-    args = parser.parse_args(); root = Path(args.results)
-    c = load(root/'mapping/config_resolved.yaml'); frame = c['frames']['map']
+    args = parser.parse_args(remove_ros_args(sys.argv)[1:]); root = Path(args.results)
+    loc_config = root/'localization/config_resolved.yaml'
+    c = load(loc_config if loc_config.is_file() else root/'mapping/config_resolved.yaml')
+    frame = c['frames']['map']
+    prior_map = c['localization'].get('prior_map')
+    prior_trajectory = c['localization'].get('prior_trajectory')
     rclpy.init(); node = Node('competition_result_viewer')
     qos = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL, reliability=ReliabilityPolicy.RELIABLE)
     outputs = []
     def add(typ, topic, msg):
         outputs.append((node.create_publisher(typ, topic, qos), msg))
-    points = pcd.xyz(root/'mapping/map.pcd')
+    points = pcd.xyz(prior_map or root/'mapping/map.pcd')
     if args.max_points <= 0:
         raise ValueError('--max-points must be positive')
     points = points[::max(1, (len(points)+args.max_points-1)//args.max_points)]
     msg = cloud.pack(points, 0, frame)
     add(PointCloud2, '/competition/result/map', deserialize_message(bytes(bagio.STORE.serialize_cdr(msg, msg.__msgtype__)), PointCloud2))
-    for topic, file in [('mapping',root/'mapping/trajectory_optimized.tum'), ('localization',root/'localization/trajectory.tum')]:
+    mapping_trajectory = Path(prior_trajectory) if prior_trajectory else root/'mapping/trajectory_optimized.tum'
+    for topic, file in [('mapping',mapping_trajectory), ('localization',root/'localization/trajectory.tum')]:
         if not file.exists():
             continue
         path = PathMsg(); path.header.frame_id = frame
