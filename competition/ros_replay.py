@@ -127,6 +127,10 @@ def run(config, normalized, output, params, baseline=False):
         while time.monotonic() < deadline:
             clock(start); rclpy.spin_once(node, timeout_sec=.01)
         index = 0
+        paced = os.environ.get("MGTS_REPLAY_1X") == "1"
+        deadlines, completed, service, registration = [], [], [], []
+        replay_start = time.monotonic()
+        first_ready = None
         with bagio.reader(normalized) as r:
             for conn, _, raw in r.messages(connections=[x for x in r.connections if x.topic == "/competition/lidar"]):
                 typed = r.deserialize(raw, conn.msgtype)
@@ -134,6 +138,12 @@ def run(config, normalized, output, params, baseline=False):
                 arr = cloud.fields(typed)
                 lookahead = max(0., float(arr["time"].max())) if "time" in arr.dtype.names and len(arr) else 0.
                 ready_at = n + round(lookahead * 1e9)
+                if first_ready is None:
+                    first_ready = ready_at
+                due = replay_start + (ready_at - first_ready) * 1e-9
+                if paced:
+                    time.sleep(max(0., due - time.monotonic()))
+                tick = time.monotonic()
                 # Supply IMU covering the sweep. The bag's IMU history remains in chronological order.
                 while index < len(sensors) and sensors[index][0] <= ready_at:
                     t, topic, m = sensors[index]; clock(t); pubs[topic].publish(m)
@@ -150,6 +160,7 @@ def run(config, normalized, output, params, baseline=False):
                 until = time.monotonic() + .02
                 while time.monotonic() < until:
                     rclpy.spin_once(node, timeout_sec=.001)
+                published = time.monotonic()
                 pubs["/competition/lidar"].publish(deserialize_message(bytes(raw), PointCloud2))
                 wait_for(lambda: n in (samples if baseline else statuses), c["localization"]["scan_timeout_s"],
                          f"No registration result for scan {n}; refusing silent scan loss")
@@ -165,6 +176,11 @@ def run(config, normalized, output, params, baseline=False):
                         "accepted": accepted, "fitness_score": values.get("fitness_score")})
                 else:
                     events.append({"t": n * 1e-9, "stamp_ns": n, "state": "lidar_odometry", "accepted": True})
+                done = time.monotonic()
+                deadlines.append(due)
+                completed.append(done)
+                service.append(done - tick)
+                registration.append(done - published)
                 if len(events) % 100 == 0:
                     print(f"Processed {len(events)} scans", flush=True)
         accepted_times = {x["stamp_ns"] for x in events if x["accepted"]}
@@ -186,6 +202,20 @@ def run(config, normalized, output, params, baseline=False):
                   "odometry_only_time_s": 0., "automatic_global_relocalization": False,
                   "local_recoveries": sum(e["state"] == "relocalized_locally" for e in events),
                   "global_relocalizations": 0, "events": events}
+        def milliseconds(durations):
+            return dict(zip(("p50", "p95", "p99", "max"),
+                            np.percentile(np.asarray(durations) * 1000, [50, 95, 99, 100]).tolist()))
+
+        timing = {"paced_1x": paced, "scans": len(events), "accepted": accepted,
+                  "sensor_span_s": deadlines[-1] - deadlines[0],
+                  "tracking_wall_s": completed[-1] - replay_start,
+                  "imu_and_registration_ms": milliseconds(service),
+                  "publish_to_registration_result_ms": milliseconds(registration)}
+        if paced:
+            timing["scan_end_to_result_ms"] = milliseconds(np.subtract(completed, deadlines))
+            timing["missed_next_scan"] = int(np.sum(np.array(completed[:-1]) > deadlines[1:]))
+            timing["deadline_comparisons"] = len(events) - 1
+        write_json(output / "timing.json", timing)
         write_json(output / "diagnostics.json", report)
         if not baseline and report["accepted_fraction"] < c["localization"]["min_accepted_fraction"]:
             raise RuntimeError("Accepted fraction below configured minimum; outputs retained as failed run")

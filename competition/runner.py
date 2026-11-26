@@ -119,7 +119,9 @@ def run_phase(phase, c, root, backend):
                 loc = resolved["localization"]
                 if loc["initial_pose"] is None and not loc.get("manual_initial_pose"):
                     from .cold_start import initialize
+                    search_start = time.monotonic()
                     result = initialize(map_path, bag, resolved, root / "mapping/trajectory_optimized.tum")
+                    result["wall_time_s"] = time.monotonic() - search_start
                     write_json(folder / "initialization.json", result)
                     loc["initial_pose"] = result["initial_pose"]
                     (folder / "config_resolved.yaml").write_text(yaml.safe_dump(resolved))

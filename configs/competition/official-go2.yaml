@@ -1,0 +1,86 @@
+# cloud_base is published in body axes. IMU rotation estimated from A gyro/gravity vs body odometry.
+# IMU translation approximated by lidar centre; delay fit < 1 ms; no correction applied.
+schema_version: 1
+bags:
+  mapping: /data/mapping
+  localization: /data/localization
+output: /results/official-glim-v2
+topics:
+  lidar: /utlidar/cloud_base
+  imu: /utlidar/imu
+  odometry: null
+frames:
+  map: map
+  odom: odom
+  base: base_link
+  lidar: lidar
+  imu: imu
+source_frames:
+  lidar: base_link
+  imu: utlidar_imu
+  odometry: null
+  odometry_child: null
+extrinsics:
+  T_base_lidar:
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.0
+  - 1.0
+  T_base_imu:
+  - 0.28216
+  - 0.0
+  - -0.02467
+  - -0.87163196
+  - 0.4738777
+  - -0.109756
+  - 0.06042583
+units:
+  xyz: m
+  acceleration: m/s2
+  angular_velocity: rad/s
+point_time:
+  field: time
+  unit: s
+  mode: relative
+  offset_s: 0.0
+time_offsets_s:
+  lidar: 0.0
+  imu: 0.0
+  odometry: 0.0
+lidar:
+  scan_period_s: 0.07142857142857142
+  range_m:
+  - 0.3
+  - 50.0
+  intensity_field: intensity
+  body_box_base_m: null
+mapping:
+  profile: sparse_lidar
+  mode: gpu
+  timeout_s: 7200
+  min_trajectory_coverage: 0.75
+localization:
+  initial_pose: null
+  manual_initial_pose: false
+  prediction: constant_velocity
+  registration_method: NDT_OMP
+  ndt_resolution: 0.5
+  score_threshold: 1.0
+  voxel_leaf_size: 0.15
+  scan_timeout_s: 60.0
+  initialization_timeout_s: 180.0
+  min_accepted_fraction: 0.5
+occupancy:
+  resolution_m: 0.05
+  floor_z_m: -0.31
+  height_m:
+  - 0.1
+  - 1.8
+  angular_bins: 720
+  every_n_scans: 2
+  min_hit_scans: 2
+  max_pose_gap_s: 0.5
+  max_cells: 16000000
