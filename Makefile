@@ -45,7 +45,7 @@ go2-map go2-locate:
 RUN_NAME ?= go2-live-$(shell date +%Y%m%d-%H%M%S)
 .PHONY: go2-live
 go2-live:
-	DATA_DIR="$(CURDIR)/data/official" $(COMPOSE) -f compose.yaml -f compose.gpu.yaml run --rm --pull never -v "$(CURDIR)/competition:/mgts/competition:ro" -v "$(CURDIR)/tools:/mgts/tools:ro" competition python3 -m tools.go2_live "/results/$(RUN_NAME)"
+	DATA_DIR="$(CURDIR)/data/official" $(COMPOSE) -f compose.yaml -f compose.gpu.yaml run --rm --pull never -e OPENBLAS_NUM_THREADS=1 -v "$(CURDIR)/competition:/mgts/competition:ro" -v "$(CURDIR)/tools:/mgts/tools:ro" competition python3 -m tools.go2_track "/results/$(RUN_NAME)"
 
 .PHONY: go2-result
 go2-result:

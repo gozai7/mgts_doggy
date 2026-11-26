@@ -4,7 +4,7 @@ schema_version: 1
 bags:
   mapping: /data/mapping
   localization: /data/localization
-output: /results/official-glim-v2
+output: /results/official-glim-fit
 topics:
   lidar: /utlidar/cloud_base
   imu: /utlidar/imu
@@ -62,6 +62,25 @@ mapping:
   mode: gpu
   timeout_s: 7200
   min_trajectory_coverage: 0.75
+  glim_parameters:
+    preprocess:
+      downsample_resolution: 0.045
+    odometry_estimation:
+      voxel_resolution: 0.12
+      voxel_resolution_max: 0.18
+      keyframe_update_strategy: DISPLACEMENT
+      keyframe_delta_trans: 0.32
+      keyframe_delta_rot: 0.2
+    sub_mapping:
+      keyframe_update_strategy: DISPLACEMENT
+      keyframe_update_interval_trans: 0.32
+      keyframe_update_interval_rot: 0.2
+      keyframe_voxel_resolution: 0.1
+      submap_downsample_resolution: 0.075
+  # Effective white-noise densities inferred on quiet subsets of A. Bias random walks retain defaults.
+  imu_noise_density:
+    imu_acc_noise: 0.0073703743935186585
+    imu_gyro_noise: 0.0003285212529599411
 localization:
   initial_pose: null
   manual_initial_pose: false

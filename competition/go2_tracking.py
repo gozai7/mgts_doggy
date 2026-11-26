@@ -35,7 +35,8 @@ class BodyOdometry:
             & (np.linalg.norm(points, axis=1) > 0.45)
         )
         points, offsets = points[keep], offsets[keep]
-        times = np.r_[stamp, stamp + offsets]
+        # A float32 beam offset would round Unix seconds to 128-second steps.
+        times = np.r_[stamp, stamp + offsets.astype(np.float64)]
         poses, covered = interpolate(history, times, 0.05)
         first = transform(poses[0])
         if not len(points) or np.mean(covered[1:]) < 0.8:
