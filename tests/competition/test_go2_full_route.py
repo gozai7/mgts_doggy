@@ -45,7 +45,7 @@ def test_bag_reveals_history_at_lock_and_only_appends_online_poses(tmp_path):
         writer.writerow(("stamp_ns", "source", "full_route_source"))
         for n in times:
             source = "uninitialized" if n < times[3] else "lidar"
-            full_source = "registered_odometry" if n in [times[0], times[2]] else source
+            full_source = {times[0]: "registered_odometry", times[2]: "registered_lidar"}.get(n, source)
             writer.writerow((n, source, full_source))
     (tmp_path / "map.pcd").write_text(
         "VERSION .7\nFIELDS x y z\nSIZE 4 4 4\nTYPE F F F\nCOUNT 1 1 1\n"

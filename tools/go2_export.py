@@ -22,7 +22,7 @@ def export(root):
                 n = int(record["stamp_ns"])
                 if record["source"] in ("lidar", "odometry"):
                     sources.append((n, record["source"]))
-                if record.get("full_route_source") == "registered_odometry":
+                if record.get("full_route_source") in ("registered_odometry", "registered_lidar"):
                     prefix_stamps.append(n)
         if len(sources) != len(track):
             raise ValueError("Tracking source count differs from trajectory length")

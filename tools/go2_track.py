@@ -13,13 +13,14 @@ from competition.config import load, transform, pose7, write_json, phase_config
 from competition import glim_reference, glim_route
 from competition.go2_tracking import BodyOdometry, MapTracker
 from competition.go2_full_route import path_due, registered_prefix
+from competition.go2_window import WindowTracker
 from competition.trajectory import save
 from tools.go2_export import export
 from tools.go2_global_seed import match
 from tools.go2_live import build_map
 
 
-def run(config, dest, glim_map=None, search_period_s=None):
+def run(config, dest, glim_map=None, search_period_s=None, window_se3=False):
     import rclpy
     from geometry_msgs.msg import PoseStamped
     from nav_msgs.msg import Path as RosPath
@@ -40,6 +41,7 @@ def run(config, dest, glim_map=None, search_period_s=None):
         lidar_topic = sensors["topics"]["lidar"]
         mount = transform(sensors["extrinsics"]["T_base_lidar"])
     tracker = MapTracker(pcd.xyz(dest / "map.pcd"), np.eye(4))
+    window = WindowTracker(tracker) if window_se3 else None
     odom = BodyOdometry()
     rclpy.init()
     node = rclpy.create_node("go2_map_tracker")
@@ -52,6 +54,8 @@ def run(config, dest, glim_map=None, search_period_s=None):
     last_path_stamp = None
     pending = []
     prefix_rows = []
+    prefix_lidar = set()
+    prefix_replay_s = 0.
     first_odom_stamp = None
 
     def stamped_pose(stamp, values):
@@ -99,6 +103,8 @@ def run(config, dest, glim_map=None, search_period_s=None):
                 if first_stamp is None:
                     first_stamp = stamp
                 sample = odom.at_scan(m, mount)
+                if sample is not None and window is not None:
+                    window_points = window.prepare(*sample)
                 if locked is None:
                     if search is not None and search.done():
                         result = search.result()
@@ -109,9 +115,16 @@ def run(config, dest, glim_map=None, search_period_s=None):
                             tracker.map_from_odom = transform(
                                 result["initial_pose"]
                             ) @ np.linalg.inv(transform(result["first_odometry_pose"]))
-                            prefix_rows = registered_prefix(
-                                pending, result, tracker.map_from_odom, first_stamp, first_odom_stamp,
-                            )
+                            if window is None:
+                                prefix_rows = registered_prefix(
+                                    pending, result, tracker.map_from_odom, first_stamp, first_odom_stamp,
+                                )
+                            else:
+                                replay_start = time.monotonic()
+                                prefix_rows, prefix_lidar = window.replay_prefix(
+                                    pending, result, first_stamp, first_odom_stamp
+                                )
+                                prefix_replay_s = time.monotonic() - replay_start
                             live_path.poses = [stamped_pose(n, values) for n, values in prefix_rows]
                             pending.clear()
                             locked = stamp
@@ -132,14 +145,20 @@ def run(config, dest, glim_map=None, search_period_s=None):
                         checkpoint = next(checkpoints, float("inf"))
                 if locked is None:
                     if sample is not None:
-                        pending.append((stamp, sample[0]))
+                        if window is None:
+                            pending.append((stamp, sample[0]))
+                        else:
+                            pending.append((stamp, sample[0], window_points))
                     status.append((stamp, "uninitialized"))
                     continue
                 if sample is None:
                     status.append((stamp, "missing_odometry"))
                     continue
                 body, points = sample
-                pose, source = tracker.update(body, points)
+                if window is None:
+                    pose, source = tracker.update(body, points)
+                else:
+                    pose, source = window.update(stamp, body, window_points)
                 values = pose7(pose)
                 msg = stamped_pose(stamp, values)
                 pub.publish(msg)
@@ -169,8 +188,11 @@ def run(config, dest, glim_map=None, search_period_s=None):
         writer = csv.writer(f)
         prefix_stamps = {n for n, _ in prefix_rows}
         writer.writerow(("stamp_ns", "source", "full_route_source"))
-        writer.writerows((n, source, "registered_odometry" if n in prefix_stamps else source)
-                         for n, source in status)
+        for stamp, source in status:
+            full_source = source
+            if stamp in prefix_stamps:
+                full_source = "registered_lidar" if stamp in prefix_lidar else "registered_odometry"
+            writer.writerow((stamp, source, full_source))
     if not rows:
         raise RuntimeError("No confirmed automatic localization on B")
     traj = np.asarray(rows)
@@ -202,6 +224,8 @@ def run(config, dest, glim_map=None, search_period_s=None):
         missed_next_arrival=int(deadlines),
         deadline_comparisons=len(due) - 1,
     )
+    if window is not None:
+        stats["window_se3"] = dict(prefix_replay_s=prefix_replay_s, prefix_lidar_poses=len(prefix_lidar))
     write_json(dest / "timing.json", stats)
     if glim_map is not None:
         glim_route.export(dest, Path(config["output"] + "-B") / "mapping")
@@ -215,6 +239,7 @@ if __name__ == "__main__":
     parser.add_argument("--config", default="/mgts/configs/competition/official-go2.yaml")
     parser.add_argument("--glim", action="store_true", help="Use the completed GLIM map for A")
     parser.add_argument("--search-period-s", type=float, help="Experimental fixed interval for cold-start attempts")
+    parser.add_argument("--window-se3", action="store_true", help="Register short 3D scan windows on A")
     args = parser.parse_args()
     config = load(args.config)
-    run(config, args.output, Path(config["output"]) / "mapping" if args.glim else None, args.search_period_s)
+    run(config, args.output, Path(config["output"]) / "mapping" if args.glim else None, args.search_period_s, args.window_se3)
