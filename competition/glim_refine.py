@@ -36,6 +36,7 @@ def _submaps(bag, poses, mount, knots, holdout_phase=0):
                     + track[valid, :3]
                 )
                 k = np.argmin(abs(knots - times.mean()))
+                # Reserve every fifth scan to check the wall alignment on independent observations.
                 blocks[int(index % 5 == holdout_phase)][k].append(
                     np.column_stack((xyz, times[valid]))
                 )

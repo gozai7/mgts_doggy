@@ -6,9 +6,19 @@
 
 **[Скриншоты и записи RViz](media/go2-final/)** · **[Финальный релиз с картой, маршрутом, ROS 2 bag и замерами](https://github.com/gozai7/mgts_doggy/releases/tag/go2-window-3d-final)**
 
+## Запуск финального решения на официальных бэгах
+
+На Linux x86_64 нужны Git, Make, curl, unzip и Docker с Compose и доступом к NVIDIA GPU через CDI. ROS 2 входит в контейнер.
+
 ```bash
-make go2-live RUN_NAME=final-demo ARGS=--window-se3
+git clone https://github.com/gozai7/mgts_doggy.git
+cd mgts_doggy
+make go2-final
 ```
+
+Команда сама скачает записи организаторов, при первом запуске соберёт GPU-образ, построит карту по A и локализует робота по B при скорости воспроизведения 1×. Для первой сборки нужен интернет и время на компиляцию GLIM. Если архивы уже скачаны, положите `bag_for_mapping.zip` и `bag_for_localization.zip` в `data/official/` перед запуском. Распакованные записи также подходят.
+
+В конце команда напечатает каталог результата и готовую команду для RViz (нужен рабочий стол X11/XWayland). В каталоге лежат **map.pcd** (3D-карта), **full_route.tum** (полный маршрут B), **result_bag/** (ROS 2 bag) и **timing.json** (замеры времени).
 
 Официальные бэги Go2, измеренные частоты, RViz и команды для прогона при 1× описаны в [инструкции по данным финала](docs/OFFICIAL_GO2.md).
 
@@ -51,7 +61,7 @@ https://github.com/user-attachments/assets/ccfa9fe9-12a1-4210-a2fa-619982ff22ff
 
 https://github.com/user-attachments/assets/a6165093-3eef-4c83-8004-eef74bcaffaf
 
-## Первый запуск
+## Альтернативные профили и запуск на других данных
 
 Хост: Linux x86_64, Docker Engine + Compose v2/v5. Ubuntu 22.04 на ноутбуке подходит как хост;
 ROS 2 Jazzy и Ubuntu 24.04 находятся внутри контейнера. Системный Humble менять не нужно.
@@ -59,8 +69,6 @@ ROS 2 Jazzy и Ubuntu 24.04 находятся внутри контейнера
 Сборка требует интернета. Обработка по умолчанию идёт без сети. Собирать образы нужно до соревнования.
 
 ```bash
-unzip competition-glim.zip         # либо competition-rko-lio.zip
-cd competition-glim               # либо competition-rko-lio
 mkdir -p data results
 make build
 make smoke-test

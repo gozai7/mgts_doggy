@@ -63,6 +63,7 @@ class WindowTracker:
             hessian = (jac.T * weights) @ jac / weights.sum()
             gradient = jac.T @ (weights * residual) / weights.sum()
             eig, axes = np.linalg.eigh(hessian)
+            # A corridor may constrain lateral motion only. Keep the odometry prediction on weak axes.
             gain = np.where(eig > 0.009, 1 / (eig + 0.035), 0.0)
             step = axes @ (gain * (axes.T @ gradient))
             translation, angle = np.linalg.norm(step[:3]), np.linalg.norm(step[3:])

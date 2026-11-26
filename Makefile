@@ -8,6 +8,7 @@ export DATA_DIR RESULTS_DIR
 RUN = $(COMPOSE) run --rm competition
 .PHONY: help build build-gpu bundle-gpu doctor normalize prepare mapping localization baseline occupancy evaluate run-all smoke-test test-unit legacy-build legacy-help
 help:
+	@echo 'Official Go2 bags: make go2-final (download bags, build GPU image if missing, map A and localize B)'
 	@echo 'make build; edit configs/competition/dataset.yaml; make doctor; make baseline; make mapping; make localization; make occupancy; make evaluate'
 	@echo 'CONFIG=... chooses a configuration inside the project. make test-unit runs without ROS. Legacy: make -f Makefile.legacy help'
 build:
@@ -46,6 +47,13 @@ go2-map go2-route-odometry go2-locate:
 	DATA_DIR="$(CURDIR)/data/official" $(COMPOSE) -f compose.yaml -f compose.gpu.yaml run --rm --pull never -e MGTS_REPLAY_1X=1 -v "$(CURDIR)/competition:/mgts/competition:ro" competition python3 -m competition.runner $(GO2_ACTION) --config /mgts/configs/competition/official-go2.yaml
 
 RUN_NAME ?= go2-live-$(shell date +%Y%m%d-%H%M%S)
+.PHONY: go2-final
+go2-final:
+	bash tools/go2_inputs.sh
+	@docker image inspect mgts-competition-glim:gpu >/dev/null 2>&1 || $(MAKE) build-gpu
+	@run="$(RUN_NAME)"; $(MAKE) go2-live RUN_NAME="$$run" ARGS=--window-se3 && \
+	  echo "Results: $(RESULTS_DIR)/$$run/ | RViz: make go2-result RUN_NAME=$$run"
+
 .PHONY: go2-live
 go2-live: go2-map go2-route-odometry
 	DATA_DIR="$(CURDIR)/data/official" $(COMPOSE) -f compose.yaml -f compose.gpu.yaml run --rm --pull never -e OPENBLAS_NUM_THREADS=1 -v "$(CURDIR)/competition:/mgts/competition:ro" -v "$(CURDIR)/tools:/mgts/tools:ro" competition python3 -m tools.go2_track "/results/$(RUN_NAME)" --glim $(ARGS)
