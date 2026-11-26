@@ -6,6 +6,8 @@
 
 | Компонент | Версия/commit | Лицензия/где смотреть |
 |---|---|---|
+| [Fast-LIO2, форк демо](https://github.com/PolarisXQ/SCURM_Nav_Tutorial/tree/b187f2e4e29ae0f483aec48befbe39fe67a3a5eb/FAST_LIO) | `b187f2e4e29ae0f483aec48befbe39fe67a3a5eb` | GPL-2.0, `vendor/fast_lio/LICENSE`, сохранились уведомления в исходниках |
+| [Сообщения Livox](https://github.com/PolarisXQ/SCURM_Nav_Tutorial/tree/b187f2e4e29ae0f483aec48befbe39fe67a3a5eb/livox_ros_driver2/msg) | тот же commit | MIT, `vendor/livox_ros_driver2/LICENSE.txt` |
 | [GLIM](https://github.com/koide3/glim) | `1a197c999e4865f5cab7c9cd25474128413ebbca` | MIT, `vendor/glim/LICENSE` |
 | [GLIM ROS](https://github.com/koide3/glim_ros2) | `4d4ec524ccf1b02aa09b0af2af767ecc54343798` | MIT заявлена в package.xml; отдельного LICENSE в снимке нет |
 | [gtsam_points](https://github.com/koide3/gtsam_points) | `8e94654558dfbe7ddb0341de300daaf17e25ee02` | MIT, собственный LICENSE |
@@ -33,6 +35,11 @@
 
 ## Изменения upstream
 
+- Fast-LIO в `vendor/fast_lio` собран с C++17 и ROS 2 Jazzy. Офлайн-режим читает
+  нормализованный PointCloud2 и IMU напрямую через rosbag2, сохраняет выровненный по гравитации
+  PCD и пары «поза, облако» на время конца скана. Сохранены фильтр состояний и ikd-Tree форка.
+- `vendor/livox_ros_driver2` собирает только ROS-интерфейсы, которые использует upstream
+  Fast-LIO. Для офлайн-обработки достаточно rosbag2, PCL, Eigen и OpenMP.
 - `patches/glim-optimized-pcd.patch`: binary PCD после финального global save/export_points.
 - `patches/rko-direct-bag-header.patch`, `rko-direct-bag-source.patch`: rosbag2 Writer
   для deskewed cloud и LiDAR-rate Odometry. API сверено с [Jazzy writer.hpp](https://github.com/ros2/rosbag2/blob/jazzy/rosbag2_cpp/include/rosbag2_cpp/writer.hpp).

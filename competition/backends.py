@@ -100,6 +100,37 @@ def glim_config(c, directory):
         write_json(p, data)
 
 
+def fastlio_config(c, directory, normalized, output):
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    if c["mapping"]["mode"] != "cpu":
+        raise ValueError("Fast-LIO supports mapping.mode: cpu")
+    profile = c["mapping"]["profile"]
+    if profile not in ("default_indoor", "sparse_lidar", "cpu_only", "no_point_time"):
+        raise ValueError("Unknown Fast-LIO profile")
+    timed = c["point_time"]["mode"] != "none"
+    if profile == "no_point_time" and timed:
+        raise ValueError("no_point_time profile requires point_time.mode: none")
+    extrinsics = c["extrinsics"]
+    imu_lidar = np.linalg.inv(transform(extrinsics["T_base_imu"])) @ transform(extrinsics["T_base_lidar"])
+    voxel = .25 if profile == "sparse_lidar" else .15
+    max_range = float(c["lidar"]["range_m"][1])
+    params = {
+        "competition.bag_path": str(normalized), "competition.output_dir": str(output),
+        "competition.lidar_frame": c["frames"]["lidar"], "competition.point_time": timed,
+        "common.lid_topic": "/competition/lidar", "common.imu_topic": "/competition/imu",
+        "common.odom_frame_id": "fastlio_odom", "common.sensor_frame_id": c["frames"]["imu"],
+        "locate_in_prior_map": False, "mapping.extrinsic_est_en": False,
+        "mapping.extrinsic_T": imu_lidar[:3, 3].tolist(),
+        "mapping.extrinsic_R": imu_lidar[:3, :3].ravel().tolist(),
+        "mapping.fov_degree": 360.0, "mapping.det_range": max_range,
+        "cube_side_length": max(100.0, 4 * max_range),
+        "filter_size_surf": voxel, "filter_size_map": voxel,
+    }
+    yaml_params(directory / "fastlio.yaml", params)
+    return params
+
+
 def rko_configs(c, directory, normalized, output):
     directory, output = Path(directory), Path(output)
     directory.mkdir(parents=True, exist_ok=True)
@@ -181,6 +212,10 @@ def export_mapping(backend, folder, c):
         raw_path, optimized_path = folder / "dump/odom_lidar.txt", folder / "dump/traj_lidar.txt"
         source_map = folder / "dump/map.pcd"
         body = np.linalg.inv(transform(c["extrinsics"]["T_base_lidar"]))
+    elif backend == "fast-lio":
+        raw_path = optimized_path = folder / "backend/trajectory_imu.tum"
+        source_map = folder / "backend/map.pcd"
+        body = np.linalg.inv(transform(c["extrinsics"]["T_base_imu"]))
     else:
         raw_path, optimized_path = folder / "backend/trajectory_raw_dense.tum", folder / "backend/trajectory_optimized_dense.tum"
         source_map = folder / "backend/map_dense_optimized.pcd"
@@ -192,14 +227,15 @@ def export_mapping(backend, folder, c):
     save(folder / "trajectory.tum", a)
     save(folder / "trajectory_lidar.tum", change_body(a, transform(c["extrinsics"]["T_base_lidar"])), csv=False)
     if not source_map.exists() or source_map.stat().st_size < 100:
-        raise RuntimeError(f"Missing optimized point cloud {source_map}")
+        raise RuntimeError(f"Missing mapping point cloud {source_map}")
     with source_map.open("rb") as f:
         hdr = f.read(2048)
     match = re.search(rb"POINTS\s+(\d+)", hdr)
     if match is None or int(match.group(1)) == 0:
-        raise RuntimeError("Invalid or empty optimized PCD")
+        raise RuntimeError("Invalid or empty mapping PCD")
     shutil.copyfile(source_map, folder / "map.pcd")
     write_json(folder / "frames.json", {"trajectory_optimized": f"{c['frames']['map']} <- {c['frames']['base']}",
         "trajectory_raw": f"algorithm local odom <- {c['frames']['base']}",
         "trajectory_lidar": f"{c['frames']['map']} <- {c['frames']['lidar']}",
-        "quaternion_order": "xyzw", "units": "seconds, metres", "map": "globally optimized"})
+        "quaternion_order": "xyzw", "units": "seconds, metres",
+        "map": "incremental Fast-LIO, gravity aligned" if backend == "fast-lio" else "globally optimized"})

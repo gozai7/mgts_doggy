@@ -5,6 +5,7 @@ import numpy as np
 import yaml
 from competition import backends
 from competition.config import transform
+from competition.trajectory import read_tum
 
 @pytest.mark.parametrize('mode',['cpu','gpu'])
 def test_glim_sensor_contract(config,tmp_path,mode):
@@ -24,6 +25,33 @@ def test_rko_frame_order_and_full_backend(config,tmp_path):
  assert f['competition_backend_bag'].endswith('backend_input')
  assert g['offline_map_bundle'] and g['save_dense_pose_refined_map'] and g['loop_min_overlap_ratio']>=.6
  assert not g['use_scan_context'];assert not g['use_bev_descriptor']
+
+
+def test_fastlio_calibration_and_imu_trajectory_export(config, tmp_path):
+    config["extrinsics"]["T_base_imu"] = [.1, .2, .3, 0., 0., 1., 0.]
+    base_imu = transform(config["extrinsics"]["T_base_imu"])
+    base_lidar = transform(config["extrinsics"]["T_base_lidar"])
+    work = tmp_path / "backend"
+    params = backends.fastlio_config(config, tmp_path / "config", "/data/bag", work)
+    calibration = np.linalg.inv(base_imu) @ base_lidar
+    np.testing.assert_allclose(params["mapping.extrinsic_T"], calibration[:3, 3])
+    np.testing.assert_allclose(np.reshape(params["mapping.extrinsic_R"], (3, 3)), calibration[:3, :3])
+    assert params["competition.point_time"]
+    assert not params["mapping.extrinsic_est_en"]
+
+    work.mkdir()
+    (work / "trajectory_imu.tum").write_text("1 0 0 0 0 0 0 1\n2 1 0 0 0 0 0 1\n")
+    (work / "map.pcd").write_text(
+        "VERSION .7\nFIELDS x y z\nSIZE 4 4 4\nTYPE F F F\nCOUNT 1 1 1\n"
+        "WIDTH 1\nHEIGHT 1\nPOINTS 1\nDATA ascii\n0 0 0\n"
+    )
+    backends.export_mapping("fast-lio", tmp_path, config)
+    base = read_tum(tmp_path / "trajectory.tum")
+    lidar = read_tum(tmp_path / "trajectory_lidar.tum")
+    np.testing.assert_allclose(transform(base[0, 1:]), np.linalg.inv(base_imu))
+    np.testing.assert_allclose(transform(lidar[0, 1:]), calibration)
+    np.testing.assert_array_equal(base, read_tum(tmp_path / "trajectory_raw.tum"))
+    assert (tmp_path / "map.pcd").read_bytes() == (work / "map.pcd").read_bytes()
 
 def test_localizer_unknown_start_is_explicit(config,tmp_path):
  config['localization']['initial_pose']=None

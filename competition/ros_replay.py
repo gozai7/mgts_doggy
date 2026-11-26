@@ -19,6 +19,7 @@ def run(config, normalized, output, params, baseline=False):
     from rclpy.node import Node
     from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
     from rclpy.serialization import deserialize_message
+    from ros2run.api import get_executable_path
     from sensor_msgs.msg import PointCloud2, Imu
     from nav_msgs.msg import Odometry
     from geometry_msgs.msg import PoseWithCovarianceStamped, TransformStamped
@@ -85,11 +86,17 @@ def run(config, normalized, output, params, baseline=False):
         tfs.append(t)
     static.sendTransform(tfs); clock(start)
     if baseline:
-        cmd = ["ros2","run","kiss_icp","kiss_icp_node","--ros-args","--params-file",str(params),"-r","pointcloud_topic:=/competition/lidar"]
+        package, executable = "kiss_icp", "kiss_icp_node"
+        remaps = ["-r", "pointcloud_topic:=/competition/lidar"]
     else:
-        cmd = ["ros2","run","lidar_localization_ros2","lidar_localization_node","--ros-args",
-               "-r","__node:=lidar_localization","--params-file",str(params),"-r","cloud:=/competition/lidar",
-               "-r","imu:=/competition/imu","-r","odom:=/competition/odometry"]
+        package, executable = "lidar_localization_ros2", "lidar_localization_node"
+        remaps = ["-r", "__node:=lidar_localization", "-r", "cloud:=/competition/lidar",
+                  "-r", "imu:=/competition/imu", "-r", "odom:=/competition/odometry"]
+    # Start the ROS node itself so replay can stop and reap it between runs.
+    path = get_executable_path(package_name=package, executable_name=executable)
+    if path is None:
+        raise RuntimeError(f"Executable {package}/{executable} not found")
+    cmd = [path, "--ros-args", "--params-file", str(params), *remaps]
     log = (output / "algorithm.log").open("w")
     proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT)
 

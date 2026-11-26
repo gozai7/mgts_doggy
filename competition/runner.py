@@ -69,8 +69,8 @@ def run_phase(phase, c, root, backend):
     folder = root / phase
     if (folder / "complete.json").exists():
         saved = json.loads((folder / "complete.json").read_text())
-        if saved.get("phase_config_sha256") != phase_fingerprint(c, phase):
-            raise ValueError("Completed phase uses a different config; choose a new output root")
+        if saved.get("backend") != backend or saved.get("phase_config_sha256") != phase_fingerprint(c, phase):
+            raise ValueError("Completed phase uses a different backend or config; choose a new output root")
         required = ["trajectory_optimized.tum", "map.pcd"] if phase == "mapping" else ["trajectory.tum", "diagnostics.json"]
         if not all((folder / x).is_file() and (folder / x).stat().st_size > 0 for x in required):
             raise RuntimeError("Completed phase has missing artifacts; use a new output root")
@@ -94,6 +94,10 @@ def run_phase(phase, c, root, backend):
                 cmd = ["ros2","run","glim_ros","glim_rosbag",str(bag),"--ros-args","-p",f"config_path:={configs}",
                        "-p",f"dump_path:={folder / 'dump'}","-p","auto_quit:=true"]
                 command(cmd, root / "logs/glim.log", timeout)
+            elif backend == "fast-lio":
+                backends.fastlio_config(resolved, configs, bag, folder / "backend")
+                command(["ros2", "run", "fast_lio", "fastlio_mapping", "--ros-args",
+                         "--params-file", str(configs / "fastlio.yaml")], root / "logs/fastlio.log", timeout)
             else:
                 backends.rko_configs(resolved, configs, bag, folder)
                 command(["ros2","run","rko_lio","offline_node","--ros-args","--params-file",str(configs / "rko.yaml")],
@@ -114,7 +118,8 @@ def run_phase(phase, c, root, backend):
         else:
             if phase == "localization":
                 map_path = root / "mapping/map.pcd"
-                if not (root / "mapping/complete.json").exists():
+                mapping_marker = root / "mapping/complete.json"
+                if not mapping_marker.is_file() or json.loads(mapping_marker.read_text()).get("backend") != backend:
                     raise ValueError("Mapping has no successful checkpoint")
                 loc = resolved["localization"]
                 if loc["initial_pose"] is None and not loc.get("manual_initial_pose"):
@@ -161,13 +166,16 @@ def main(argv=None):
         print(json.dumps({k: result[k] for k in ("bag","errors","warnings")}, ensure_ascii=False, indent=2))
         return 2 if result["errors"] else 0
     if args.action == "prepare":
-        validate(c)
+        mapping = validate(phase_config(c, "mapping"))
+        localization = validate(phase_config(c, "localization"))
         d = root / "prepared"; d.mkdir(exist_ok=True)
         if backend == "glim":
-            backends.glim_config(c, d / "mapping")
+            backends.glim_config(mapping, d / "mapping")
+        elif backend == "fast-lio":
+            backends.fastlio_config(mapping, d / "mapping", root / "normalized/mapping/bag", root / "mapping/backend")
         else:
-            backends.rko_configs(c, d / "mapping", root / "normalized/mapping/bag", root / "mapping")
-        backends.localization_config(c, d / "localization.yaml", root / "mapping/map.pcd")
+            backends.rko_configs(mapping, d / "mapping", root / "normalized/mapping/bag", root / "mapping")
+        backends.localization_config(localization, d / "localization.yaml", root / "mapping/map.pcd")
         print(f"Configuration generated in {d}; no SLAM was executed")
         return 0
     if args.action == "normalize":
@@ -185,7 +193,8 @@ def main(argv=None):
             run_phase(action, c, root, backend)
         elif action == "occupancy":
             from .occupancy import build
-            if not (root / "mapping/complete.json").exists():
+            mapping_marker = root / "mapping/complete.json"
+            if not mapping_marker.is_file() or json.loads(mapping_marker.read_text()).get("backend") != backend:
                 raise ValueError("Successful mapping checkpoint required")
             resolved = load(root / "mapping/config_resolved.yaml")
             resolved["occupancy"] = phase_config(c, "mapping")["occupancy"]
@@ -202,8 +211,12 @@ def main(argv=None):
                 raise FileExistsError(f"Incomplete/different occupancy export: {dest}; choose a new run or move it aside")
             use_backend_scans = backend == "rko-lio"
             bag = root / ("mapping/backend_input" if use_backend_scans else "normalized/mapping/bag")
+            lidar_topic = "/rko_lio/frame" if use_backend_scans else "/competition/lidar"
+            if backend == "fast-lio":
+                bag = root / "mapping/backend/scans"
+                use_backend_scans = True
             build(bag, root / "mapping/trajectory_optimized.tum", dest, resolved,
-                  lidar_topic="/rko_lio/frame" if use_backend_scans else "/competition/lidar", deskewed=use_backend_scans)
+                  lidar_topic=lidar_topic, deskewed=use_backend_scans)
             write_json(marker, identity)
         elif action == "evaluate":
             from .evaluate import evaluate

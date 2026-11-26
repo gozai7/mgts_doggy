@@ -1,5 +1,17 @@
 [
   {
+    "name": "fast_lio",
+    "url": "https://github.com/PolarisXQ/SCURM_Nav_Tutorial",
+    "commit": "b187f2e4e29ae0f483aec48befbe39fe67a3a5eb",
+    "path": "FAST_LIO"
+  },
+  {
+    "name": "livox_ros_driver2",
+    "url": "https://github.com/PolarisXQ/SCURM_Nav_Tutorial",
+    "commit": "b187f2e4e29ae0f483aec48befbe39fe67a3a5eb",
+    "path": "livox_ros_driver2/msg"
+  },
+  {
     "name": "lidar_localization_ros2",
     "url": "https://github.com/rsasaki0109/lidar_localization_ros2",
     "commit": "a1d56ecbde0eb65ad6e238bca124aac95a226c30",

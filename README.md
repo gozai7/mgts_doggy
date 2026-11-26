@@ -1,20 +1,18 @@
 # Соревновательная обработка LiDAR + IMU
 
-Две самостоятельные версии исходной заготовки команды: `competition-glim` и `competition-rko-lio`.
-Выбранный алгоритм указан в файле `BACKEND`. Интерфейс запуска и форматы результатов одинаковы.
-
-Проверен автономный запуск на RTX 3060 Laptop. По записи A GLIM строит 3D-карту, а по записи B стек автоматически находит начальную позу и восстанавливает маршрут. В сквозном синтетическом тесте приняты 111 из 111 поз. Точность на данных соревнования пока неизвестна. Измерения приведены в [отчёте](TEST_REPORT.md).
-
-Для переноса уже собранного образа выполните `make bundle-gpu`. Архив в `results/` содержит образ, конфиг и скрипт запуска. [Инструкция для ноутбука](docs/GPU_PORTABLE.md).
+Ветка `competition-fast-lio` строит 3D-карту по записи A на CPU. По записи B общий локализатор
+находит начальную позу на этой карте и восстанавливает маршрут. Выбранный алгоритм указан в
+`BACKEND`. Команды запуска и основные форматы совпадают с ветками GLIM и RKO-LIO.
 
 | Версия | Первый проход | Глобальная коррекция | Второй проход |
 |---|---|---|---|
 | GLIM | GLIM CPU GICP или GPU | Глобальный граф GLIM | lidar_localization_ros2 |
 | RKO-LIO | RKO-LIO из закреплённого форка стека lidar_slam | graph_based_slam, GICP, геометрические проверки петель | Тот же localizer |
+| Fast-LIO | Fast-LIO2, офлайн-чтение LiDAR и IMU | Инкрементальная карта с вертикалью по гравитации | Тот же localizer |
 
-RKO-LIO здесь не подменён другой одометрией. Сначала frontend напрямую сохраняет deskewed-сканы
-и соответствующую одометрию, затем отдельный offline backend оптимизирует граф и экспортирует
-плотную исправленную траекторию и карту. Преимущество одной версии по точности не установлено.
+Из демо Fast-LIO + Nav2 взята исходная реализация Fast-LIO из репозитория базового образа.
+Ветка использует ROS 2 Jazzy и штатный пайплайн проекта для обработки rosbag, локализации
+и экспорта 2D-карты. [Исходники и зависимости](THIRD_PARTY.md).
 
 ## Первый запуск
 
@@ -24,16 +22,16 @@ ROS 2 Jazzy и Ubuntu 24.04 находятся внутри контейнера
 Сборка требует интернета. Обработка по умолчанию идёт без сети. Собирать образы нужно до соревнования.
 
 ```bash
-unzip competition-glim.zip         # либо competition-rko-lio.zip
-cd competition-glim               # либо competition-rko-lio
+git switch competition-fast-lio
 mkdir -p data results
 make build
 make smoke-test
 ```
 
-`smoke-test` генерирует небольшой асимметричный искусственный офис и действительно запускает
-выбранный SLAM и localizer. Эталон синтетической сцены не подставляется в результаты алгоритма.
-Тест может выявить ошибки интеграции; его прохождение не доказывает качество на реальном LiDAR.
+`smoke-test` генерирует две пары записей асимметричного офиса, с временем отдельных точек и
+без него. В каждой паре Fast-LIO строит карту A, локализатор автоматически запускается на B,
+а пайплайн экспортирует 2D-карту. Эталон используется при независимой оценке результатов.
+[Протокол и результаты проверки](TEST_REPORT.md#fast-lio-на-ros-2-jazzy).
 
 Положите записи в `data/mapping/` и `data/localization/` (полные каталоги bag с metadata.yaml),
 либо укажите другие пути внутри `/data`. Отдельный `.mcap` также читается адаптером.
@@ -66,8 +64,11 @@ make evaluate
 Трансформация `T_base_lidar=[x,y,z,qx,qy,qz,qw]` переводит точку LiDAR в base.
 Единицы — метры; кватернион XYZW, единичной длины. Аналогично задаётся `T_base_imu`.
 Нулевое смещение допустимо только как измеренная калибровка, автоматически оно не подставляется.
+Входные сообщения записей имеют типы `sensor_msgs/msg/PointCloud2` и `sensor_msgs/msg/Imu`.
 PointCloud2 нормализуется в XYZ SI и относительное поле `time` в секундах. При `mode: none`
 поле времени не выдумывается, deskew отключается. Поправки времени применяются ровно один раз.
+Fast-LIO записывает позу на время последней точки скана или на stamp облака при `mode: none`.
+Для инициализации IMU запись A должна начинаться с неподвижной фазы.
 
 При пустом `localization.initial_pose` начальную позу корпуса вычисляет стек. Он накапливает сканы B в локальной системе первого скана, ищет кандидатов по всей горизонтальной проекции карты A методом BBS и уточняет их по 3D-карте с ICP. Отдельный скан проверяет совпадение. При близких оценках разных поз поиск продолжается, а при исчерпании записи возвращает ошибку. Высоту для уточнения подсказывает ближайшая по XY поза маршрута A. Режим рассчитан на одноэтажное помещение.
 
@@ -80,10 +81,10 @@ PointCloud2 нормализуется в XYZ SI и относительное �
 
 | Путь внутри результата | Содержание |
 |---|---|
-| `mapping/map.pcd` | Глобально оптимизированная 3D-карта |
+| `mapping/map.pcd` | Инкрементальная 3D-карта Fast-LIO |
 | `mapping/trajectory_raw.tum` | Одометрическая траектория base в локальной системе алгоритма |
-| `mapping/trajectory_optimized.tum` | Исправленная траектория base в map |
-| `mapping/trajectory.tum`, `trajectory.csv` | Та же исправленная траектория в общем формате |
+| `mapping/trajectory_optimized.tum` | Траектория base в map в общем формате |
+| `mapping/trajectory.tum`, `trajectory.csv` | Та же траектория в форматах TUM и CSV |
 | `mapping/trajectory_lidar.tum` | Позы физического LiDAR в map |
 | `mapping/frames.json`, `config_resolved.yaml` | Frame-контракт и фактическая конфигурация |
 | `localization/trajectory.tum`, `trajectory.csv` | Только принятые регистрации второго прохода |
@@ -91,7 +92,10 @@ PointCloud2 нормализуется в XYZ SI и относительное �
 | `occupancy/map.yaml`, `map.pgm`, `occupancy_bag/` | 2D-карта и ROS nav_msgs/OccupancyGrid |
 | `diagnostics/mapping/`, `diagnostics/localization/` | Bag Doctor JSON и Markdown |
 | `diagnostics/metrics.json`, `system.json`, `report.md` | Метрики, версии и отчёт |
-| `logs/`, `mapping/dump/` либо `mapping/backend/` | Логи и нативные результаты upstream |
+| `logs/`, `mapping/backend/` | Логи, IMU-траектория и облака для 2D-экспорта |
+
+В Fast-LIO `trajectory_raw.tum` и `trajectory_optimized.tum` совпадают. Имя второго файла
+сохранено для совместимости. Отдельная оптимизация петель в этой ветке отсутствует.
 
 TUM/CSV: `t x y z qx qy qz qw`; секунды исходной временной шкалы после поправок, метры, XYZW.
 Числа времени в TUM double имеют ограничение точности возле больших Unix timestamps;
@@ -101,20 +105,9 @@ TUM/CSV: `t x y z qx qy qz qw`; секунды исходной временно
 
 ## CPU, GPU и просмотр
 
-CPU — стандарт для обеих версий. На GLIM доступны профили `default_indoor`, `sparse_lidar`,
-`cpu_only`, `gpu`, `no_point_time`; профиль и `mapping.mode` должны согласовываться.
-RKO-LIO использует CPU; доступны indoor/sparse/cpu_only/no_point_time.
-
-Только для GLIM, после установки совместимого NVIDIA Container Toolkit и драйвера на хосте:
-
-```bash
-make build-gpu
-# dataset.yaml: mapping.mode: gpu; mapping.profile: gpu
-make mapping COMPOSE='docker compose -f compose.yaml -f compose.gpu.yaml'
-```
-
-Образ использует CUDA 12.6. Проверено на RTX 3060 Laptop, драйвер 615.78.08, ROS 2 Jazzy. CPU-образ CUDA не требует.
-RViz, PlotJuggler, GLIM offline viewer и ручная инициализация описаны в
+Для Fast-LIO установите `mapping.mode: cpu`. Доступны профили `default_indoor`,
+`sparse_lidar`, `cpu_only` и `no_point_time`. Профиль `no_point_time` требует `point_time.mode: none`.
+RViz, PlotJuggler и ручная инициализация описаны в
 [docs/VISUALIZATION.md](docs/VISUALIZATION.md); основной pipeline работает без GUI.
 
 ## Проверки и диагностика
@@ -145,7 +138,7 @@ Identity в примере разрешён **только если систем
 Сохранены `solver/`, `sim/`, сценарии, Karto-патч, исходные тесты и исследования.
 Старый 2D workflow вызывается через `make -f Makefile.legacy help/build/...`;
 его контейнеры описаны в `Dockerfile.legacy` и `compose.legacy.yaml`.
-Старые показатели в `benchmarks/` относятся к исходной 2D-системе, а не к GLIM/RKO.
+Показатели в `benchmarks/` относятся к исходной 2D-системе.
 
 Читайте [COMPETITION_RUNBOOK.md](COMPETITION_RUNBOOK.md), [ARCHITECTURE.md](ARCHITECTURE.md),
 [KNOWN_ISSUES.md](KNOWN_ISSUES.md), [CHANGELOG.md](CHANGELOG.md),
