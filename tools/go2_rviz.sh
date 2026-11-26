@@ -14,7 +14,7 @@ case "$phase" in
     for file in map.pcd mapping.tum; do
       [[ -s "$PWD/results/$run/$file" ]] || { echo "Missing results/$run/$file" >&2; exit 2; }
     done
-    [[ -s "$PWD/results/$run/glim_b_in_map.tum" || -s "$PWD/results/$run/trajectory.tum" ]] || { echo "Missing route B" >&2; exit 2; } ;;
+    [[ -s "$PWD/results/$run/full_route.tum" || -s "$PWD/results/$run/glim_b_in_map.tum" || -s "$PWD/results/$run/trajectory.tum" ]] || { echo "Missing route B" >&2; exit 2; } ;;
   *) echo "Use mapping, localization, result or glim" >&2; exit 2 ;;
 esac
 x11=(-e DISPLAY -v /tmp/.X11-unix:/tmp/.X11-unix:ro)
@@ -33,14 +33,18 @@ docker run "${options[@]}" --rm --name "$viewer" --network none "${x11[@]}" -e Q
   mgts-competition-glim:gpu bash -c '
     if [[ $1 == glim ]]; then
       python3 /mgts/tools/view_results.py --flat "/results/$2" &
-      cp /mgts/configs/competition/glim-routes.rviz "/tmp/$(basename "$2").rviz"
+      layout=glim-routes
+      if [[ -s "/results/$2/full_route.tum" ]]; then layout=glim-full-route; fi
+      cp "/mgts/configs/competition/$layout.rviz" "/tmp/$(basename "$2").rviz"
       rviz2 -d "/tmp/$(basename "$2").rviz" &
       wait -n
       exit $?
     fi
     if [[ $1 == result ]]; then
       ros2 bag play "/results/$2/result_bag" --qos-profile-overrides-path /mgts/configs/competition/result-play-qos.yaml --loop >/tmp/go2-play.log 2>&1 &
-      exec rviz2 -d /mgts/configs/competition/results.rviz
+      layout=results
+      if [[ -s "/results/$2/full_route.tum" ]]; then layout=glim-full-route; fi
+      exec rviz2 -d "/mgts/configs/competition/$layout.rviz"
     fi
     ros2 bag play "/data/$1" --loop --topics /utlidar/cloud_deskewed /utlidar/robot_odom >/tmp/go2-play.log 2>&1 &
     exec rviz2 -d /mgts/configs/competition/official-go2.rviz

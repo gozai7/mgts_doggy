@@ -6,6 +6,8 @@ from pathlib import Path
 
 from competition import bagio, cloud, pcd
 from competition.trajectory import read_tum
+from competition.go2_full_route import path_due
+import numpy as np
 
 
 def export(root):
@@ -13,15 +15,29 @@ def export(root):
     T = bagio.STORE.types
 
     sources = []
+    prefix_stamps = []
     if (root / "tracking.csv").exists():
         with (root / "tracking.csv").open() as f:
-            sources = [
-                (int(r["stamp_ns"]), r["source"])
-                for r in csv.DictReader(f)
-                if r["source"] in ("lidar", "odometry")
-            ]
+            for record in csv.DictReader(f):
+                n = int(record["stamp_ns"])
+                if record["source"] in ("lidar", "odometry"):
+                    sources.append((n, record["source"]))
+                if record.get("full_route_source") == "registered_odometry":
+                    prefix_stamps.append(n)
         if len(sources) != len(track):
             raise ValueError("Tracking source count differs from trajectory length")
+
+    full = read_tum(root / "full_route.tum") if (root / "full_route.tum").is_file() else None
+    if full is not None:
+        n_prefix = len(full) - len(track)
+        if n_prefix < 0 or not np.array_equal(full[n_prefix:], track):
+            raise ValueError("Full route must end with the unchanged online trajectory")
+        if not (root / "tracking.csv").exists():
+            prefix_stamps = [round(row[0] * 1e9) for row in full[:n_prefix]]
+        if len(prefix_stamps) != n_prefix or any(
+            abs(n * 1e-9 - row[0]) > 5e-7 for n, row in zip(prefix_stamps, full[:n_prefix])
+        ):
+            raise ValueError("Full route prefix timestamps differ from tracking history")
 
     def stamped_pose(row, header):
         pose = T["geometry_msgs/msg/Pose"](
@@ -32,6 +48,10 @@ def export(root):
 
     def messages():
         poses = []
+        full_poses = [] if full is None else [
+            stamped_pose(row, bagio.header(n, "map")) for n, row in zip(prefix_stamps, full)
+        ]
+        last_full_stamp = None
         for i, row in enumerate(track):
             stamp = sources[i][0] if sources else round(row[0] * 1e9)
             header = bagio.header(stamp, "map")
@@ -46,6 +66,11 @@ def export(root):
             yield "/competition/result/base_pose", stamp, stamped
             if sources:
                 yield "/competition/result/source", stamp, T["std_msgs/msg/String"](sources[i][1])
+            if full is not None:
+                full_poses.append(stamped)
+                if path_due(stamp, last_full_stamp) or i == len(track) - 1:
+                    yield "/competition/result/full_route", stamp, T["nav_msgs/msg/Path"](header, list(full_poses))
+                    last_full_stamp = stamp
             if i % 15 == 0 or i == len(track) - 1:
                 yield (
                     "/competition/result/localization",

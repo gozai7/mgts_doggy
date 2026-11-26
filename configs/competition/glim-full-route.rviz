@@ -1,0 +1,93 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+  - Class: rviz_common/Views
+    Name: Views
+Visualization Manager:
+  Global Options:
+    Fixed Frame: map
+    Background Color: 26; 31; 37
+    Frame Rate: 25
+  Displays:
+    - Class: rviz_default_plugins/Grid
+      Name: Grid (1 m)
+      Enabled: true
+      Cell Size: 1
+      Plane Cell Count: 36
+      Alpha: 0.16
+    - Class: rviz_default_plugins/PointCloud2
+      Name: GLIM map from A
+      Enabled: true
+      Topic:
+        Value: /competition/result/map
+        Durability Policy: Transient Local
+        Reliability Policy: Reliable
+        Depth: 1
+      Position Transformer: XYZ
+      Color Transformer: FlatColor
+      Color: 163; 177; 188
+      Style: Points
+      Size (Pixels): 2
+      Alpha: 0.68
+    - Class: rviz_default_plugins/Path
+      Name: B - full route (reconstructed start + live)
+      Enabled: true
+      Topic:
+        Value: /competition/result/full_route
+        Durability Policy: Transient Local
+        Reliability Policy: Reliable
+        Depth: 1
+      Color: 255; 149; 48
+      Line Style: Billboards
+      Line Width: 0.075
+      Alpha: 1
+    - Class: rviz_default_plugins/Path
+      Name: A - GLIM mapping trajectory
+      Enabled: false
+      Topic:
+        Value: /competition/result/mapping
+        Durability Policy: Transient Local
+        Reliability Policy: Reliable
+        Depth: 1
+      Color: 25; 205; 250
+      Line Style: Billboards
+      Line Width: 0.065
+      Alpha: 1
+    - Class: rviz_default_plugins/Path
+      Name: B - online localization on A
+      Enabled: false
+      Topic:
+        Value: /competition/result/localization
+        Durability Policy: Transient Local
+        Reliability Policy: Reliable
+        Depth: 1
+      Color: 255; 149; 48
+      Line Style: Billboards
+      Line Width: 0.075
+      Alpha: 1
+    - Class: rviz_default_plugins/Path
+      Name: B - GLIM offline (rigid alignment)
+      Enabled: false
+      Topic:
+        Value: /competition/result/glim_b
+        Durability Policy: Transient Local
+        Reliability Policy: Reliable
+        Depth: 1
+      Color: 216; 108; 255
+      Line Style: Billboards
+      Line Width: 0.06
+      Alpha: 1
+  Tools:
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/FocusCamera
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Target Frame: <Fixed Frame>
+      Distance: 32
+      Focal Point: {X: 0, Y: 8, Z: 0}
+      Pitch: 1.28
+      Yaw: 0.75
+Window Geometry:
+  Width: 1280
+  Height: 800

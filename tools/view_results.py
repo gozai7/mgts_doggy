@@ -23,6 +23,8 @@ def main():
         frame = 'map'
         map_file = root/'map.pcd'
         paths = [('mapping', root/'mapping.tum')]
+        if (root/'full_route.tum').is_file():
+            paths.append(('full_route', root/'full_route.tum'))
         if (root/'trajectory.tum').is_file():
             paths.append(('localization', root/'trajectory.tum'))
         if (root/'glim_b_in_map.tum').is_file():

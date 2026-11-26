@@ -12,6 +12,7 @@ from competition import bagio, pcd
 from competition.config import load, transform, pose7, write_json, phase_config
 from competition import glim_reference, glim_route
 from competition.go2_tracking import BodyOdometry, MapTracker
+from competition.go2_full_route import path_due, registered_prefix
 from competition.trajectory import save
 from tools.go2_export import export
 from tools.go2_global_seed import match
@@ -21,6 +22,8 @@ from tools.go2_live import build_map
 def run(config, dest, glim_map=None, search_period_s=None):
     import rclpy
     from geometry_msgs.msg import PoseStamped
+    from nav_msgs.msg import Path as RosPath
+    from rclpy.qos import DurabilityPolicy, QoSProfile
     from std_msgs.msg import String
 
     if search_period_s is not None and not (np.isfinite(search_period_s) and search_period_s > 0):
@@ -41,6 +44,25 @@ def run(config, dest, glim_map=None, search_period_s=None):
     rclpy.init()
     node = rclpy.create_node("go2_map_tracker")
     pub = node.create_publisher(PoseStamped, "/competition/result/base_pose", 10)
+    path_pub = node.create_publisher(
+        RosPath, "/competition/result/full_route",
+        QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL),
+    )
+    live_path = RosPath()
+    last_path_stamp = None
+    pending = []
+    prefix_rows = []
+    first_odom_stamp = None
+
+    def stamped_pose(stamp, values):
+        msg = PoseStamped()
+        msg.header.frame_id = "map"
+        msg.header.stamp.sec, msg.header.stamp.nanosec = divmod(stamp, 10**9)
+        msg.pose.position.x, msg.pose.position.y, msg.pose.position.z = values[:3]
+        (msg.pose.orientation.x, msg.pose.orientation.y,
+         msg.pose.orientation.z, msg.pose.orientation.w) = values[3:]
+        return msg
+
     state_pub = node.create_publisher(String, "/competition/result/source", 10)
     latest_receipt = {}
 
@@ -69,6 +91,8 @@ def run(config, dest, glim_map=None, search_period_s=None):
                 rclpy.spin_once(node, timeout_sec=0)
                 m = r.deserialize(raw, c.msgtype)
                 if c.topic.endswith("odom"):
+                    if first_odom_stamp is None:
+                        first_odom_stamp = bagio.ns(m)
                     odom.append(m)
                     continue
                 stamp = bagio.ns(m)
@@ -85,6 +109,11 @@ def run(config, dest, glim_map=None, search_period_s=None):
                             tracker.map_from_odom = transform(
                                 result["initial_pose"]
                             ) @ np.linalg.inv(transform(result["first_odometry_pose"]))
+                            prefix_rows = registered_prefix(
+                                pending, result, tracker.map_from_odom, first_stamp, first_odom_stamp,
+                            )
+                            live_path.poses = [stamped_pose(n, values) for n, values in prefix_rows]
+                            pending.clear()
                             locked = stamp
                     if (
                         locked is None
@@ -102,6 +131,8 @@ def run(config, dest, glim_map=None, search_period_s=None):
                         )
                         checkpoint = next(checkpoints, float("inf"))
                 if locked is None:
+                    if sample is not None:
+                        pending.append((stamp, sample[0]))
                     status.append((stamp, "uninitialized"))
                     continue
                 if sample is None:
@@ -110,25 +141,23 @@ def run(config, dest, glim_map=None, search_period_s=None):
                 body, points = sample
                 pose, source = tracker.update(body, points)
                 values = pose7(pose)
-                msg = PoseStamped()
-                msg.header.frame_id = "map"
-                msg.header.stamp.sec, msg.header.stamp.nanosec = divmod(stamp, 10**9)
-                msg.pose.position.x, msg.pose.position.y, msg.pose.position.z = values[:3]
-                (
-                    msg.pose.orientation.x,
-                    msg.pose.orientation.y,
-                    msg.pose.orientation.z,
-                    msg.pose.orientation.w,
-                ) = values[3:]
+                msg = stamped_pose(stamp, values)
                 pub.publish(msg)
                 state = String()
                 state.data = source
                 state_pub.publish(state)
+                live_path.poses.append(msg)
+                live_path.header = msg.header
+                if path_due(stamp, last_path_stamp):
+                    path_pub.publish(live_path)
+                    last_path_stamp = stamp
                 rclpy.spin_once(node, timeout_sec=0)
                 rows.append([stamp * 1e-9, *values])
                 due.append((stamp, arrival))
                 odom_route.append(body[:3, 3])
                 status.append((stamp, source))
+            if due and last_path_stamp != due[-1][0]:
+                path_pub.publish(live_path)
             until = time.monotonic() + 1
             while len(latest_receipt) < len(rows) and time.monotonic() < until:
                 rclpy.spin_once(node, timeout_sec=0.01)
@@ -138,12 +167,16 @@ def run(config, dest, glim_map=None, search_period_s=None):
     write_json(dest / "initialization.json", attempts)
     with (dest / "tracking.csv").open("w") as f:
         writer = csv.writer(f)
-        writer.writerow(("stamp_ns", "source"))
-        writer.writerows(status)
+        prefix_stamps = {n for n, _ in prefix_rows}
+        writer.writerow(("stamp_ns", "source", "full_route_source"))
+        writer.writerows((n, source, "registered_odometry" if n in prefix_stamps else source)
+                         for n, source in status)
     if not rows:
         raise RuntimeError("No confirmed automatic localization on B")
     traj = np.asarray(rows)
     save(dest / "trajectory.tum", traj)
+    full = np.asarray([[n * 1e-9, *values] for n, values in prefix_rows] + rows)
+    save(dest / "full_route.tum", full)
     latency = [(latest_receipt[n] - t) * 1000 for n, t in due if n in latest_receipt]
     deadlines = sum(
         latest_receipt.get(n, np.inf) > t_next for (n, _), (_, t_next) in zip(due, due[1:])
@@ -154,9 +187,12 @@ def run(config, dest, glim_map=None, search_period_s=None):
         input_scans=len(status),
         sources=counts,
         output_poses=len(rows),
+        full_route_poses=len(full),
+        registered_prefix_poses=len(prefix_rows),
+        full_route_length_m=lengths(full[:, 1:4]),
         observed_ros_poses=len(latency),
         first_pose_s=latest_receipt[due[0][0]] - start,
-        max_gap_s=float(np.diff(traj[:, 0]).max()),
+        max_gap_s=float(np.diff(traj[:, 0]).max(initial=0)),
         tail_without_pose_s=(status[-1][0] - due[-1][0]) * 1e-9,
         length_m=lengths(traj[:, 1:4]),
         odometry_same_stamps_m=lengths(odom_route),
