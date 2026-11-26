@@ -1,0 +1,145 @@
+Panels:
+- Class: rviz_common/Displays
+  Name: Displays
+- Class: rviz_common/Views
+  Name: Views
+Visualization Manager:
+  Class: ''
+  Global Options:
+    Fixed Frame: map
+    Background Color: 30; 30; 35
+    Frame Rate: 20
+  Displays:
+  - Class: rviz_default_plugins/Grid
+    Name: Grid
+    Enabled: true
+    Cell Size: 1.0
+    Plane Cell Count: 30
+  - Class: rviz_default_plugins/PointCloud2
+    Name: Optimized map
+    Enabled: true
+    Topic:
+      Value: /competition/result/map
+      Depth: 5
+      Durability Policy: Transient Local
+      Reliability Policy: Reliable
+      History Policy: Keep Last
+    Position Transformer: XYZ
+    Color Transformer: FlatColor
+    Color: 150; 180; 200
+    Size (Pixels): 2
+    Style: Points
+    Alpha: 1.0
+  - Class: rviz_default_plugins/PointCloud2
+    Name: Localizer map
+    Enabled: false
+    Topic:
+      Value: /map
+      Depth: 5
+      Durability Policy: Transient Local
+      Reliability Policy: Reliable
+      History Policy: Keep Last
+    Position Transformer: XYZ
+    Color Transformer: FlatColor
+    Color: 150; 180; 200
+    Size (Pixels): 2
+    Style: Points
+    Alpha: 1.0
+  - Class: rviz_default_plugins/PointCloud2
+    Name: Live lidar
+    Enabled: false
+    Topic:
+      Value: /competition/lidar
+      Depth: 5
+      Durability Policy: Volatile
+      Reliability Policy: Reliable
+      History Policy: Keep Last
+    Position Transformer: XYZ
+    Color Transformer: FlatColor
+    Color: 255; 240; 120
+    Size (Pixels): 2
+    Style: Points
+    Alpha: 1.0
+  - Class: rviz_default_plugins/PointCloud2
+    Name: RKO deskewed
+    Enabled: false
+    Topic:
+      Value: /rko_lio/frame
+      Depth: 5
+      Durability Policy: Volatile
+      Reliability Policy: Reliable
+      History Policy: Keep Last
+    Position Transformer: XYZ
+    Color Transformer: FlatColor
+    Color: 180; 230; 180
+    Size (Pixels): 2
+    Style: Points
+    Alpha: 1.0
+  - Class: rviz_default_plugins/Path
+    Name: Mapping trajectory
+    Enabled: true
+    Topic:
+      Value: /competition/result/mapping
+      Depth: 5
+      Durability Policy: Transient Local
+      Reliability Policy: Reliable
+      History Policy: Keep Last
+    Color: 60; 180; 255
+    Line Style: Lines
+    Line Width: 0.05
+    Alpha: 1.0
+  - Class: rviz_default_plugins/Path
+    Name: Localization trajectory
+    Enabled: true
+    Topic:
+      Value: /competition/result/localization
+      Depth: 5
+      Durability Policy: Transient Local
+      Reliability Policy: Reliable
+      History Policy: Keep Last
+    Color: 255; 140; 40
+    Line Style: Lines
+    Line Width: 0.05
+    Alpha: 1.0
+  - Class: rviz_default_plugins/Map
+    Name: Occupancy
+    Enabled: false
+    Topic:
+      Value: /competition/result/occupancy
+      Depth: 5
+      Durability Policy: Transient Local
+      Reliability Policy: Reliable
+      History Policy: Keep Last
+    Alpha: 0.7
+  - Class: rviz_default_plugins/TF
+    Name: TF
+    Enabled: false
+  - Class: rviz_default_plugins/PoseWithCovariance
+    Name: Current localization
+    Enabled: false
+    Topic:
+      Value: /pcl_pose
+      Depth: 5
+      Durability Policy: Transient Local
+      Reliability Policy: Reliable
+      History Policy: Keep Last
+  Tools:
+  - Class: rviz_default_plugins/Interact
+  - Class: rviz_default_plugins/MoveCamera
+  - Class: rviz_default_plugins/SetInitialPose
+    Topic:
+      Value: /initialpose
+      Depth: 5
+      Durability Policy: Volatile
+      Reliability Policy: Reliable
+      History Policy: Keep Last
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Distance: 20
+      Pitch: 1.2
+      Yaw: 0.7
+      Target Frame: <Fixed Frame>
+Window Geometry:
+  Width: 1280
+  Height: 800

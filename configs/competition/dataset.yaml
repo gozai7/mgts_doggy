@@ -1,0 +1,56 @@
+schema_version: 1
+bags:
+  mapping: /data/mapping
+  localization: /data/localization
+output: /results/run01
+topics:
+  lidar: auto
+  imu: auto
+  odometry: null
+# Canonical output names; source names below must refer to the measured mounts.
+frames: {map: map, odom: odom, base: base_link, lidar: lidar, imu: imu}
+source_frames:
+  lidar: null
+  imu: null
+  odometry: null
+  odometry_child: null
+extrinsics:
+  # T_base_sensor maps sensor coordinates to base coordinates, metres, quaternion XYZW.
+  # Identity is NOT assumed. Fill from the organisers' measured calibration.
+  T_base_lidar: null
+  T_base_imu: null
+units: {xyz: m, acceleration: null, angular_velocity: null}
+point_time: {field: null, unit: null, mode: null, offset_s: 0.0}
+# Corrected time = original time + offset. One correction, in the adapter only.
+time_offsets_s: {lidar: 0.0, imu: 0.0, odometry: 0.0}
+lidar:
+  scan_period_s: 0.1
+  range_m: [0.3, 50.0]
+  intensity_field: intensity
+  body_box_base_m: null
+mapping:
+  profile: default_indoor
+  mode: cpu
+  timeout_s: 7200
+  min_trajectory_coverage: 0.75
+localization:
+  # [x,y,z,qx,qy,qz,qw], pose of BASE in map; null requires manual RViz initialization.
+  initial_pose: null
+  manual_initial_pose: false
+  prediction: constant_velocity
+  registration_method: NDT_OMP
+  ndt_resolution: 0.5
+  score_threshold: 1.0
+  voxel_leaf_size: 0.15
+  scan_timeout_s: 60.0
+  initialization_timeout_s: 180.0
+  min_accepted_fraction: 0.5
+occupancy:
+  resolution_m: 0.05
+  floor_z_m: 0.0
+  height_m: [0.10, 1.80]
+  angular_bins: 720
+  every_n_scans: 2
+  min_hit_scans: 2
+  max_pose_gap_s: 0.5
+  max_cells: 16000000

@@ -1,0 +1,51 @@
+name: doc
+
+on:
+  push:
+    tags:
+      - '*'
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+
+permissions:
+  contents: write  # required by mkdocs gh-deploy to push the gh-pages branch
+
+jobs:
+  gendoc:
+    name: Generate documentation
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          submodules: 'recursive'
+
+      - name: Configure Git Credentials
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+
+      - name : Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git cmake build-essential doxygen graphviz python3-dev python3-pip python3-pybind11 pybind11-dev libglm-dev libglfw3-dev libpng-dev libjpeg-dev libeigen3-dev python3-numpy python3-sphinx python3-sphinx-rtd-theme
+
+      - name: Install python dependencies
+        run: python -m pip install pybind11 mkdocs mkdocs-material mkdocs-static-i18n
+      
+      - name: Generate documentation
+        run: cd docs && make all
+      
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: site
+          path: ./site/*
+
+      # Credentials are not persisted by actions/checkout; provide them only for the push step
+      - name: Deploy documentation
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          cd docs && make deploy

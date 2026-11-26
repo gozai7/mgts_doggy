@@ -1,4 +1,12 @@
 /data/
 /truth/
 /runs/
+/results/
+/.venv/
+/build/
+/install/
+/log/
+/dist/
 __pycache__/
+.pytest_cache/
+*.pyc
