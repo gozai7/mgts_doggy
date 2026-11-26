@@ -23,6 +23,13 @@ def export(root):
         if len(sources) != len(track):
             raise ValueError("Tracking source count differs from trajectory length")
 
+    def stamped_pose(row, header):
+        pose = T["geometry_msgs/msg/Pose"](
+            T["geometry_msgs/msg/Point"](*row[1:4]),
+            T["geometry_msgs/msg/Quaternion"](*row[4:8]),
+        )
+        return T["geometry_msgs/msg/PoseStamped"](header, pose)
+
     def messages():
         poses = []
         for i, row in enumerate(track):
@@ -34,11 +41,7 @@ def export(root):
                     stamp,
                     cloud.pack(pcd.xyz(root / "map.pcd"), stamp, "map"),
                 )
-            pose = T["geometry_msgs/msg/Pose"](
-                T["geometry_msgs/msg/Point"](*row[1:4]),
-                T["geometry_msgs/msg/Quaternion"](*row[4:8]),
-            )
-            stamped = T["geometry_msgs/msg/PoseStamped"](header, pose)
+            stamped = stamped_pose(row, header)
             poses.append(stamped)
             yield "/competition/result/base_pose", stamp, stamped
             if sources:
@@ -48,6 +51,21 @@ def export(root):
                     "/competition/result/localization",
                     stamp,
                     T["nav_msgs/msg/Path"](header, list(poses)),
+                )
+
+        # Complete offline routes are published only after the last online update.
+        if (root / "glim_b_in_map.tum").is_file():
+            offline_b = read_tum(root / "glim_b_in_map.tum")
+            offline_a = read_tum(root / "mapping.tum")
+            end = max(stamp, round(offline_b[-1, 0] * 1e9), round(offline_a[-1, 0] * 1e9))
+            for name, route in (("mapping", offline_a), ("glim_b", offline_b)):
+                full_path = [
+                    stamped_pose(row, bagio.header(round(row[0] * 1e9), "map")) for row in route
+                ]
+                yield (
+                    "/competition/result/" + name,
+                    end,
+                    T["nav_msgs/msg/Path"](bagio.header(end, "map"), full_path),
                 )
 
     bagio.write_messages(root / "result_bag", messages())

@@ -8,7 +8,8 @@ from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 from competition import bagio, pcd
-from competition.config import load, transform, pose7, write_json
+from competition.config import load, transform, pose7, write_json, phase_config
+from competition import glim_reference, glim_route
 from competition.go2_tracking import BodyOdometry, MapTracker
 from competition.trajectory import save
 from tools.go2_export import export
@@ -16,14 +17,22 @@ from tools.go2_global_seed import match
 from tools.go2_live import build_map
 
 
-def run(config, dest):
+def run(config, dest, glim_map=None):
     import rclpy
     from geometry_msgs.msg import PoseStamped
     from std_msgs.msg import String
 
     dest.mkdir(parents=True)
     bag = config["bags"]["localization"]
-    build_map(config["bags"]["mapping"], dest)
+    if glim_map is None:
+        build_map(config["bags"]["mapping"], dest)
+        lidar_topic = "/utlidar/cloud_base"
+        mount = None
+    else:
+        glim_reference.export(glim_map, dest)
+        sensors = phase_config(config, "localization")
+        lidar_topic = sensors["topics"]["lidar"]
+        mount = transform(sensors["extrinsics"]["T_base_lidar"])
     tracker = MapTracker(pcd.xyz(dest / "map.pcd"), np.eye(4))
     odom = BodyOdometry()
     rclpy.init()
@@ -46,11 +55,7 @@ def run(config, dest):
     checkpoint = next(checkpoints)
     try:
         with ThreadPoolExecutor(max_workers=1) as pool, bagio.reader(bag) as r:
-            conns = [
-                c
-                for c in r.connections
-                if c.topic in ("/utlidar/cloud_base", "/utlidar/robot_odom")
-            ]
+            conns = [c for c in r.connections if c.topic in (lidar_topic, "/utlidar/robot_odom")]
             for c, t, raw in r.messages(connections=conns):
                 if first_arrival is None:
                     first_arrival = t
@@ -65,7 +70,7 @@ def run(config, dest):
                 stamp = bagio.ns(m)
                 if first_stamp is None:
                     first_stamp = stamp
-                sample = odom.at_scan(m)
+                sample = odom.at_scan(m, mount)
                 if locked is None:
                     if search is not None and search.done():
                         result = search.result()
@@ -83,7 +88,13 @@ def run(config, dest):
                         and (stamp - first_stamp) * 1e-9 >= checkpoint + 0.12
                     ):
                         search = pool.submit(
-                            match, dest / "map.pcd", dest / "mapping.tum", bag, checkpoint
+                            match,
+                            dest / "map.pcd",
+                            dest / "mapping.tum",
+                            bag,
+                            checkpoint,
+                            lidar_topic,
+                            mount,
                         )
                         checkpoint = next(checkpoints, float("inf"))
                 if locked is None:
@@ -152,6 +163,8 @@ def run(config, dest):
         deadline_comparisons=len(due) - 1,
     )
     write_json(dest / "timing.json", stats)
+    if glim_map is not None:
+        glim_route.export(dest, Path(config["output"] + "-B") / "mapping")
     export(dest)
     print(stats, flush=True)
 
@@ -160,5 +173,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("output", type=Path)
     parser.add_argument("--config", default="/mgts/configs/competition/official-go2.yaml")
+    parser.add_argument("--glim", action="store_true", help="Use the completed GLIM map for A")
     args = parser.parse_args()
-    run(load(args.config), args.output)
+    config = load(args.config)
+    run(config, args.output, Path(config["output"]) / "mapping" if args.glim else None)

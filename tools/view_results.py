@@ -17,21 +17,33 @@ def main():
     from nav_msgs.msg import Path as PathMsg, OccupancyGrid
     from geometry_msgs.msg import PoseStamped
     parser = argparse.ArgumentParser(); parser.add_argument('results'); parser.add_argument('--max-points', type=int, default=500000)
+    parser.add_argument('--flat', action='store_true', help='Read map.pcd, mapping.tum and trajectory.tum in the map frame')
     args = parser.parse_args(); root = Path(args.results)
-    c = load(root/'mapping/config_resolved.yaml'); frame = c['frames']['map']
+    if args.flat:
+        frame = 'map'
+        map_file = root/'map.pcd'
+        paths = [('mapping', root/'mapping.tum')]
+        if (root/'trajectory.tum').is_file():
+            paths.append(('localization', root/'trajectory.tum'))
+        if (root/'glim_b_in_map.tum').is_file():
+            paths.append(('glim_b', root/'glim_b_in_map.tum'))
+    else:
+        frame = load(root/'mapping/config_resolved.yaml')['frames']['map']
+        map_file = root/'mapping/map.pcd'
+        paths = [('mapping', root/'mapping/trajectory_optimized.tum'), ('localization', root/'localization/trajectory.tum')]
     rclpy.init(); node = Node('competition_result_viewer')
     qos = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL, reliability=ReliabilityPolicy.RELIABLE)
     outputs = []
     def add(typ, topic, msg):
         outputs.append((node.create_publisher(typ, topic, qos), msg))
-    points = pcd.xyz(root/'mapping/map.pcd')
+    points = pcd.xyz(map_file)
     if args.max_points <= 0:
         raise ValueError('--max-points must be positive')
     points = points[::max(1, (len(points)+args.max_points-1)//args.max_points)]
     msg = cloud.pack(points, 0, frame)
     add(PointCloud2, '/competition/result/map', deserialize_message(bytes(bagio.STORE.serialize_cdr(msg, msg.__msgtype__)), PointCloud2))
-    for topic, file in [('mapping',root/'mapping/trajectory_optimized.tum'), ('localization',root/'localization/trajectory.tum')]:
-        if not file.exists():
+    for topic, file in paths:
+        if not args.flat and not file.exists():
             continue
         path = PathMsg(); path.header.frame_id = frame
         for row in read_tum(file):
@@ -49,7 +61,9 @@ def main():
     def publish():
         for pub, msg in outputs:
             pub.publish(msg)
-    node.create_timer(1.,publish); publish()
+    if not args.flat:
+        node.create_timer(1.,publish)
+    publish()
     print('Publishing results. RViz fixed frame: '+frame, flush=True)
     try:
         rclpy.spin(node)

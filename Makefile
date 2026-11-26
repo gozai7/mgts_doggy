@@ -36,17 +36,20 @@ scene-test:
 	DATA_DIR="$(abspath $(SCENE_ROOT))/$(SCENE)/data" $(COMPOSE) -f compose.yaml -f compose.gpu.yaml run --rm --pull never competition python3 -m competition.runner run-all --config /data/dataset.yaml
 	python3 -m sim.score_scene "$(SCENE_ROOT)/$(SCENE)/reference" "$(RESULTS_DIR)/lidar-scenes/$(SCENE)"
 
-.PHONY: go2-rviz go2-map go2-locate
+.PHONY: go2-rviz go2-map go2-route-odometry go2-locate
 go2-rviz:
 	bash tools/go2_rviz.sh $(PHASE)
-go2-map go2-locate:
-	DATA_DIR="$(CURDIR)/data/official" $(COMPOSE) -f compose.yaml -f compose.gpu.yaml run --rm --pull never -e MGTS_REPLAY_1X=1 -v "$(CURDIR)/competition:/mgts/competition:ro" competition python3 -m competition.runner $(if $(filter go2-map,$@),mapping,localization) --config /mgts/configs/competition/official-go2.yaml
+go2-map: GO2_ACTION=mapping
+go2-route-odometry: GO2_ACTION=route-odometry
+go2-locate: GO2_ACTION=localization
+go2-map go2-route-odometry go2-locate:
+	DATA_DIR="$(CURDIR)/data/official" $(COMPOSE) -f compose.yaml -f compose.gpu.yaml run --rm --pull never -e MGTS_REPLAY_1X=1 -v "$(CURDIR)/competition:/mgts/competition:ro" competition python3 -m competition.runner $(GO2_ACTION) --config /mgts/configs/competition/official-go2.yaml
 
 RUN_NAME ?= go2-live-$(shell date +%Y%m%d-%H%M%S)
 .PHONY: go2-live
-go2-live:
-	DATA_DIR="$(CURDIR)/data/official" $(COMPOSE) -f compose.yaml -f compose.gpu.yaml run --rm --pull never -e OPENBLAS_NUM_THREADS=1 -v "$(CURDIR)/competition:/mgts/competition:ro" -v "$(CURDIR)/tools:/mgts/tools:ro" competition python3 -m tools.go2_track "/results/$(RUN_NAME)"
+go2-live: go2-map go2-route-odometry
+	DATA_DIR="$(CURDIR)/data/official" $(COMPOSE) -f compose.yaml -f compose.gpu.yaml run --rm --pull never -e OPENBLAS_NUM_THREADS=1 -v "$(CURDIR)/competition:/mgts/competition:ro" -v "$(CURDIR)/tools:/mgts/tools:ro" competition python3 -m tools.go2_track "/results/$(RUN_NAME)" --glim
 
 .PHONY: go2-result
 go2-result:
-	bash tools/go2_rviz.sh result "$(RUN_NAME)"
+	bash tools/go2_rviz.sh $(if $(wildcard $(RESULTS_DIR)/$(RUN_NAME)/mapping_source.json),glim,result) "$(RUN_NAME)"

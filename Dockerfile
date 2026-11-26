@@ -26,6 +26,9 @@ COPY . .
 RUN bash docker/competition/resolve-submodules.sh \
     && BUILD_JOBS=${BUILD_JOBS} WITH_VIEWER=${WITH_VIEWER} bash docker/competition/build.sh \
     && chmod +x docker/competition/entrypoint.sh
+RUN if [[ $(cat BACKEND) == glim ]]; then source /opt/ros/jazzy/setup.bash \
+    && cmake -S native/go2_glim_odom -B /tmp/go2-odom -DCMAKE_BUILD_TYPE=Release \
+    && cmake --build /tmp/go2-odom && cmake --install /tmp/go2-odom && ldconfig; fi
 
 # Use binary GTSAM dependencies; build GLIM and its ROS wrapper at the team revisions.
 FROM base AS gpu_deps
@@ -51,6 +54,9 @@ COPY BACKEND .
 COPY vendor/ vendor/
 COPY docker/competition/build.sh docker/competition/
 RUN BUILD_WITH_CUDA=ON bash docker/competition/build.sh
+COPY native/go2_glim_odom native/go2_glim_odom
+RUN source /opt/ros/jazzy/setup.bash && cmake -S native/go2_glim_odom -B /tmp/go2-odom -DCMAKE_BUILD_TYPE=Release \
+    && cmake --build /tmp/go2-odom && cmake --install /tmp/go2-odom && ldconfig
 COPY competition/ competition/
 COPY configs/ configs/
 COPY tools/ tools/

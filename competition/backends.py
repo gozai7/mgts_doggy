@@ -74,6 +74,8 @@ def glim_config(c, directory):
         "base_frame_id": c["frames"]["imu"], "map_frame_id": c["frames"]["map"],
         "odom_frame_id": "glim_odom", "publish_imu2lidar": True,
         "extension_modules": ["libmemory_monitor.so", "librviz_viewer.so"]})
+    if c["mapping"].get("kinematic_factors"):
+        ros["glim_ros"]["extension_modules"].append("/usr/local/lib/libgo2_glim_odom.so")
     # During offline GLIM replay no original TF is broadcast. Base export is performed explicitly.
     write_json(directory / "config_ros.json", ros)
     pre = jsonc(directory / "config_preprocess.json")

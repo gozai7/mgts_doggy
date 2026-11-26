@@ -20,12 +20,12 @@ from .trajectory import read_tum, metrics
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def command(cmd, logfile, timeout):
+def command(cmd, logfile, timeout, env=None):
     logfile = Path(logfile); logfile.parent.mkdir(parents=True, exist_ok=True)
     started = time.monotonic()
     with logfile.open("w") as log:
         log.write("COMMAND " + json.dumps(cmd) + "\n"); log.flush()
-        proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+        proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, start_new_session=True, env=env)
         try:
             rc = proc.wait(timeout=timeout)
         except BaseException:
@@ -93,7 +93,28 @@ def run_phase(phase, c, root, backend):
                 backends.glim_config(resolved, configs)
                 cmd = ["ros2","run","glim_ros","glim_rosbag",str(bag),"--ros-args","-p",f"config_path:={configs}",
                        "-p",f"dump_path:={folder / 'dump'}","-p","auto_quit:=true"]
-                command(cmd, root / "logs/glim.log", timeout)
+                if resolved["mapping"].get("kinematic_factors"):
+                    tum = folder / "kinematic.tum"
+                    with bagio.reader(bag) as reader, tum.open("w") as out:
+                        conns = [x for x in reader.connections if x.topic == "/competition/odometry"]
+                        if not conns:
+                            raise ValueError("GLIM kinematic factors require normalized odometry")
+                        for conn, _, raw in reader.messages(connections=conns):
+                            msg = reader.deserialize(raw, conn.msgtype)
+                            sec, ns = divmod(bagio.ns(msg), 10**9)
+                            out.write(f"{sec}.{ns:09d} " + " ".join(map(str, bagio.pose_values(msg.pose.pose))) + "\n")
+                    env = dict(os.environ, MGTS_GO2_ODOM_TUM=str(tum),
+                               MGTS_GO2_BASE_IMU=" ".join(map(str, resolved["extrinsics"]["T_base_imu"])))
+                    for key, name in (("kinematic_translation_sigma_m", "MGTS_GO2_ODOM_SIGMA_METRES"),
+                                      ("kinematic_rotation_sigma_rad", "MGTS_GO2_ODOM_SIGMA_RADIANS")):
+                        if key in resolved["mapping"]:
+                            env[name] = str(resolved["mapping"][key])
+                    command(cmd, root / "logs/glim.log", timeout, env=env)
+                    count_path = folder / "dump/go2_odom_factors.txt"
+                    if not count_path.exists() or int(count_path.read_text()) < 1:
+                        raise RuntimeError("GLIM did not integrate the required kinematic factors")
+                else:
+                    command(cmd, root / "logs/glim.log", timeout)
             else:
                 backends.rko_configs(resolved, configs, bag, folder)
                 command(["ros2","run","rko_lio","offline_node","--ros-args","--params-file",str(configs / "rko.yaml")],
@@ -152,10 +173,14 @@ def run_phase(phase, c, root, backend):
 
 def main(argv=None):
     p = argparse.ArgumentParser(description="Competition SLAM workflow")
-    p.add_argument("action", choices=["doctor","normalize","prepare","mapping","localization","baseline","occupancy","evaluate","run-all"])
+    p.add_argument("action", choices=["doctor","normalize","prepare","mapping","localization","baseline","occupancy","evaluate","run-all","route-odometry"])
     p.add_argument("--config", default="configs/competition/dataset.yaml")
     p.add_argument("--phase", choices=["mapping","localization"], default="mapping")
     args = p.parse_args(argv); c = load(args.config)
+    if args.action == "route-odometry":
+        c["bags"]["mapping"] = c["bags"]["localization"]
+        c["output"] += "-B"
+        args.action = "mapping"
     root = Path(c["output"]).resolve(); root.mkdir(parents=True, exist_ok=True)
     backend = (ROOT / "BACKEND").read_text().strip()
     if args.action == "doctor":

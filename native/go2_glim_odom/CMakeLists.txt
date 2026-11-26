@@ -1,0 +1,7 @@
+cmake_minimum_required(VERSION 3.16)
+project(go2_glim_odom LANGUAGES CXX)
+find_package(glim REQUIRED)
+add_library(go2_glim_odom SHARED go2_glim_odom.cpp)
+target_compile_features(go2_glim_odom PRIVATE cxx_std_17)
+target_link_libraries(go2_glim_odom PRIVATE glim::glim)
+install(TARGETS go2_glim_odom LIBRARY DESTINATION lib)

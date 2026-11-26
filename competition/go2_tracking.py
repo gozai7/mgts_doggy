@@ -19,7 +19,7 @@ class BodyOdometry:
     def append(self, msg):
         self.history.append([bagio.ns(msg) * 1e-9, *bagio.pose_values(msg.pose.pose)])
 
-    def at_scan(self, msg):
+    def at_scan(self, msg, base_from_lidar=None):
         """Deskew cloud_base in the base frame at the first beam using received odometry."""
         if not self.history:
             return None
@@ -37,6 +37,8 @@ class BodyOdometry:
         points, offsets = points[keep], offsets[keep]
         # A float32 beam offset would round Unix seconds to 128-second steps.
         times = np.r_[stamp, stamp + offsets.astype(np.float64)]
+        if base_from_lidar is not None:
+            points = moved(points, base_from_lidar)
         poses, covered = interpolate(history, times, 0.05)
         first = transform(poses[0])
         if not len(points) or np.mean(covered[1:]) < 0.8:
