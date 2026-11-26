@@ -2,7 +2,7 @@
 set -euo pipefail
 # Actual SLAM/localization test. No fabricated trajectories or copied reference output.
 case_dir="$(mktemp -d /results/ros-smoke-XXXXXX)"
-python3 tools/synthetic_bags.py "$case_dir/input"
+python3 tools/synthetic_bags.py "$case_dir/input" --mapping-mode "${GLIM_SMOKE_MODE:-cpu}"
 python3 -m competition.runner run-all --config "$case_dir/input/dataset.yaml"
 test -s "$case_dir/input/results/mapping/map.pcd"
 test -s "$case_dir/input/results/localization/trajectory.tum"

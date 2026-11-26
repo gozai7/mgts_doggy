@@ -27,7 +27,7 @@ def test_rko_frame_order_and_full_backend(config,tmp_path):
 
 def test_localizer_unknown_start_is_explicit(config,tmp_path):
  config['localization']['initial_pose']=None
- with pytest.raises(ValueError,match='initial_pose'):backends.localization_config(config,tmp_path/'l.yaml','/map.pcd')
+ assert not backends.localization_config(config,tmp_path/'l.yaml','/map.pcd')['set_initial_pose']
  config['localization']['manual_initial_pose']=True
  p=backends.localization_config(config,tmp_path/'l.yaml','/map.pcd');assert not p['set_initial_pose']
 

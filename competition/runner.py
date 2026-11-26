@@ -116,6 +116,13 @@ def run_phase(phase, c, root, backend):
                 map_path = root / "mapping/map.pcd"
                 if not (root / "mapping/complete.json").exists():
                     raise ValueError("Mapping has no successful checkpoint")
+                loc = resolved["localization"]
+                if loc["initial_pose"] is None and not loc.get("manual_initial_pose"):
+                    from .cold_start import initialize
+                    result = initialize(map_path, bag, resolved, root / "mapping/trajectory_optimized.tum")
+                    write_json(folder / "initialization.json", result)
+                    loc["initial_pose"] = result["initial_pose"]
+                    (folder / "config_resolved.yaml").write_text(yaml.safe_dump(resolved))
                 backends.localization_config(resolved, configs / "localization.yaml", map_path)
                 params = configs / "localization.yaml"
             else:

@@ -22,7 +22,7 @@
 | `lidar.scan_period_s` | Фактический период, также sanity limit времени точек |
 | `lidar.range_m` | Фильтр дальности `[min,max]` в SI |
 | `lidar.body_box_base_m` | null либо `[[xmin,ymin,zmin],[xmax,ymax,zmax]]` в физическом base |
-| `localization.initial_pose` | Поза base в map `[xyz, qxyzw]`; для второго прохода |
+| `localization.initial_pose` | `null` включает автоматический поиск. Известную позу base в map можно передать как `[xyz, qxyzw]` |
 | `occupancy.floor_z_m` | Высота пола в окончательной map; не обязательно ноль |
 
 Bag Doctor ищет распространённые time/t/timestamp/time_stamp/offset_time, но не объявляет

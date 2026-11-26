@@ -26,8 +26,8 @@ docker save mgts-competition-glim:cpu -o competition-glim-image.tar
 2. `make doctor`, `make doctor PHASE=localization`. Проверить type/topics, rates/gaps,
    NaN, time candidates, перекрытие, TF и kin odom. Ошибки структуры устранять до SLAM.
 3. Заполнить dataset.yaml измеренными данными. `auto` допустим лишь при одном topic нужного типа.
-4. `make prepare`; проверить сгенерированные конфиги. При неизвестном старте пока указать
-   ручную инициализацию, а не фиктивную identity-позу.
+4. `make prepare`; проверить сгенерированные конфиги. Для закрытой карты оставить
+   `initial_pose: null` и `manual_initial_pose: false`. Найденная поза появится в `localization/initialization.json`.
 
 ## Маппинг и выбор результата
 

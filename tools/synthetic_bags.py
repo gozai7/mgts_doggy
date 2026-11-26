@@ -17,7 +17,7 @@ def motion(t, duration):
  phase=2*np.pi*(3*u*u-2*u*u*u)
  return np.array([1.5*np.sin(phase),1-np.cos(phase),0.]), .3*np.sin(phase)
 
-def generate(output, duration=20., seed=8):
+def generate(output, duration=20., seed=8, mapping_mode="cpu"):
  output=Path(output);output.mkdir(parents=True,exist_ok=False)
  rng=np.random.default_rng(seed); T=bagio.STORE.types
  # Walls plus an asymmetric cabinet; angular ray intersections in XY.
@@ -27,6 +27,7 @@ def generate(output, duration=20., seed=8):
  for phase in ('mapping','localization'):
   records=[]; truth=[]
   for i in range(round(duration*100)+1):
+   if phase=='localization' and i < round(duration*45):continue
    t=i/100; n=base_ns+round(t*1e9);pos,yaw=motion(t,duration)
    h=.001;p0,y0=motion(t-h,duration);p1,y1=motion(t+h,duration)
    acc=(p1-2*pos+p0)/(h*h)+np.array([0,0,9.80665])
@@ -61,13 +62,14 @@ def generate(output, duration=20., seed=8):
  c['extrinsics']={'T_base_lidar':[0.,0.,0.,0.,0.,0.,1.],'T_base_imu':[0.,0.,0.,0.,0.,0.,1.]}
  c['units']={'xyz':'m','acceleration':'m/s2','angular_velocity':'rad/s'}
  c['point_time']={'field':None,'unit':None,'mode':'none','offset_s':0.}
- c['localization']['initial_pose']=[0.,0.,0.,0.,0.,0.,1.]
+ c['localization']['initial_pose']=None
  c['occupancy']['floor_z_m']=-.4
+ c['mapping']['mode']=mapping_mode
  c['mapping']['min_trajectory_coverage']=.6
  (output/'dataset.yaml').write_text(yaml.safe_dump(c))
  return output/'dataset.yaml'
 
 if __name__=='__main__':
- p=argparse.ArgumentParser();p.add_argument('output');p.add_argument('--duration',type=float,default=20.);a=p.parse_args()
+ p=argparse.ArgumentParser();p.add_argument('output');p.add_argument('--duration',type=float,default=20.);p.add_argument('--mapping-mode',choices=('cpu','gpu'),default='cpu');a=p.parse_args()
  if a.duration<=5:raise ValueError('duration must exceed 5 seconds')
- print(generate(a.output,a.duration))
+ print(generate(a.output,a.duration,mapping_mode=a.mapping_mode))

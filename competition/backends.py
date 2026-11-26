@@ -147,8 +147,6 @@ def rko_configs(c, directory, normalized, output):
 
 def localization_config(c, path, map_path):
     l = c["localization"]; initial = l["initial_pose"]
-    if initial is None and not l.get("manual_initial_pose"):
-        raise ValueError("Set localization.initial_pose or manual_initial_pose:true; global matching is not assumed")
     if initial is not None:
         transform(initial)
     predictor = l["prediction"]

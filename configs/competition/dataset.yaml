@@ -34,7 +34,7 @@ mapping:
   timeout_s: 7200
   min_trajectory_coverage: 0.75
 localization:
-  # [x,y,z,qx,qy,qz,qw], pose of BASE in map; null requires manual RViz initialization.
+  # [x,y,z,qx,qy,qz,qw], pose of BASE in map; null selects automatic scan-to-map initialization.
   initial_pose: null
   manual_initial_pose: false
   prediction: constant_velocity
