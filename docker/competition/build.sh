@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -eo pipefail
 source /opt/ros/jazzy/setup.bash
+set -u
 jobs="${BUILD_JOBS:-2}"
 mode="${BUILD_WITH_CUDA:-OFF}"
 backend="$(cat /mgts/BACKEND)"
@@ -11,12 +12,10 @@ build_cmake() {
   cmake --build "/tmp/build-$name-$mode" --parallel "$jobs"
   cmake --install "/tmp/build-$name-$mode"
 }
-if [ "$backend" = glim ]; then
-  if [ "$mode" = OFF ]; then
-    build_cmake gtsam -DGTSAM_BUILD_TESTS=OFF -DGTSAM_BUILD_EXAMPLES_ALWAYS=OFF \
-      -DGTSAM_BUILD_UNSTABLE=ON -DGTSAM_UNSTABLE_BUILD_TESTS=OFF -DGTSAM_WITH_TBB=OFF \
-      -DGTSAM_USE_SYSTEM_EIGEN=ON -DGTSAM_BUILD_WITH_MARCH_NATIVE=OFF
-  fi
+if [ "$backend" = glim ] && [ "$mode" = OFF ]; then
+  build_cmake gtsam -DGTSAM_BUILD_TESTS=OFF -DGTSAM_BUILD_EXAMPLES_ALWAYS=OFF \
+    -DGTSAM_BUILD_UNSTABLE=ON -DGTSAM_UNSTABLE_BUILD_TESTS=OFF -DGTSAM_WITH_TBB=OFF \
+    -DGTSAM_USE_SYSTEM_EIGEN=ON -DGTSAM_BUILD_WITH_MARCH_NATIVE=OFF
   if [ "${WITH_VIEWER:-OFF}" = ON ]; then
     build_cmake iridescence -DBUILD_EXAMPLES=OFF
   fi
@@ -56,7 +55,7 @@ fi
 rosdep install -y --from-paths "${dep_paths[@]}" --ignore-src --rosdistro jazzy \
   -t build -t buildtool -t build_export -t buildtool_export -t exec \
   --skip-keys 'glim gtsam_points iridescence'
-colcon build --packages-up-to "${targets[@]}" --executor sequential --parallel-workers 1 \
+MAKEFLAGS="-j$jobs" colcon build --packages-up-to "${targets[@]}" --executor sequential --parallel-workers 1 \
   --cmake-args -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF \
     -DBUILD_WITH_CUDA="$mode" -DBUILD_WITH_VIEWER="${WITH_VIEWER:-OFF}" -DBUILD_WITH_CV_BRIDGE=OFF \
     -DRKO_LIO_FETCH_CONTENT_DEPS=ON -DCMAKE_BUILD_PARALLEL_LEVEL="$jobs"

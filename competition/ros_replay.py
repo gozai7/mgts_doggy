@@ -51,7 +51,7 @@ def run(config, normalized, output, params, baseline=False):
             if s.name == "lidar_localization_ros2/alignment":
                 n = stamp(m)
                 values = {x.key: x.value for x in s.values}
-                statuses[n] = {"stamp_ns": n, "level": s.level, "message": s.message, "values": values}
+                statuses[n] = {"stamp_ns": n, "level": ord(s.level), "message": s.message, "values": values}
                 diagnostic_stream.write(json.dumps(statuses[n]) + "\n"); diagnostic_stream.flush()
 
     subs = [node.create_subscription(Odometry if baseline else PoseWithCovarianceStamped,
