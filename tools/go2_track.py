@@ -2,6 +2,7 @@
 
 import argparse
 import csv
+from itertools import count
 from pathlib import Path
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -17,11 +18,13 @@ from tools.go2_global_seed import match
 from tools.go2_live import build_map
 
 
-def run(config, dest, glim_map=None):
+def run(config, dest, glim_map=None, search_period_s=None):
     import rclpy
     from geometry_msgs.msg import PoseStamped
     from std_msgs.msg import String
 
+    if search_period_s is not None and not (np.isfinite(search_period_s) and search_period_s > 0):
+        raise ValueError("search_period_s must be positive and finite")
     dest.mkdir(parents=True)
     bag = config["bags"]["localization"]
     if glim_map is None:
@@ -51,7 +54,8 @@ def run(config, dest, glim_map=None):
     due = []
     odom_route = []
     first_stamp = first_arrival = search = locked = None
-    checkpoints = iter([8.0, 16.0, 25.0, 40.0, 60.0, 90.0])
+    checkpoints = (count(search_period_s, search_period_s) if search_period_s is not None
+                   else iter((8, 16, 25, 40, 60, 90)))
     checkpoint = next(checkpoints)
     try:
         with ThreadPoolExecutor(max_workers=1) as pool, bagio.reader(bag) as r:
@@ -174,6 +178,7 @@ if __name__ == "__main__":
     parser.add_argument("output", type=Path)
     parser.add_argument("--config", default="/mgts/configs/competition/official-go2.yaml")
     parser.add_argument("--glim", action="store_true", help="Use the completed GLIM map for A")
+    parser.add_argument("--search-period-s", type=float, help="Experimental fixed interval for cold-start attempts")
     args = parser.parse_args()
     config = load(args.config)
-    run(config, args.output, Path(config["output"]) / "mapping" if args.glim else None)
+    run(config, args.output, Path(config["output"]) / "mapping" if args.glim else None, args.search_period_s)
