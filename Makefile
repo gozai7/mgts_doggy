@@ -27,6 +27,15 @@ legacy-build:
 legacy-help:
 	$(MAKE) -f Makefile.legacy help
 
+SCENE ?= equipment
+SCENE_ROOT ?= $(CURDIR)/results/lidar-test-kit
+.PHONY: scenes scene-test
+scenes:
+	python3 -m sim.lidar_suite "$(SCENE_ROOT)" $(foreach name,$(SCENES),--scene "$(name)")
+scene-test:
+	DATA_DIR="$(abspath $(SCENE_ROOT))/$(SCENE)/data" $(COMPOSE) -f compose.yaml -f compose.gpu.yaml run --rm --pull never competition python3 -m competition.runner run-all --config /data/dataset.yaml
+	python3 -m sim.score_scene "$(SCENE_ROOT)/$(SCENE)/reference" "$(RESULTS_DIR)/lidar-scenes/$(SCENE)"
+
 .PHONY: go2-rviz go2-map go2-locate
 go2-rviz:
 	bash tools/go2_rviz.sh $(PHASE)
