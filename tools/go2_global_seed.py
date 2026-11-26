@@ -46,6 +46,7 @@ def prefix(bag, seconds):
         [sample(np.vstack(s), 0.10, 3200) for s in sets],
         scans[0][0],
         (scans[-1][0] - scans[0][0]) * 1e-9,
+        pose7(np.linalg.inv(anchor)),
     )
 
 
@@ -93,7 +94,7 @@ def candidates(model, query, ref, step=0.20):
 
 def match(map_path, path_a, bag, seconds):
     tic = time.monotonic()
-    (source, holdout), stamp, used = prefix(bag, seconds)
+    (source, holdout), stamp, used, first_odom = prefix(bag, seconds)
     model = pcd.xyz(map_path)
     ref = read_tum(path_a)
     target = cKDTree(sample(model, 0.065, 900000))
@@ -108,6 +109,7 @@ def match(map_path, path_a, bag, seconds):
         initial_pose=pose7(pose),
         stamp_ns=stamp,
         prefix_s=used,
+        first_odometry_pose=first_odom,
         wall_time_s=time.monotonic() - tic,
         heldout_distance_m=best,
         alternate_distance_m=alt,

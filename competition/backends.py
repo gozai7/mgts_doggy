@@ -60,6 +60,11 @@ def glim_config(c, directory):
     sensors["sensors"].update({"T_lidar_imu": pose7(np.linalg.inv(transform(c["extrinsics"]["T_base_lidar"])) @ transform(c["extrinsics"]["T_base_imu"])),
         "global_shutter_lidar": c["point_time"]["mode"] == "none", "autoconf_perpoint_times": False,
         "autoconf_prefer_frame_time": True, "perpoint_relative_time": True, "perpoint_time_scale": 1.0})
+    noise = c["mapping"].get("imu_noise_density", {})
+    if any(isinstance(value, bool) or not isinstance(value, (int, float)) or
+           not np.isfinite(value) or value <= 0 for value in noise.values()):
+        raise ValueError("IMU noise densities must be positive finite numbers")
+    tune(sensors["sensors"], noise, {"imu_acc_noise", "imu_gyro_noise"})
     write_json(directory / "config_sensors.json", sensors)
     ros = jsonc(directory / "config_ros.json")
     ros["glim_ros"].update({"imu_topic": "/competition/imu", "points_topic": "/competition/lidar",
